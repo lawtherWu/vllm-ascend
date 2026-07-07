@@ -1,5 +1,9 @@
 {
+<<<<<<<< HEAD:csrc/attention/store_kv_block_metadata/op_kernel_aicpu/store_kv_block_metadata_aicpu.json
+    "StoreKvBlockMetadata":{
+========
     "VllmQuantLightningIndexerMetadata":{
+>>>>>>>> ec8bcaf3d (Rfc/vllm cann synchronize wuth main branch (#11513)):csrc/attention/vllm_quant_lightning_indexer_metadata/op_kernel_aicpu/vllm_quant_lightning_indexer_metadata_aicpu.json
         "opInfo":{
             "computeCost":"100",
             "engine":"DNN_VM_AICPU",

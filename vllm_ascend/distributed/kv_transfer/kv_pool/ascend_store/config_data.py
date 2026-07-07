@@ -5,7 +5,6 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-import numpy as np
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata, KVConnectorWorkerMetadata
 from vllm.logger import logger
@@ -13,66 +12,8 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList
 from vllm.v1.core.sched.output import NewRequestData
 
-from vllm_ascend.memcache_comm_fence import AttentionComputeStartGate
-
 _GROUPED_BLOCK_HASH_DOMAIN = b"vllm-ascend-grouped-block-hash-v1\0"
 _GROUPED_BLOCK_HASH_LENGTH_PREFIX_BYTES = 4
-
-HYBRID_CACHE_C128_CHUNK_CONFIG_KEY = "hybrid_cache_c128_chunk"
-HYBRID_CACHE_C128_CHUNK_MULTIPLIER = 4
-HYBRID_CACHE_C128_TRANSFER_NAMESPACE = "hybrid_c128_chunk_v1"
-HYBRID_CACHE_C128_FAMILY = "c128"
-
-
-@dataclass(frozen=True)
-class HybridCacheC128Config:
-    """Connector-only hybrid C128 external transfer configuration."""
-
-    enabled: bool = False
-    chunk_tokens: int | None = None
-    namespace: str | None = None
-    c128_group_id: int | None = None
-    c128_slots_per_page: int | None = None
-
-
-@dataclass(frozen=True)
-class TransferChunk:
-    """One external key and its raw-token/cache-slot placement."""
-
-    raw_start: int
-    raw_end: int
-    value_start: int
-    value_end: int
-    target_block_index: int
-    key: PoolKey
-
-
-@dataclass(frozen=True)
-class TransferChunkWithBlockId(TransferChunk):
-    block_id: int
-    block_ids: tuple[int, ...] = ()
-
-
-def aggregate_c128_page_chunks(
-    chunks: Iterable[TransferChunkWithBlockId],
-    slots_per_page: int | None = None,
-) -> list[TransferChunkWithBlockId]:
-    """Collapse C128 chunks to one representative key per physical page.
-
-    Every non-tail page must have its final authoritative range; an incomplete
-    page is retained only when it is the last page in the request.
-    """
-    pages: dict[tuple[int, int], TransferChunkWithBlockId] = {}
-    for chunk in chunks:
-        pages[(chunk.target_block_index, chunk.block_id)] = chunk
-    if slots_per_page is None or not pages:
-        return list(pages.values())
-    tail_page_index = max(chunk.target_block_index for chunk in pages.values())
-    return [
-        chunk
-        for chunk in pages.values()
-        if chunk.value_end >= slots_per_page or chunk.target_block_index == tail_page_index
-    ]
 
 
 # Parameters related to the key
@@ -95,12 +36,6 @@ class KeyMetadata:
     cache_role: str = "kv"
     """ Family name for compress-aware hybrid cache layouts """
     cache_family: str = "default"
-    """ Versioned namespace for an opt-in external transfer layout """
-    transfer_namespace: str | None = None
-    """ First authoritative cache slot in a full-page value """
-    slot_start: int | None = None
-    """ Exclusive end of the authoritative cache-slot range """
-    slot_end: int | None = None
 
 
 @dataclass(order=True)
@@ -119,19 +54,11 @@ class PoolKey:
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
-                self.key_metadata.transfer_namespace,
-                self.key_metadata.slot_start,
-                self.key_metadata.slot_end,
                 self.chunk_hash,
             )
         )
 
     def to_string(self):
-        transfer_suffix = ""
-        if self.key_metadata.transfer_namespace is not None:
-            transfer_suffix += f"@transfer:{self.key_metadata.transfer_namespace}"
-        if self.key_metadata.slot_start is not None and self.key_metadata.slot_end is not None:
-            transfer_suffix += f"@range:{self.key_metadata.slot_start}_{self.key_metadata.slot_end}"
         return (
             f"{self.key_metadata.model_name}"
             f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
@@ -140,7 +67,6 @@ class PoolKey:
             f"@group:{self.key_metadata.kv_cache_group_id}"
             f"@cache_role:{self.key_metadata.cache_role}"
             f"@cache_family:{self.key_metadata.cache_family}"
-            f"{transfer_suffix}"
             f"@{self.chunk_hash}"
         )
 
@@ -174,20 +100,12 @@ class LayerPoolKey(PoolKey):
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
-                self.key_metadata.transfer_namespace,
-                self.key_metadata.slot_start,
-                self.key_metadata.slot_end,
                 self.chunk_hash,
                 self.layer_id,
             )
         )
 
     def to_string(self):
-        transfer_suffix = ""
-        if self.key_metadata.transfer_namespace is not None:
-            transfer_suffix += f"@transfer:{self.key_metadata.transfer_namespace}"
-        if self.key_metadata.slot_start is not None and self.key_metadata.slot_end is not None:
-            transfer_suffix += f"@range:{self.key_metadata.slot_start}_{self.key_metadata.slot_end}"
         return (
             f"{self.key_metadata.model_name}"
             f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
@@ -195,7 +113,6 @@ class LayerPoolKey(PoolKey):
             f"@group:{self.key_metadata.kv_cache_group_id}"
             f"@cache_role:{self.key_metadata.cache_role}"
             f"@cache_family:{self.key_metadata.cache_family}"
-            f"{transfer_suffix}"
             f"@layer_id:{self.layer_id}"
             f"@{self.chunk_hash}"
         )
@@ -218,86 +135,6 @@ def infer_cache_family_ratio(cache_family: str | None) -> int:
 
 def get_cache_family_granularity(block_size: int, cache_family: str | None) -> int:
     return block_size * infer_cache_family_ratio(cache_family)
-
-
-def resolve_hybrid_cache_c128_config(
-    vllm_config: Any,
-    *,
-    use_layerwise: bool,
-    group_block_sizes: Sequence[int],
-    group_cache_families: Sequence[str],
-    hash_block_size: int,
-    discard_partial_chunks: bool,
-) -> HybridCacheC128Config:
-    """Parse and validate the opt-in connector-only hybrid C128 path."""
-    kv_transfer_config = vllm_config.kv_transfer_config
-    extra_config = kv_transfer_config.kv_connector_extra_config
-    enabled = extra_config.get(HYBRID_CACHE_C128_CHUNK_CONFIG_KEY, False)
-    if not isinstance(enabled, bool):
-        raise ValueError(f"{HYBRID_CACHE_C128_CHUNK_CONFIG_KEY} must be a boolean.")
-    if not enabled:
-        return HybridCacheC128Config()
-
-    config_key = HYBRID_CACHE_C128_CHUNK_CONFIG_KEY
-    if str(extra_config.get("backend", "mooncake")).lower() != "mooncake":
-        raise ValueError(f"{config_key} requires the Mooncake backend.")
-    if use_layerwise:
-        raise ValueError(f"{config_key} does not support layerwise transfer.")
-    if not discard_partial_chunks:
-        raise ValueError(f"{config_key} requires discard_partial_chunks=true.")
-    if len(group_block_sizes) != len(group_cache_families):
-        raise ValueError("KV cache group sizes and cache families must have the same length.")
-
-    c128_group_id: int | None = None
-    c128_block_size: int | None = None
-    for group_id, (block_size, family) in enumerate(
-        zip(group_block_sizes, group_cache_families, strict=True)
-    ):
-        if family == HYBRID_CACHE_C128_FAMILY:
-            if c128_group_id is not None:
-                raise ValueError(f"{config_key} requires exactly one C128 cache group.")
-            c128_group_id = group_id
-            c128_block_size = block_size
-
-    if c128_group_id is None or c128_block_size is None:
-        raise ValueError(f"{config_key} requires exactly one C128 cache group.")
-
-    # Four C128 compressed-slot groups form one external transfer chunk.  The
-    # physical block size is deliberately taken from the actual group spec so
-    # block_size=128 yields 512 raw tokens and block_size=64 yields 256.
-    chunk_tokens = c128_block_size * HYBRID_CACHE_C128_CHUNK_MULTIPLIER
-    if chunk_tokens % hash_block_size != 0:
-        raise ValueError(
-            f"{config_key} chunk size ({chunk_tokens}) must be divisible by "
-            f"hash_block_size ({hash_block_size})."
-        )
-    c128_ratio = infer_cache_family_ratio(HYBRID_CACHE_C128_FAMILY)
-    if chunk_tokens % c128_ratio != 0:
-        raise ValueError(
-            f"{config_key} chunk size ({chunk_tokens}) must be divisible by "
-            f"the C128 compression ratio ({c128_ratio})."
-        )
-
-    for group_id, (block_size, family) in enumerate(
-        zip(group_block_sizes, group_cache_families, strict=True)
-    ):
-        if family == HYBRID_CACHE_C128_FAMILY:
-            continue
-        raw_tokens_per_block = get_cache_family_granularity(block_size, family)
-        if chunk_tokens % raw_tokens_per_block != 0:
-            raise ValueError(
-                f"{config_key} chunk size ({chunk_tokens}) must be divisible by "
-                "every non-C128 group's raw tokens per physical block; "
-                f"group {group_id} ({family}) maps {raw_tokens_per_block}."
-            )
-
-    return HybridCacheC128Config(
-        enabled=True,
-        chunk_tokens=chunk_tokens,
-        namespace=HYBRID_CACHE_C128_TRANSFER_NAMESPACE,
-        c128_group_id=c128_group_id,
-        c128_slots_per_page=c128_block_size,
-    )
 
 
 def _get_layer_compress_ratio(
@@ -370,7 +207,6 @@ class ChunkedTokenDatabase:
         partitions: list[int] | None,
         use_hybrid: bool = False,
         hash_block_size: int | None = None,
-        hybrid_cache_c128_config: HybridCacheC128Config | None = None,
     ):
         self.metadata = metadata
         self.block_size = block_size
@@ -388,7 +224,6 @@ class ChunkedTokenDatabase:
         self.partitions = partitions
         self.use_hybrid = use_hybrid
         self.hash_block_size = self.block_size[0] if hash_block_size is None else hash_block_size
-        self.hybrid_cache_c128_config = hybrid_cache_c128_config or HybridCacheC128Config()
         self.cache_coordinator: Any | None = None
 
     def set_cache_coordinator(self, cache_coordinator: Any | None) -> None:
@@ -421,11 +256,7 @@ class ChunkedTokenDatabase:
         if masks is None or kv_cache_group_id >= len(masks):
             return True
         group_mask = masks[kv_cache_group_id]
-        if self.hybrid_cache_c128_config.enabled:
-            assert self.hybrid_cache_c128_config.chunk_tokens is not None
-            block_idx = start // self.hybrid_cache_c128_config.chunk_tokens
-        else:
-            block_idx = start // self.get_block_size(kv_cache_group_id)
+        block_idx = start // self.get_block_size(kv_cache_group_id)
         return block_idx < len(group_mask) and group_mask[block_idx]
 
     def _make_key_by_hash(
@@ -435,9 +266,6 @@ class ChunkedTokenDatabase:
         cache_role: str = "kv",
         cache_family: str | None = None,
         layer_id: int | None = None,
-        transfer_namespace: str | None = None,
-        slot_start: int | None = None,
-        slot_end: int | None = None,
     ):
         assert self.metadata is not None
         if cache_family is None:
@@ -453,19 +281,9 @@ class ChunkedTokenDatabase:
                 kv_cache_group_id=kv_cache_group_id,
                 cache_role=cache_role,
                 cache_family=cache_family,
-                transfer_namespace=transfer_namespace,
-                slot_start=slot_start,
-                slot_end=slot_end,
             ),
             chunk_hash,
         )
-
-    def is_hybrid_cache_c128_enabled(self) -> bool:
-        return self.hybrid_cache_c128_config.enabled
-
-    def is_c128_group(self, kv_cache_group_id: int) -> bool:
-        config = self.hybrid_cache_c128_config
-        return config.enabled and config.c128_group_id == kv_cache_group_id
 
     def get_block_size(self, kv_cache_group_id: int) -> int:
         if kv_cache_group_id >= len(self.block_size):
@@ -535,16 +353,6 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
-    def prepare_block_info(self, start: int, end: int, block_ids: list[int]) -> tuple[int, list[int]]:
-        block_size = self.block_size[0]
-        block_id = block_ids[start // block_size]
-        block_len = self.group_block_len.get(0, [])
-        size_list = []
-        for i in range(len(block_len)):
-            size = int(block_len[i] / block_size * (end - start))
-            size_list.append(size)
-        return block_id, size_list
-
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
         group_block_size = self.get_block_size(0)
         block_idx = start // group_block_size
@@ -567,234 +375,6 @@ class ChunkedTokenDatabase:
             addr_list.append(addr)
             size_list.append(size)
         return addr_list, size_list, block_id
-
-    def process_transfer_chunks(
-        self,
-        token_len: int,
-        block_hashes: BlockHashList | list[str],
-        mask_num: int = 0,
-        kv_cache_group_id: int = 0,
-        cache_role: str = "kv",
-        cache_family: str | None = None,
-    ) -> Iterable[TransferChunk]:
-        """Return explicit raw-token and physical-value coordinates."""
-        config = self.hybrid_cache_c128_config
-        if not config.enabled:
-            group_block_size = self.get_block_size(kv_cache_group_id)
-            for start, end, key in self.process_tokens(
-                token_len,
-                block_hashes,
-                mask_num,
-                kv_cache_group_id=kv_cache_group_id,
-                cache_role=cache_role,
-                cache_family=cache_family,
-            ):
-                yield TransferChunk(
-                    raw_start=start,
-                    raw_end=end,
-                    value_start=start,
-                    value_end=end,
-                    target_block_index=start // group_block_size,
-                    key=key,
-                )
-            return
-
-        if not block_hashes:
-            return
-        assert config.chunk_tokens is not None
-        assert config.namespace is not None
-        chunk_tokens = config.chunk_tokens
-        if cache_family is None:
-            cache_family = self.group_cache_families.get(cache_role, {}).get(kv_cache_group_id, "default")
-        family_ratio = max(infer_cache_family_ratio(cache_family), 1)
-        physical_block_size = self.get_block_size(kv_cache_group_id)
-        raw_tokens_per_page = physical_block_size * family_ratio
-        chunk_hashes = get_block_hashes(block_hashes, chunk_tokens, self.hash_block_size)
-        if not chunk_hashes:
-            return
-
-        for chunk_id, hash_value in enumerate(chunk_hashes):
-            raw_start = chunk_id * chunk_tokens
-            raw_end = raw_start + chunk_tokens
-            if raw_end > token_len:
-                break
-            if raw_start < mask_num:
-                continue
-            if not isinstance(hash_value, str):
-                hash_value = hash_value.hex()
-            target_block_index = raw_start // raw_tokens_per_page
-            value_start = (raw_start % raw_tokens_per_page) // family_ratio
-            value_end = value_start + min(chunk_tokens, raw_tokens_per_page) // family_ratio
-            slot_start = value_start if self.is_c128_group(kv_cache_group_id) else None
-            slot_end = value_end if self.is_c128_group(kv_cache_group_id) else None
-            yield TransferChunk(
-                raw_start=raw_start,
-                raw_end=raw_end,
-                value_start=value_start,
-                value_end=value_end,
-                target_block_index=target_block_index,
-                key=self._make_key_by_hash(
-                    hash_value,
-                    kv_cache_group_id=kv_cache_group_id,
-                    cache_role=cache_role,
-                    cache_family=cache_family,
-                    transfer_namespace=config.namespace,
-                    slot_start=slot_start,
-                    slot_end=slot_end,
-                ),
-            )
-
-    def process_transfer_chunks_with_block_ids(
-        self,
-        token_len: int,
-        block_hashes: BlockHashList | list[str],
-        block_ids: list[int],
-        mask_num: int = 0,
-        kv_cache_group_id: int = 0,
-        skip_null_blocks: bool = False,
-        cache_role: str = "kv",
-        cache_family: str | None = None,
-    ) -> Iterable[TransferChunkWithBlockId]:
-        if not self.hybrid_cache_c128_config.enabled:
-            group_block_size = self.get_block_size(kv_cache_group_id)
-            for start, end, key, block_id in self.process_tokens_with_block_ids(
-                token_len,
-                block_hashes,
-                block_ids,
-                mask_num,
-                kv_cache_group_id=kv_cache_group_id,
-                skip_null_blocks=skip_null_blocks,
-                cache_role=cache_role,
-                cache_family=cache_family,
-            ):
-                yield TransferChunkWithBlockId(
-                    raw_start=start,
-                    raw_end=end,
-                    value_start=start,
-                    value_end=end,
-                    target_block_index=start // group_block_size,
-                    key=key,
-                    block_id=block_id,
-                    block_ids=(block_id,),
-                )
-            return
-
-        all_chunks = list(
-            self.process_transfer_chunks(
-                token_len,
-                block_hashes,
-                kv_cache_group_id=kv_cache_group_id,
-                cache_role=cache_role,
-                cache_family=cache_family,
-            )
-        )
-        if not all_chunks:
-            return
-        if cache_family is None:
-            cache_family = self.group_cache_families.get(cache_role, {}).get(kv_cache_group_id, "default")
-        family_ratio = max(infer_cache_family_ratio(cache_family), 1)
-        raw_tokens_per_page = self.get_block_size(kv_cache_group_id) * family_ratio
-        # A C128 chunk addresses a range inside a full physical page, so a
-        # partial final page still needs to participate in the tail offset.
-        # Other groups only publish complete transfer chunks and their block
-        # IDs therefore correspond to complete native pages at this frontier.
-        if self.is_c128_group(kv_cache_group_id):
-            num_logical_blocks = cdiv(token_len, raw_tokens_per_page)
-        else:
-            num_logical_blocks = token_len // raw_tokens_per_page
-        block_id_offset = max(num_logical_blocks - len(block_ids), 0)
-        for chunk in all_chunks:
-            if chunk.raw_start < mask_num:
-                continue
-            if self.is_c128_group(kv_cache_group_id):
-                block_start = chunk.target_block_index
-                block_end = block_start + 1
-            elif self.cache_coordinator is not None:
-                block_start, block_end = self.cache_coordinator.transfer_value_block_range(
-                    kv_cache_group_id,
-                    chunk.raw_start,
-                    chunk.raw_end,
-                )
-            else:
-                block_start = chunk.target_block_index
-                block_end = block_start + 1
-            block_start -= block_id_offset
-            block_end -= block_id_offset
-            if block_start < 0 or block_end > len(block_ids):
-                continue
-            chunk_block_ids = tuple(block_ids[block_start:block_end])
-            if skip_null_blocks and any(block_id <= 0 for block_id in chunk_block_ids):
-                continue
-            yield TransferChunkWithBlockId(
-                raw_start=chunk.raw_start,
-                raw_end=chunk.raw_end,
-                value_start=chunk.value_start,
-                value_end=chunk.value_end,
-                target_block_index=chunk.target_block_index,
-                key=chunk.key,
-                block_id=chunk_block_ids[0],
-                block_ids=chunk_block_ids,
-            )
-
-    def prepare_transfer_value(
-        self,
-        chunk: TransferChunkWithBlockId,
-        block_ids: list[int],
-        kv_cache_group_id: int = 0,
-        cache_role: str = "kv",
-    ):
-        if not self.hybrid_cache_c128_config.enabled:
-            return self.prepare_value(
-                chunk.value_start,
-                chunk.value_end,
-                block_ids,
-                kv_cache_group_id=kv_cache_group_id,
-                cache_role=cache_role,
-                block_id=chunk.block_id,
-            )
-
-        if self.is_c128_group(kv_cache_group_id):
-            # Mooncake stores a complete physical C128 page.  The load path
-            # uses the representative key for lookup and writes this complete
-            # page directly to the target block; ordinary groups use their
-            # complete transfer block.
-            value_start = 0
-            value_end = self.get_block_size(kv_cache_group_id)
-            return self.prepare_value(
-                value_start,
-                value_end,
-                block_ids,
-                kv_cache_group_id=kv_cache_group_id,
-                cache_role=cache_role,
-                block_id=chunk.block_id,
-            )
-
-        chunk_block_ids = chunk.block_ids or (chunk.block_id,)
-        values = [
-            self.prepare_value(
-                0,
-                self.get_block_size(kv_cache_group_id),
-                block_ids,
-                kv_cache_group_id=kv_cache_group_id,
-                cache_role=cache_role,
-                block_id=block_id,
-            )
-            for block_id in chunk_block_ids
-        ]
-        if not values or not values[0][0]:
-            return [], [], chunk.block_id
-        num_buffers = len(values[0][0])
-        addr_list = [
-            values[block][0][buffer]
-            for buffer in range(num_buffers)
-            for block in range(len(values))
-        ]
-        size_list = [
-            values[block][1][buffer]
-            for buffer in range(num_buffers)
-            for block in range(len(values))
-        ]
-        return addr_list, size_list, chunk.block_id
 
     def process_tokens(
         self,
@@ -822,7 +402,7 @@ class ChunkedTokenDatabase:
             return
         if not isinstance(block_hashes[0], str):
             block_hashes = [
-                h.hex() if not isinstance(h, str) else h  # type: ignore[union-attr]
+                h.hex()  # type: ignore[union-attr]
                 for h in block_hashes
             ]
         start_idx = 0
@@ -965,10 +545,6 @@ def _rehash_block_hash_group(block_hashes: Sequence[BlockHash | str]) -> BlockHa
     return BlockHash(hasher.digest())
 
 
-def block_hash_to_str(block_hash: BlockHash | str) -> str:
-    return block_hash if isinstance(block_hash, str) else block_hash.hex()
-
-
 def _block_hash_to_bytes(block_hash: BlockHash | str) -> bytes:
     if isinstance(block_hash, str):
         if len(block_hash) == 64:
@@ -1013,19 +589,6 @@ class RequestTracker:
 
     # Full prompt length before chunk truncation, used by sparse retention masks.
     num_prompt_tokens: int | None = None
-    block_gvas: list[int] = field(default_factory=list)
-    block_gvas_by_group: list[list[int]] = field(default_factory=list)
-    gva_block_offset: int = 0
-    last_block_gva: int | None = None
-
-    block_keys: list[str] = field(default_factory=list)
-
-    starts: list[int] | None = None
-    ends: list[int] | None = None
-
-    sizes_per_chunk: list[list[int]] | None = None
-
-    last_block_key: str | None = None
 
     mamba_group_ids: list[int] | None = None
 
@@ -1043,15 +606,6 @@ class RequestTracker:
         num_saved_tokens: int = 0,
         token_ids: list[int] | None = None,
         num_prompt_tokens: int | None = None,
-        block_gvas: list[int] | None = None,
-        block_gvas_by_group: list[list[int]] | None = None,
-        gva_block_offset: int = 0,
-        last_block_gva: int | None = None,
-        block_keys: list[str] | None = None,
-        starts: list[int] | None = None,
-        ends: list[int] | None = None,
-        sizes_per_chunk: list[list[int]] | None = None,
-        last_block_key: str | None = None,
         mamba_group_ids: list[int] | None = None,
         num_speculative_blocks: int = 0,
         block_sizes: list[int] | None = None,
@@ -1067,15 +621,6 @@ class RequestTracker:
         self.num_saved_tokens = num_saved_tokens
         self.token_ids = token_ids
         self.num_prompt_tokens = num_prompt_tokens
-        self.block_gvas = [] if block_gvas is None else block_gvas
-        self.block_gvas_by_group = block_gvas_by_group if block_gvas_by_group is not None else []
-        self.gva_block_offset = gva_block_offset
-        self.last_block_gva = last_block_gva
-        self.block_keys = [] if block_keys is None else block_keys
-        self.starts = starts
-        self.ends = ends
-        self.sizes_per_chunk = sizes_per_chunk
-        self.last_block_key = last_block_key
         self.block_sizes = block_sizes
 
     @property
@@ -1149,17 +694,12 @@ class RequestTracker:
 class ReqMeta:
     # Request id
     req_id: str
-    # End token for full-block KV save.
-    save_end_token: int
-    # Token length after this scheduled step finishes.
-    target_token_len: int
+    # Number of tokens in this chunk
+    token_len_chunk: int
 
     block_ids_by_group: list[list[int]]
 
     block_hashes: list[BlockHash]
-
-    # First token that has not been saved before this metadata was built.
-    save_start_token: int = 0
 
     can_save: bool | None = None
     # load_spec
@@ -1184,7 +724,7 @@ class ReqMeta:
     def __init__(
         self,
         req_id: str,
-        token_len_chunk: int | None = None,
+        token_len_chunk: int,
         block_ids_by_group: list[list[int]] | None = None,
         block_hashes: list[BlockHash] | None = None,
         can_save: bool | None = None,
@@ -1200,30 +740,9 @@ class ReqMeta:
         original_block_size: list[int] | int | None = None,
         block_ids: list[int] | list[list[int]] | None = None,
         event_id: int | None = None,
-        save_end_token: int | None = None,
-        target_token_len: int | None = None,
-        save_start_token: int = 0,
-        last_block_gva: int | None = None,
-        partial_block_index: int | None = None,
-        starts: list[int] | None = None,
-        ends: list[int] | None = None,
-        sizes_per_chunk: list[list[int]] | None = None,
-        block_ids_np: np.ndarray | None = None,
-        block_ids_by_group_np: list[np.ndarray] | None = None,
-        block_gvas_np: np.ndarray | None = None,
-        block_gvas_by_group_np: list[np.ndarray] | None = None,
-        gva_block_offset: int = 0,
-        load_block_gvas_np: np.ndarray | None = None,
-        load_block_gvas_by_group_np: list[np.ndarray] | None = None,
-        load_gva_block_offset: int = 0,
     ) -> None:
-        if token_len_chunk is None:
-            token_len_chunk = 0 if save_end_token is None else save_end_token
         self.req_id = req_id
         self.token_len_chunk = token_len_chunk
-        self.save_end_token = token_len_chunk if save_end_token is None else save_end_token
-        self.target_token_len = token_len_chunk if target_token_len is None else target_token_len
-        self.save_start_token = save_start_token
         if block_ids_by_group is None:
             block_ids_by_group = normalize_block_ids_by_group(block_ids or [])
         self.block_ids_by_group = block_ids_by_group
@@ -1240,19 +759,6 @@ class ReqMeta:
         self.token_ids = token_ids
         self.original_block_size = original_block_size
         self.event_id = event_id
-        self.last_block_gva = last_block_gva
-        self.partial_block_index = partial_block_index
-        self.starts = starts
-        self.ends = ends
-        self.sizes_per_chunk = sizes_per_chunk
-        self.block_ids_np = block_ids_np
-        self.block_ids_by_group_np = block_ids_by_group_np
-        self.block_gvas_np = block_gvas_np
-        self.block_gvas_by_group_np = block_gvas_by_group_np
-        self.gva_block_offset = gva_block_offset
-        self.load_block_gvas_np = load_block_gvas_np
-        self.load_block_gvas_by_group_np = load_block_gvas_by_group_np
-        self.load_gva_block_offset = load_gva_block_offset
 
     @property
     def block_ids(self) -> list[int]:
@@ -1261,23 +767,6 @@ class ReqMeta:
     @block_ids.setter
     def block_ids(self, block_ids: list[int] | list[list[int]]) -> None:
         self.block_ids_by_group = normalize_block_ids_by_group(block_ids)
-
-    last_block_gva: int | None = None
-    partial_block_index: int | None = None
-    save_keys: list[str] | None = None
-    load_keys: list[str] | None = None
-
-    starts: list[int] | None = None
-    ends: list[int] | None = None
-
-    sizes_per_chunk: list[list[int]] | None = None
-
-    block_ids_np: np.ndarray | None = None
-    block_ids_by_group_np: list[np.ndarray] | None = None
-    block_gvas_np: np.ndarray | None = None
-    block_gvas_by_group_np: list[np.ndarray] | None = None
-    gva_block_offset: int = 0
-    load_block_gvas_by_group_np: list[np.ndarray] | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -1294,8 +783,7 @@ class ReqMeta:
         """Create the request metadata from a request tracker."""
         if block_hashes is None:
             block_hashes = []
-        target_token_len = tracker.token_len
-        previous_saved_tokens = tracker.num_saved_tokens
+        input_token_len = tracker.token_len
 
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
@@ -1306,36 +794,17 @@ class ReqMeta:
             else 0
         )
         num_tokens_to_save = (
-            (target_token_len // cache_transfer_granularity * cache_transfer_granularity)
+            (input_token_len // cache_transfer_granularity * cache_transfer_granularity)
             if discard_partial_chunks
-            else target_token_len
+            else input_token_len
         )
-        full_block_count = target_token_len // cache_transfer_granularity
-        boundary_without_hash = (
-            target_token_len > 0
-            and target_token_len % cache_transfer_granularity == 0
-            and full_block_count > len(block_hashes)
-        )
-        if boundary_without_hash:
-            num_tokens_to_save = len(block_hashes) * cache_transfer_granularity
-        if tracker.last_block_gva is not None and (
-            target_token_len % cache_transfer_granularity != 0 or boundary_without_hash
-        ):
-            partial_block_index = (
-                full_block_count if target_token_len % cache_transfer_granularity != 0 else full_block_count - 1
-            )
-        else:
-            partial_block_index = None
 
-        skip_save = skip_save or (num_tokens_to_save < chunk_boundary and partial_block_index is None)
+        skip_save = skip_save or num_tokens_to_save < chunk_boundary
         if skip_save and load_spec is None:
             return None
 
         if not skip_save:
-            tracker.num_saved_tokens = max(
-                tracker.num_saved_tokens,
-                num_tokens_to_save,
-            )
+            tracker.num_saved_tokens = num_tokens_to_save
 
         token_ids = None
         if tracker.token_ids:
@@ -1353,101 +822,28 @@ class ReqMeta:
         return ReqMeta(
             req_id=tracker.req_id,
             token_len_chunk=num_tokens_to_save,
-            save_end_token=num_tokens_to_save,
-            target_token_len=target_token_len,
-            save_start_token=previous_saved_tokens,
             block_ids_by_group=tracker.allocated_block_ids_by_group,
             can_save=not skip_save,
             load_spec=load_spec,
             block_hashes=block_hashes,
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
-            num_prompt_tokens=tracker.num_prompt_tokens or target_token_len,
+            num_prompt_tokens=tracker.num_prompt_tokens or input_token_len,
             original_block_size=original_block_size,
-            last_block_gva=tracker.last_block_gva,
-            partial_block_index=partial_block_index,
-            block_ids_np=np.asarray(tracker.allocated_block_ids, dtype=np.int64),
-            block_ids_by_group_np=[np.asarray(ids, dtype=np.int64) for ids in tracker.allocated_block_ids_by_group]
-            if tracker.allocated_block_ids_by_group
-            else None,
-            block_gvas_np=np.asarray(tracker.block_gvas, dtype=np.int64),
-            block_gvas_by_group_np=[np.asarray(gvas, dtype=np.int64) for gvas in tracker.block_gvas_by_group]
-            if hasattr(tracker, "block_gvas_by_group") and tracker.block_gvas_by_group
-            else None,
-            gva_block_offset=tracker.gva_block_offset,
             kv_cache_group_ids=list(range(len(tracker.allocated_block_ids_by_group))),
             kv_cache_families_by_group=kv_cache_group_families,
         )
 
 
 class AscendConnectorMetadata(KVConnectorMetadata):
-    def __init__(
-        self,
-        unfinished_request_ids,
-        preempted_req_ids,
-        loading_req_ids: set[str] | None = None,
-        delayed_free_req_ids: set[str] | None = None,
-    ):
-        self.requests: list[ReqMeta] = []
+    def __init__(self, unfinished_request_ids, preempted_req_ids):
+        self.requests = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
-        self.loading_req_ids = loading_req_ids or set()
-        self.delayed_free_req_ids = delayed_free_req_ids or set()
 
     def add_request(self, req_meta: ReqMeta) -> None:
         """Add a request to the metadata."""
         self.requests.append(req_meta)
-
-
-@dataclass
-class LayerBatchReqMeta:
-    req_ids: list[str]
-    layer_id: int
-    is_last_chunks: list[bool | None] = field(default_factory=list)
-    addr_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
-    size_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
-    gvas_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
-    load_keys: list[str] = field(default_factory=list)
-
-
-@dataclass
-class LayerBlockRange:
-    request: ReqMeta
-    start_block: int
-    end_block: int
-    partial_block_index: int | None = None
-
-
-@dataclass
-class SharedBlockData:
-    """Pre-computed block data shared across all layers for the same request."""
-
-    block_ids_arr: np.ndarray
-    block_gvas_arr: np.ndarray
-    req_ids: list[str]
-    is_last_chunks: list[bool | None]
-    save_keys: list[str] = field(default_factory=list)
-    load_keys: list[str] = field(default_factory=list)
-
-
-@dataclass
-class LayerTransferTask:
-    layer_id: int
-    block_ranges: list[LayerBlockRange]
-    shared_block_data: SharedBlockData | None = None
-    group_id: int = 0
-    layer_idx_in_group: int = 0
-    # Cache for KVCacheStoreKeyLayerSendingThread:
-    # maps block_range index -> list of (start, end, key_all_layers)
-    cached_process_tokens: dict[int, list[tuple[int, int, list]]] | None = None
-
-
-@dataclass
-class LayerLoadTask:
-    wait_for_save_layer: int | None
-    transfer_tasks: list[LayerTransferTask]
-    layer_id: int
-    attention_start_gate: AttentionComputeStartGate | None = None
 
 
 @dataclass(init=False)
