@@ -41,7 +41,6 @@ from vllm_ascend.ascend_config import WeightPrefetchConfig, get_ascend_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import AttentionSpec
 else:
     VllmConfig = None
 
@@ -80,30 +79,6 @@ _CUSTOM_OP_BASE_DIR = (
 )
 
 
-def is_dspark_config(config: Any) -> bool:
-    """Return whether a config object enables a DSpark draft model.
-
-    ``config`` may be an HF config, ModelConfig, SpeculativeConfig, or
-    VllmConfig. DSpark is identified by a truthy ``dspark_block_size``.
-    """
-    if config is None:
-        return False
-
-    speculative_config = getattr(config, "speculative_config", None)
-    if speculative_config is not None:
-        config = speculative_config
-
-    draft_model_config = getattr(config, "draft_model_config", None)
-    if draft_model_config is not None:
-        config = draft_model_config
-
-    hf_config = getattr(config, "hf_config", None)
-    if hf_config is not None:
-        config = hf_config
-
-    return bool(getattr(config, "dspark_block_size", 0))
-
-
 def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
     """Extract DSV4 index for config per-layer arrays.
 
@@ -133,31 +108,6 @@ def get_dsv4_compress_ratio(config: Any, layer_idx: int) -> int:
     if compress_ratios is None or layer_idx >= len(compress_ratios):
         return 0
     return compress_ratios[layer_idx]
-
-
-def model_uses_sfa_sparse(model_config: Any | None) -> bool:
-    hf_text_config = getattr(model_config, "hf_text_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
-    return (
-        hf_text_config is not None
-        and hasattr(hf_text_config, "index_topk")
-        and not hasattr(hf_text_config, "compress_ratios")
-        and not hasattr(hf_config, "compress_ratios")
-    )
-
-
-def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> bool:
-    if vllm_config is None:
-        from vllm.config import get_current_vllm_config
-
-        vllm_config = get_current_vllm_config()
-
-    parallel_config = vllm_config.parallel_config
-    return (
-        model_uses_sfa_sparse(vllm_config.model_config)
-        and parallel_config.decode_context_parallel_size > 1
-        and parallel_config.prefill_context_parallel_size == 1
-    )
 
 
 def clear_enable_sp():
@@ -589,15 +539,6 @@ def adapt_patch(is_global_patch: bool = False):
         from vllm_ascend.patch import platform  # noqa: F401
     else:
         from vllm_ascend.patch import worker  # noqa: F401
-        # Worker trace patches wrap NPUModelRunner, which is only fully
-        # defined after vllm_ascend.worker.model_runner_v1 finishes
-        # importing. That module imports from vllm_ascend.patch.worker
-        # (via patch_draft_quarot), so applying trace at patch-worker
-        # import time re-enters a partially-initialized model_runner_v1
-        # and raises a circular-import error. Deferring to here ensures
-        # model_runner_v1 is already loaded when trace wraps its targets.
-        if os.getenv("VLLM_ASCEND_TRACE", "0") == "1":
-            import vllm_ascend.patch.worker.patch_trace  # noqa: F401
 
 
 def setup_ascend_local_comm_res(local_rank: int, kv_transfer_config: Any | None) -> None:
@@ -1746,25 +1687,10 @@ def get_compressed_pos_and_indices(
     return positions_compressed_list, req_indices_compressed_list, num_scheduled_tokens_compressed_list
 
 
-def kv_cache_spec_uses_sparse_sfa_c8(kv_cache_spec) -> bool:
+def kv_cache_spec_uses_sparse_c8(kv_cache_spec) -> bool:
     from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 
-    return isinstance(kv_cache_spec, AscendMLAAttentionSpec) and bool(
-        getattr(kv_cache_spec, "cache_sparse_sfa_c8", False)
-    )
-
-
-def kv_cache_spec_uses_sparse_li_c8(kv_cache_spec) -> bool:
-    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
-
-    return isinstance(kv_cache_spec, AscendMLAAttentionSpec) and bool(
-        getattr(kv_cache_spec, "cache_sparse_li_c8", False)
-    )
-
-
-def sparse_kv_cache_has_indexer(kv_cache_spec: AttentionSpec) -> bool:
-    sparse_head_dim = getattr(kv_cache_spec, "sparse_head_dim", None)
-    return sparse_head_dim is not None and len(sparse_head_dim) == 3 and sparse_head_dim[2] > 0
+    return isinstance(kv_cache_spec, AscendMLAAttentionSpec) and bool(getattr(kv_cache_spec, "cache_sparse_c8", False))
 
 
 def is_hidden_state_cache_spec(spec) -> bool:
