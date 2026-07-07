@@ -43,7 +43,6 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedEx
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_NZ,
     maybe_trans_nz,
@@ -113,11 +112,18 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def process_weights_after_loading(self, layer):
         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
 
-        w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
-        layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+        if not vllm_version_is("0.23.0"):
+            w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2)
+            layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
 
-        w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
-        layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+            w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2)
+            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+        else:
+            w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
+            layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+
+            w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
+            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
 
         # TODO: Current dispatch_ffn_combine fusion operator ONLY supports NZ format.
         # Therefore, we must cast weights to NZ when fusion is enabled.
@@ -125,16 +131,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # ND format (or other formats), remove this specific 'if' check and the forced
         # npu_format_cast. At that point, the operator should be able to handle weights
         # in their native format without explicit casting here.
-        enable_fused_mc2 = get_ascend_config().enable_fused_mc2
-        if enable_fused_mc2:
+        if get_ascend_config().enable_fused_mc2:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
             layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
-            if enable_fused_mc2 == 1 and self.dynamic_eplb:
-                layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
-                layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
-                del layer.w13_weight
-                del layer.w2_weight
-                torch.npu.empty_cache()
         else:
             layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
             layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
@@ -232,25 +231,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # (due to signature constraints), we are forced to use a placeholder empty tensor.
         # This TODO tracks the requirement to update the C++ operator to accept Optional[Tensor]
         # or None for scales in non-quantized scenarios.
-        w13_weight_list = getattr(layer, "w13_weight_list", None)
-        w2_weight_list = getattr(layer, "w2_weight_list", None)
-        has_split_weight_lists = isinstance(w13_weight_list, list) and isinstance(w2_weight_list, list)
         if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
-            if self.dynamic_eplb and not has_split_weight_lists:
-                logger.warning_once(
-                    "FUSED_MC2 is enabled with dynamic EPLB, but unquantized MoE weights are not split into "
-                    "tensor lists. This may cause accuracy issues or communication hangs."
-                )
-            w1 = w13_weight_list if isinstance(w13_weight_list, list) else [layer.w13_weight]
-            w2 = w2_weight_list if isinstance(w2_weight_list, list) else [layer.w2_weight]
+            w1 = [layer.w13_weight]
             w1_scale = [torch.tensor([], dtype=torch.int64)]
+            w2 = [layer.w2_weight]
             w2_scale = [torch.tensor([], dtype=torch.int64)]
             w1_scale_bias = [torch.tensor([], dtype=torch.float32)]
             w2_scale_bias = [torch.tensor([], dtype=torch.float32)]
         else:
-            w1 = w13_weight_list if isinstance(w13_weight_list, list) else layer.w13_weight
+            w1 = layer.w13_weight
             w1_scale = None
-            w2 = w2_weight_list if isinstance(w2_weight_list, list) else layer.w2_weight
+            w2 = layer.w2_weight
             w2_scale = None
             w1_scale_bias = None
             w2_scale_bias = None
@@ -278,9 +269,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
                 swiglu_limit=layer.swiglu_limit,
-                # Per-layer MoE LoRA state, set once by AscendFusedMoEWithLoRA
-                # when an adapter wraps this layer; None for non-LoRA layers.
-                lora_context=getattr(layer, "_ascend_moe_lora_context", None),
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -360,9 +348,6 @@ else:
                 )
 
             self.quant_type = self._get_quant_type()
-            # Can be removed after vllm fixes the issue.
-            if self._needs_routed_expert_parameter_aliases():
-                self._register_routed_expert_parameter_aliases()
 
             self.moe_config.tp_group = get_tp_group()
             self.moe_config.dp_group = get_dp_group()
@@ -514,29 +499,6 @@ else:
 
             return quant_type
 
-        def _register_routed_expert_parameter_aliases(self) -> None:
-            alias_names = []
-            for name, param in self.routed_experts.named_parameters(recurse=False):
-                alias_param = torch.nn.Parameter(param.data, requires_grad=param.requires_grad)
-                alias_param.__dict__.update(param.__dict__)
-                self.register_parameter(name, alias_param)
-                alias_names.append(name)
-
-            original_process_weights = self._quant_method.process_weights_after_loading
-
-            @wraps(original_process_weights)
-            def wrapped_process_weights(layer, *args, **kwargs):
-                for name in alias_names:
-                    self._parameters.pop(name, None)
-                return original_process_weights(layer, *args, **kwargs)
-
-            self._quant_method.process_weights_after_loading = wrapped_process_weights  # type: ignore[method-assign]
-
-        def _needs_routed_expert_parameter_aliases(self) -> bool:
-            vllm_config = get_current_vllm_config()
-            hf_config = getattr(vllm_config.model_config, "hf_config", None)
-            return getattr(hf_config, "model_type", None) == "gpt_oss"
-
         @property
         def is_internal_router(self) -> bool:
             gate = self.gate
@@ -580,9 +542,6 @@ else:
             states = torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(states)
             return states[..., :trunc_size]
 
-        def set_lora_context(self, lora_context):
-            self.routed_experts._ascend_moe_lora_context = lora_context
-
         def no_shared_forward_impl(  # type: ignore[override]
             self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
         ) -> torch.Tensor | FusedMoEResult:
@@ -603,9 +562,6 @@ else:
                 assert fc3_context is not None
                 assert AscendMoERunner.gate_stream is not None
                 AscendMoERunner.gate_stream.wait_stream(torch.npu.current_stream())
-                main_stream = torch.npu.current_stream()
-                hidden_states.record_stream(AscendMoERunner.gate_stream)
-                router_logits.record_stream(AscendMoERunner.gate_stream)
                 with npu_stream_switch(AscendMoERunner.gate_stream, enabled=self.multistream_overlap_gate):
                     # share_expert
                     assert fc3_context.shared_experts is not None
@@ -618,7 +574,6 @@ else:
                     ):
                         shared_out = tensor_model_parallel_all_reduce(shared_out)
                     set_flash_common3_context(shared_out=shared_out)
-                    shared_out.record_stream(main_stream)
                     input_ids = getattr(get_forward_context(), "input_ids", None)
 
                     topk_weights, topk_ids = select_experts(
@@ -736,8 +691,6 @@ else:
                 if evt is not None:
                     torch.npu.current_stream().wait_event(evt)
 
-            main_stream = torch.npu.current_stream()
-            hidden_states.record_stream(shared_experts_calculation_stream())
             with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap_shared_expert):
                 # Only used for int quantization
                 has_quantized_shared = hasattr(self._shared_experts.gate_up_proj, "weight_scale") and hasattr(
@@ -759,6 +712,9 @@ else:
                         bias=None,
                         output_dtype=torch.int32,
                     )
+                    # Execute activation concurrently with gmm2.
+
+                    maybe_wait_event(fused_moe_evts.before_gmm2)
                     quantized_x, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
                         x=hidden_states,
                         weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
@@ -794,6 +750,8 @@ else:
                     # dispatch communication.
                     maybe_wait_event(fused_moe_evts.before_dispatch)
                     hidden_states = self._shared_experts.gate_up_proj((quantized_x, pertoken_scale))[0]
+                    # Execute activation concurrently with gmm2.
+                    maybe_wait_event(fused_moe_evts.before_gmm2)
                     quantized_x, swiglu_out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
                         hidden_states,
                         topk_weight=None,
@@ -817,8 +775,6 @@ else:
                     # communication.
                     maybe_wait_event(fused_moe_evts.before_combine)
                     shared_out = self._shared_experts_part2(hidden_states, part1_out)
-
-                shared_out.record_stream(main_stream)
 
             # Make sure the default stream waits for the shared experts stream to
             # finish.
@@ -844,10 +800,13 @@ else:
             if self.is_internal_router:
                 gate = self.gate
                 assert gate is not None
+                # NOTE(Angazenn): To make this cast explicitly, the hbm usage might
+                # increase with extra hidden states. We also assume that all gate
+                # linear is unquantized so that we the weight is pre-casted in
+                # process_weights_after_loading of AscendUnquantizedLinearMethod.
+                hidden_states_fp32 = hidden_states.float()
                 before_routed_experts = torch.npu.current_stream().record_event()
-                router_logits = DeviceOperator.compute_gate_logits(
-                    hidden_states, gate.weight, gate.weight_fp32
-                )
+                router_logits = F.linear(hidden_states_fp32, gate.weight_fp32)
                 after_routed_experts = torch.npu.current_stream().record_event()
             else:
                 before_routed_experts = torch.npu.current_stream().record_event()
