@@ -24,9 +24,6 @@ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm.distributed.kv_events import BlockStored
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
-    ChunkedTokenDatabase,
-    HYBRID_CACHE_C128_TRANSFER_NAMESPACE,
-    HybridCacheC128Config,
     KeyMetadata,
     LayerMultiBlockReqMeta,
     LayerPoolKey,
@@ -75,9 +72,6 @@ class FakeKey:
 class FakeTokenDatabase:
     def __init__(self, block_size=16):
         self.block_size = block_size
-        self.group_block_len = [[block_size, block_size]]
-        self.group_kv_caches_base_addr = [[0, block_size]]
-        self.group_block_stride = {0: [block_size, block_size]}
 
     def process_tokens(self, token_len, block_hashes, mask_num=0):
         meta = KeyMetadata("m", 0, 0, 0, 0)
@@ -376,87 +370,6 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
         keys, _, _ = store.put_calls[0]
         self.assertEqual(len(keys), 1)
 
-    @staticmethod
-    def _make_hybrid_c128_thread():
-        store = FakeStore([0, 0])
-        transfer_config = HybridCacheC128Config(
-            enabled=True,
-            chunk_tokens=512,
-            namespace=HYBRID_CACHE_C128_TRANSFER_NAMESPACE,
-            c128_group_id=1,
-            c128_slots_per_page=128,
-        )
-        db = ChunkedTokenDatabase(
-            [
-                KeyMetadata("hybrid-model", 0, 0, 0, 0, kv_cache_group_id=0),
-                KeyMetadata("hybrid-model", 0, 0, 0, 0, kv_cache_group_id=1),
-            ],
-            block_size=[128, 128],
-            partitions=None,
-            use_hybrid=True,
-            hash_block_size=128,
-            hybrid_cache_c128_config=transfer_config,
-        )
-        db.set_group_buffers(
-            {0: [1000], 1: [2000]},
-            {0: [1280], 1: [1280]},
-            group_cache_families={0: "c4", 1: "c128"},
-        )
-        thread = KVCacheStoreSendingThread(
-            m_store=store,
-            token_database=db,
-            block_size=[128, 128],
-            tp_rank=0,
-            dcp_size=1,
-            put_step=1,
-            kv_role="kv_producer",
-            ready_event=threading.Event(),
-            group_uses_align_state=[False, False],
-        )
-        return thread, store
-
-    def test_hybrid_c128_put_publishes_only_complete_512_frontier(self):
-        thread, store = self._make_hybrid_c128_thread()
-        request = ReqMeta(
-            req_id="r1",
-            token_len_chunk=1000,
-            block_ids_by_group=[[7], [9]],
-            block_hashes=[bytes([index]) * 32 for index in range(8)],
-            kv_cache_group_ids=[0, 1],
-        )
-        thread.add_stored_request(request.req_id)
-        thread.request_queue.put(request)
-
-        with self.assertLogs(level="DEBUG") as logs:
-            thread._handle_request(request)
-        self.assertTrue(any("kv Test put" in line for line in logs.output))
-
-        self.assertEqual(len(store.put_calls), 2)
-        self.assertEqual([len(keys) for keys, _, _ in store.put_calls], [1, 1])
-        self.assertIn("@range:0_4", store.put_calls[1][0][0])
-
-    def test_hybrid_c128_put_uses_non_cumulative_c128_keys_and_full_pages(self):
-        thread, store = self._make_hybrid_c128_thread()
-        request = ReqMeta(
-            req_id="r1",
-            token_len_chunk=1024,
-            block_ids_by_group=[[7, 8], [9]],
-            block_hashes=[bytes([index]) * 32 for index in range(8)],
-            kv_cache_group_ids=[0, 1],
-        )
-        thread.add_stored_request(request.req_id)
-        thread.request_queue.put(request)
-
-        thread._handle_request(request)
-
-        self.assertEqual(len(store.put_calls), 2)
-        c128_keys, c128_addrs, c128_sizes = store.put_calls[1]
-        self.assertEqual(len(c128_keys), 2)
-        self.assertIn("@range:0_4", c128_keys[0])
-        self.assertIn("@range:4_8", c128_keys[1])
-        self.assertEqual(c128_addrs, [[2000 + 9 * 1280]] * 2)
-        self.assertEqual(c128_sizes, [[1280], [1280]])
-
 
 class TestKVCacheStoreRecvingThread(unittest.TestCase):
     def test_handle_request(self):
@@ -512,104 +425,9 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
         keys, _, _ = store.get_calls[0]
         self.assertEqual(len(keys), 1)
 
-    @staticmethod
-    def _make_hybrid_c128_thread():
-        store = FakeStore()
-        store.get = MagicMock(side_effect=lambda keys, _addrs, _sizes: [0] * len(keys))
-        transfer_config = HybridCacheC128Config(
-            enabled=True,
-            chunk_tokens=512,
-            namespace=HYBRID_CACHE_C128_TRANSFER_NAMESPACE,
-            c128_group_id=1,
-            c128_slots_per_page=128,
-        )
-        db = ChunkedTokenDatabase(
-            [
-                KeyMetadata("hybrid-model", 0, 0, 0, 0, kv_cache_group_id=0),
-                KeyMetadata("hybrid-model", 0, 0, 0, 0, kv_cache_group_id=1),
-            ],
-            block_size=[128, 128],
-            partitions=None,
-            use_hybrid=True,
-            hash_block_size=128,
-            hybrid_cache_c128_config=transfer_config,
-        )
-        db.set_group_buffers(
-            {0: [1000], 1: [2000]},
-            {0: [1280], 1: [1280]},
-            group_cache_families={0: "c4", 1: "c128"},
-        )
-        get_staging = MagicMock(return_value=([9000], [1280]))
-        merge_staging = MagicMock()
-        thread = KVCacheStoreRecvingThread(
-            m_store=store,
-            token_database=db,
-            block_size=[128, 128],
-            tp_rank=0,
-            dcp_size=1,
-            ready_event=threading.Event(),
-            invalid_block_ids=set(),
-            invalid_block_ids_lock=threading.Lock(),
-            get_c128_staging_value=get_staging,
-            merge_c128_staging_chunk=merge_staging,
-        )
-        return thread, store, get_staging, merge_staging
 
-    def test_hybrid_c128_async_load_aggregates_pages_and_loads_directly(self):
-        thread, store, get_staging, merge_staging = self._make_hybrid_c128_thread()
-        load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=1024, can_load=True, token_len=1024)
-        request = ReqMeta(
-            req_id="r1",
-            token_len_chunk=1024,
-            block_ids_by_group=[[7, 8], [9]],
-            block_hashes=[bytes([index]) * 32 for index in range(8)],
-            kv_cache_group_ids=[0, 1],
-            load_spec=load_spec,
-        )
-        thread.request_queue.put(request)
-
-        thread._handle_request(request)
-
-        self.assertEqual(store.get.call_count, 2)
-        get_keys, get_addrs, get_sizes = store.get.call_args_list[1].args
-        self.assertEqual(len(get_keys), 1)
-        self.assertIn("@range:4_8", get_keys[0])
-        self.assertEqual(get_addrs, [[2000 + 9 * 1280]])
-        self.assertEqual(get_sizes, [[1280]])
-        get_staging.assert_not_called()
-        merge_staging.assert_not_called()
-        self.assertIn("r1", thread.get_and_clear_finished_requests())
-
-    def test_hybrid_c128_async_load_does_not_merge_failed_chunk(self):
-        thread, store, get_staging, merge_staging = self._make_hybrid_c128_thread()
-        store.get.side_effect = lambda keys, _addrs, _sizes: [1] * len(keys)
-        load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=512, can_load=True, token_len=512)
-        request = ReqMeta(
-            req_id="r1",
-            token_len_chunk=512,
-            block_ids_by_group=[[], [9]],
-            block_hashes=[bytes([index]) * 32 for index in range(4)],
-            kv_cache_group_ids=[1],
-            load_spec=load_spec,
-        )
-        thread.request_queue.put(request)
-
-        thread._handle_request(request)
-
-        self.assertEqual(store.get.call_count, 1)
-        get_keys, get_addrs, get_sizes = store.get.call_args.args
-        self.assertEqual(len(get_keys), 1)
-        self.assertIn("@range:0_4", get_keys[0])
-        self.assertEqual(get_addrs, [[2000 + 9 * 1280]])
-        self.assertEqual(get_sizes, [[1280]])
-        get_staging.assert_not_called()
-        merge_staging.assert_not_called()
-        self.assertIn("r1", thread.get_and_clear_finished_requests())
-
-
-@unittest.skip("LayerMultiBlockReqMeta API is deprecated, tests need update for LayerTransferTask")
 class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
-    def _make_thread(self, exists_result=None, num_layers=2):
+    def _make_thread(self, exists_result=None, num_layers=2, enable_kv_event=False):
         store = FakeStore(exists_result or [0, 0])
         db = FakeTokenDatabase()
         t = KVCacheStoreLayerSendingThread(
@@ -617,16 +435,11 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
             token_database=db,
             block_size=16,
             tp_rank=0,
-            tp_size=1,
             dcp_size=1,
             put_step=1,
-            my_key_index=0,
-            num_ranks_per_layer=1,
-            page_size_bytes=32,
             ready_event=threading.Event(),
             num_layers=num_layers,
-            layer_save_finished_events=[threading.Event() for _ in range(num_layers)],
-            sync_save_events=[],
+            enable_kv_event=enable_kv_event,
         )
         return t, store
 
@@ -721,7 +534,7 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
         self.assertIn("r1", finished)
 
     def test_layerwise_kv_event_published_on_final_layer(self):
-        t, store = self._make_thread([0], num_layers=2)
+        t, store = self._make_thread([0], num_layers=2, enable_kv_event=True)
         req = self._make_layer_req(layer_id=1, is_last_chunk=True, num_keys=1)
         t.add_stored_request(req.req_id)
         t.request_queue.put(req)
@@ -733,7 +546,7 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
         self.assertEqual(events[0].block_size, 16)
 
     def test_layerwise_kv_event_not_published_before_final_layer(self):
-        t, store = self._make_thread([0], num_layers=2)
+        t, store = self._make_thread([0], num_layers=2, enable_kv_event=True)
         req = self._make_layer_req(layer_id=0, is_last_chunk=False, num_keys=1)
         t.add_stored_request(req.req_id)
         t.request_queue.put(req)
@@ -741,7 +554,7 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
         self.assertEqual(t.get_kv_events(), [])
 
     def test_layerwise_kv_event_uses_missing_blocks_from_previous_layers(self):
-        t, store = self._make_thread([0], num_layers=2)
+        t, store = self._make_thread([0], num_layers=2, enable_kv_event=True)
         first_layer_req = self._make_layer_req(layer_id=0, is_last_chunk=True, num_keys=1)
         t.add_stored_request(first_layer_req.req_id)
         t.request_queue.put(first_layer_req)
@@ -755,7 +568,6 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
         self.assertEqual(events[0].block_hashes, [maybe_convert_block_hash(b"h0")])
 
 
-@unittest.skip("LayerMultiBlockReqMeta API is deprecated, tests need update for LayerTransferTask")
 class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
     def test_handle_request(self):
         store = FakeStore()
