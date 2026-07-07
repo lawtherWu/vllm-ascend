@@ -73,6 +73,43 @@ def needs_layer_aware_fia_graph_replay() -> bool:
     return any(model_type in {"gemma4", "gemma4_text"} for model_type in model_types)
 
 
+def cache_graph_workspace(
+    graph_params,
+    num_tokens: int,
+    candidate_workspace: torch.Tensor,
+    *,
+    use_max_workspace: bool,
+) -> torch.Tensor:
+    # Most models keep the original first-workspace cache behavior. Models with
+    # mixed attention layer shapes may need the largest workspace for a graph
+    # size because layers can require different FIA workspace sizes.
+    current_workspace = graph_params.workspaces.get(num_tokens)
+    if use_max_workspace:
+        if current_workspace is None or (
+            candidate_workspace.numel() * candidate_workspace.element_size()
+            > current_workspace.numel() * current_workspace.element_size()
+        ):
+            graph_params.workspaces[num_tokens] = candidate_workspace
+    elif current_workspace is None:
+        graph_params.workspaces[num_tokens] = candidate_workspace
+    return graph_params.workspaces[num_tokens]
+
+
+@lru_cache(maxsize=1)
+def needs_layer_aware_fia_graph_replay() -> bool:
+    vllm_config = get_current_vllm_config()
+    model_config = vllm_config.model_config
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    text_config = getattr(hf_config, "text_config", None)
+    model_types = (
+        getattr(hf_config, "model_type", None),
+        getattr(hf_text_config, "model_type", None),
+        getattr(text_config, "model_type", None),
+    )
+    return any(model_type in {"gemma4", "gemma4_text"} for model_type in model_types)
+
+
 def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
     scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
@@ -454,26 +491,6 @@ def maybe_save_kv_layer_to_connector(
         return
     # TODO: assert ascendMetadata
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
-
-
-def notify_kv_cache_written(layer_name: str = ""):
-    """Notify the connector that the paged KV cache for ``layer_name`` has been
-    written for the current step.
-
-    The attention layer calls this unconditionally; each connector decides whether
-    it needs to record a synchronization primitive (e.g. a compute-stream event
-    later waited on by the resharding stream to overlap the outgoing KV copy).
-    Connectors that don't need it -- such as the AscendStore pool connector, which
-    records its own sync event at save time -- simply do not implement
-    ``on_kv_cache_written`` and this becomes a no-op.
-    """
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return
-
-    connector = get_kv_transfer_group()
-    on_kv_cache_written = getattr(connector, "on_kv_cache_written", None)
-    if on_kv_cache_written is not None:
-        on_kv_cache_written(layer_name)
 
 
 def round_up(val: int, align: int) -> int:
