@@ -13,28 +13,20 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import (
-    AscendCommonAttentionMetadata,
-    maybe_save_kv_layer_to_connector,
-    notify_kv_cache_written,
-    split_decodes_and_prefills,
-    wait_for_kv_layer_from_connector,
-)
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.device.mxfp_compat import is_rms_norm_dynamic_mx_quant_fusion_available
 from vllm_ascend.distributed.utils import all_gather_async
-from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
-from vllm_ascend.quantization.methods.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_dsa_cp_with_o_proj_tp,
     get_ascend_device_type,
     olora_tp_enable,
 )
+
 
 def hadamard_transform_ref(
     x: torch.Tensor,
@@ -63,36 +55,6 @@ def _has_prefill(attn_state: AscendAttentionState) -> bool:
         AscendAttentionState.DecodeOnly,
         AscendAttentionState.SpecDecoding,
     }
-
-
-def _is_w8a8_mxfp8_dynamic(linear) -> bool:
-    qm = getattr(linear, "quant_method", None)
-    if qm is None or isinstance(qm, AscendUnquantizedLinearMethod):
-        return False
-    inner = getattr(qm, "quant_method", None)
-    return isinstance(inner, AscendW8A8MXFP8DynamicLinearMethod)
-
-
-def _can_fuse_q_norm_mx_quant(
-    is_mxfp8: bool,
-    fusion_available: bool,
-    qr_consumed_by_topk: bool,
-) -> bool:
-    return is_mxfp8 and fusion_available and not qr_consumed_by_topk
-
-
-def _rms_norm_dynamic_mx_quant(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    out = torch.ops.npu.npu_rms_norm_dynamic_mx_quant(
-        x,
-        weight,
-        epsilon=eps,
-        dst_type=torch.float8_e4m3fn,
-    )
-    return out[0], out[1]
 
 
 @dataclass
@@ -636,7 +598,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         )
         local_seq_lens_q_cpu = local_query_start_loc_cpu[1 : num_reqs + 1] - local_query_start_loc_cpu[:num_reqs]
         max_local_query_len = max(1, int(local_seq_lens_q_cpu.max().item()))
-        max_local_seqlen = max(1, int(local_seq_lens_cpu.max().item()))
+        max_local_seq_lens = max(1, int(local_seq_lens_cpu.max().item()))
 
         # start_pos: context length before current query
         start_pos = self.seq_lens[:num_reqs] - seq_lens_q
@@ -677,8 +639,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             query_start_loc=local_query_start_loc,
             seq_lens=local_seq_lens,
             seq_lens_q=local_seq_lens_q,
-            max_seqlen=max_local_seqlen,
-            max_seqlen_q=max_local_query_len,
+            max_query_len=max_local_query_len,
+            max_seq_lens=max_local_seq_lens,
             index_topk=index_topk,
             num_reqs=num_reqs,
             has_prefill=has_prefill,
@@ -690,8 +652,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             query_start_loc=local_query_start_loc,
             seq_lens=local_seq_lens,
             seq_lens_q=local_seq_lens_q,
-            max_seqlen=max_local_seqlen,
-            max_seqlen_q=max_local_query_len,
             num_reqs=num_reqs,
         )
 
@@ -826,8 +786,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         query_start_loc,
         seq_lens,
         seq_lens_q,
-        max_seqlen,
-        max_seqlen_q,
+        max_query_len,
+        max_seq_lens,
         index_topk,
         num_reqs,
         has_prefill,
@@ -865,8 +825,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
                 seqused_q=self.seqused_q,
                 seqused_kv=seq_lens,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen,
+                max_seqlen_q=max_query_len,
+                max_seqlen_kv=max_seq_lens,
                 batch_size=num_reqs,
                 ori_mask_mode=4,
                 ori_win_left=self.model_config.hf_config.sliding_window - 1,
@@ -894,7 +854,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.req_sas_metadata[:1024] = metadata
         return self.req_sas_metadata[:1024]
 
-    def _build_qli_metadata(self, query_start_loc, seq_lens, seq_lens_q, max_seqlen, max_seqlen_q, num_reqs):
+    def _build_qli_metadata(self, query_start_loc, seq_lens, seq_lens_q, num_reqs):
         if self.compressor_ratio != 4:
             return None
 
@@ -902,6 +862,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         metadata = self.common_ratio_to_sas_metadata.get(cache_key)
 
         if metadata is None:
+            max_seqlen_q = max(1, int(seq_lens_q.max().item()))
+            max_seqlen_k = max(1, int(seq_lens.max().item()))
             metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
                 actual_seq_lengths_query=query_start_loc[1:].clone(),
                 actual_seq_lengths_key=seq_lens.clone(),
@@ -912,7 +874,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 key_quant_mode=0,
                 batch_size=num_reqs,
                 max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen,
+                max_seqlen_k=max_seqlen_k,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=self.model_config.hf_config.index_topk,
@@ -1228,7 +1190,6 @@ class AscendDSACPImpl(DSAAttentionImpl):
             return output.fill_(0)
         if not isinstance(attn_metadata, list):
             attn_metadata = [attn_metadata]
-        wait_for_kv_layer_from_connector(layer_name)
         full_gather_wo_a_enabled = (
             self.tp_size > 1
             and self.enable_dsa_cp_with_o_proj_tp
@@ -1299,8 +1260,6 @@ class AscendDSACPImpl(DSAAttentionImpl):
             if full_gather_wo_a_enabled:
                 self._switch_o_proj_to_tp_weight()
 
-        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
-
         return output
 
     def _forward(
@@ -1340,30 +1299,9 @@ class AscendDSACPImpl(DSAAttentionImpl):
         has_prefill = _has_prefill(common_attn_metadata.attn_state)
         hidden_states_cache = hidden_states[: common_attn_metadata.num_actual_tokens]
 
-        is_w8a8 = (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
+        if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
             self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod
-        )
-        is_mxfp8 = _is_w8a8_mxfp8_dynamic(self.wq_b)
-        fusion_available = is_rms_norm_dynamic_mx_quant_fusion_available()
-        # CP compress_ratio=4 always consumes qr_local for indexer topk.
-        qr_consumed_by_topk = self.compress_ratio == 4
-        can_fuse_q_norm_mx_quant = _can_fuse_q_norm_mx_quant(
-            is_mxfp8=is_mxfp8,
-            fusion_available=fusion_available,
-            qr_consumed_by_topk=qr_consumed_by_topk,
-        )
-
-        if can_fuse_q_norm_mx_quant:
-            q_a = self.wq_a(hidden_states_local)
-            q_b_quant, q_b_scale = _rms_norm_dynamic_mx_quant(q_a, self.q_norm.weight, self.eps)
-            q = self.wq_b.quant_method.apply(
-                self.wq_b,
-                (q_b_quant, q_b_scale),
-                self.wq_b.bias,
-            )
-            qr_local = None
-            qr_pertoken_scale_local = None
-        elif is_w8a8:
+        ):
             q_a = self.wq_a(hidden_states_local)
             qr_local, qr_pertoken_scale_local = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
                 q_a, self.q_norm.weight, epsilon=self.eps
@@ -1486,8 +1424,6 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 compressed_kv = None
             DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
 
-        notify_kv_cache_written(layer_name)
-        record_attention_compute_start()
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
         if has_prefill:

@@ -25,7 +25,7 @@
 #
 import math
 import typing
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
@@ -77,7 +77,6 @@ from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
-from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_dsa_cp,
@@ -89,45 +88,6 @@ from vllm_ascend.utils import (
 
 if not vllm_version_is("0.23.0"):
     from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
-
-DSV4_STACKED_PARAMS_MAPPING = (
-    ("gate_up_proj", "gate_proj", 0),
-    ("gate_up_proj", "up_proj", 1),
-)
-
-
-def _normalize_dsv4_layer_weight_name(
-    name: str,
-    *,
-    preserve_wo_a_scale: bool = False,
-) -> str:
-    name = name.replace(".w1.", ".gate_proj.")
-    name = name.replace(".w2.", ".down_proj.")
-    name = name.replace(".w3.", ".up_proj.")
-    name = name.replace(".attn.", ".self_attn.")
-    name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
-    name = name.replace(".attn_norm.", ".input_layernorm.")
-    name = name.replace(".ffn.", ".mlp.")
-    if name.endswith(".scale") and not (preserve_wo_a_scale and name.endswith(".self_attn.wo_a.scale")):
-        name = name.removesuffix(".scale") + ".weight_scale"
-    return name.replace(".gate.bias", ".gate.e_score_correction_bias")
-
-
-def _hc_head_torch(
-    x: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_eps: float,
-    hc_eps: float,
-) -> torch.Tensor:
-    shape, dtype = x.size(), x.dtype
-    x_flat = x.flatten(1).float()
-    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + norm_eps)
-    mixes = F.linear(x_flat, hc_fn) * rsqrt
-    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
-    y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=1)
-    return y.to(dtype)
 
 
 def _get_ascend_dsa_backend():
@@ -206,7 +166,6 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             cache_dtype_str=self.cache_config.cache_dtype,
             scale_dim=1 if self.head_dim == 128 else 0,
             scale_dtype=torch.float if get_ascend_device_type() in {AscendDeviceType.A5} else torch.float16,
-            page_size_padded=_dsv4_block_sizes()[vllm_config.cache_config.block_size][1][0],
         )
 
     def forward(self): ...
@@ -230,22 +189,17 @@ class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
         self.block_size = _dsv4_block_sizes()[cache_config.block_size][0][1]
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        is_dspark_cache = getattr(self, "is_dspark_cache", False)
-        if get_ascend_device_type() in {AscendDeviceType.A5} and not is_dspark_cache:
+        if get_ascend_device_type() in {AscendDeviceType.A5}:
             self.dtype = torch.float8_e4m3fn
             vllm_config.cache_config.cache_dtype = "float8_e4m3fn"
-        cached_head_size = (
-            self.head_dim + 128
-            if get_ascend_device_type() in {AscendDeviceType.A5} and not is_dspark_cache
-            else self.head_dim
-        )
+        cached_head_size = self.head_dim + 128 if get_ascend_device_type() in {AscendDeviceType.A5} else self.head_dim
         return AscendSlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=cached_head_size,
             dtype=self.dtype,
             sliding_window=self.window_size,
-            cache_dtype_str="auto" if is_dspark_cache else self.cache_config.cache_dtype,
+            cache_dtype_str=self.cache_config.cache_dtype,
             model_version="deepseek_v4",
             alignment=None,
         )
@@ -519,7 +473,7 @@ class DeepseekV4MoE(nn.Module):
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
         else:
             # router_logits: (num_tokens, n_experts)
-            router_logits = DeviceOperator.compute_gate_logits(hidden_states, self.gate.weight)
+            router_logits = F.linear(hidden_states.float(), self.gate.weight)
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
         fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
@@ -962,7 +916,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
         is_draft_layer: bool = False,
-        attn_cls: type[nn.Module] | None = None,
     ) -> None:
         super().__init__()
 
@@ -980,8 +933,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.norm_eps = config.rms_norm_eps
 
-        if attn_cls is None:
-            attn_cls = DeepseekV4Attention
+        attn_cls = DeepseekV4Attention
 
         self.self_attn = attn_cls(
             vllm_config=vllm_config,
@@ -1034,33 +986,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self._forward_hc_blocks(
-            positions,
-            hidden_states,
-            llama_4_scaling=llama_4_scaling,
-        )
-
-    def _forward_hc_blocks(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        *,
-        llama_4_scaling: torch.Tensor | None = None,
-        input_ids: torch.Tensor | None = None,
-        extra_attn_kwargs: dict[str, torch.Tensor | None] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
-        if extra_attn_kwargs is not None:
-            attn_kwargs.update(extra_attn_kwargs)
         hidden_states = self.self_attn(**attn_kwargs)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, input_ids)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
@@ -1150,21 +1085,18 @@ class DeepseekV4Model(nn.Module):
             dtype=vllm_config.model_config.dtype,
             device=self.device,
         )
-        self._dspark_target_layer_ids = list(getattr(config, "dspark_target_layer_ids", []) or [])
-        self._dspark_target_layer_id_set = frozenset(self._dspark_target_layer_ids)
-        if self._dspark_target_layer_ids:
-            self._dspark_hidden_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                len(self._dspark_target_layer_ids) * config.hidden_size,
-                dtype=vllm_config.model_config.dtype,
-                device=self.device,
-            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        return _hc_head_torch(x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps)
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(1).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = torch.nn.functional.linear(x, hc_fn) * rsqrt
+        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
+        return y.to(dtype)
 
     def forward(
         self,
@@ -1198,12 +1130,8 @@ class DeepseekV4Model(nn.Module):
 
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
-        dspark_hiddens: list[torch.Tensor] = []
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
-            if layer.layer_idx in self._dspark_target_layer_id_set:
-                # Average over the HC branch dimension, preserving [num_tokens, hidden_size].
-                dspark_hiddens.append(hidden_states.mean(dim=1))
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         # When FlashComm1 (sequence parallelism) is enabled, tokens are
@@ -1225,14 +1153,6 @@ class DeepseekV4Model(nn.Module):
         else:
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
-        if self._dspark_target_layer_ids and dspark_hiddens:
-            dspark_states = torch.cat(dspark_hiddens, dim=-1)
-            if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
-                dspark_states = tensor_model_parallel_all_gather(dspark_states, dim=0)
-                pad_size = forward_ctx.pad_size
-                if pad_size > 0:
-                    dspark_states = dspark_states[:-pad_size]
-            self._dspark_hidden_buffer[: dspark_states.shape[0]].copy_(dspark_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1270,22 +1190,6 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
             self.num_routed_experts = example_moe.n_routed_experts
             self.num_shared_experts = example_moe.n_shared_experts
             self.num_redundant_experts = example_moe.n_redundant_experts
-
-    def set_moe_parameters_from_layers(self, layers: Iterator[nn.Module]) -> None:
-        self.expert_weights = []
-        self.num_expert_groups = getattr(self.config, "n_group", 1)
-        self.moe_layers = []
-        self.moe_mlp_layers = []
-        example_moe = None
-        for layer in layers:
-            if isinstance(layer, PPMissingLayer):
-                continue
-            assert isinstance(layer, DeepseekV2DecoderLayer)
-            if isinstance(layer.mlp, DeepseekV4MoE):
-                example_moe = layer.mlp
-                self.moe_mlp_layers.append(layer.mlp)
-                self.moe_layers.append(layer.mlp.experts)
-        self.extract_moe_parameters(example_moe)
 
     def update_physical_experts_metadata(
         self,
@@ -1333,7 +1237,25 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         self.set_moe_parameters()
 
     def set_moe_parameters(self):
-        self.set_moe_parameters_from_layers(iter(self.model.layers))
+        self.expert_weights = []
+
+        self.num_expert_groups = getattr(self.config, "n_group", 1)
+
+        self.moe_layers = []
+        self.moe_mlp_layers = []
+        example_moe = None
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+
+            assert isinstance(layer, DeepseekV2DecoderLayer)
+            if isinstance(layer.mlp, DeepseekV4MoE):
+                # Pick last one layer since the first ones may be dense layers.
+                example_moe = layer.mlp
+                self.moe_mlp_layers.append(layer.mlp)
+                self.moe_layers.append(layer.mlp.experts)
+
+        self.extract_moe_parameters(example_moe)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1383,13 +1305,15 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         """Pre-hc_head residual stream buffer (max_num_batched_tokens,
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
-        if getattr(self.model, "_dspark_target_layer_ids", None):
-            return getattr(self.model, "_dspark_hidden_buffer", None)
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         rocm_aiter_moe_shared_expert_enabled = getattr(get_ascend_config(), "mix_placement", False)
+        stacked_params_mapping = [
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -1433,16 +1357,34 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             if not name.startswith("model"):
                 name = f"model.{name}"
 
+            if ".w1." in name:
+                name = name.replace(".w1.", ".gate_proj.")
+            if ".w2." in name:
+                name = name.replace(".w2.", ".down_proj.")
+            if ".w3." in name:
+                name = name.replace(".w3.", ".up_proj.")
+
             if "model.head." in name and "model.lm_head." not in name:
                 name = name.replace("model.head.", "lm_head.")
             if "model.lm_head." in name:
                 name = name.replace("model.lm_head.", "lm_head.")
             if "embed." in name and "embed_token." not in name:
                 name = name.replace("embed.", "embed_tokens.")
-            name = _normalize_dsv4_layer_weight_name(name)
+            if "attn" in name and "self_attn" not in name:
+                name = name.replace(".attn.", ".self_attn.")
+            if ".ffn." in name:
+                name = name.replace(".ffn.", ".mlp.")
+            if ".ffn_norm." in name:
+                name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
+            if ".attn_norm." in name:
+                name = name.replace(".attn_norm.", ".input_layernorm.")
+            if name.endswith(".scale"):
+                name = name.replace(".scale", ".weight_scale")
 
             if "rotary_emb.inv_freq" in name:
                 continue
+            if ".gate.bias" in name:
+                name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
 
             if "sink" in name:
                 if is_pp_missing_parameter(name, self):
@@ -1459,7 +1401,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
 
             is_fusion_moe_shared_experts_layer = rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
 
-            for param_name, weight_name, shard_id in DSV4_STACKED_PARAMS_MAPPING:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
