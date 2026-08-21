@@ -426,6 +426,8 @@ def wait_for_kv_layer_from_connector(layer_name: str):
 def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],
+    *,
+    kv_ready_event: Any | None = None,
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -437,7 +439,12 @@ def maybe_save_kv_layer_to_connector(
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
-    connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+    connector.save_kv_layer(
+        layer_name,
+        kv_cache_layer,
+        attn_metadata,
+        kv_ready_event=kv_ready_event,
+    )
 
 
 def round_up(val: int, align: int) -> int:
