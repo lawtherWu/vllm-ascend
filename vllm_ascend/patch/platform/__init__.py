@@ -32,7 +32,6 @@ import vllm_ascend.patch.platform.patch_minimax_m2_config  # noqa
 import vllm_ascend.patch.platform.patch_glm_tool_call_streaming  # noqa
 
 if vllm_version_is("0.23.0"):
-    import vllm_ascend.patch.platform.patch_deepseek_v4_thinking_defaults  # noqa
     import vllm_ascend.patch.platform.patch_glm47_tool_call_parser  # noqa
     import vllm_ascend.patch.platform.patch_minimax_m2_tool_call_parser  # noqa
     import vllm_ascend.patch.platform.patch_minimax_usage_accounting  # noqa
@@ -41,6 +40,10 @@ import vllm_ascend.patch.platform.patch_weight_transfer_engine  # noqa
 import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
 import vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa
 import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
+
+# Must run before patch_balance_schedule replaces the module-level Scheduler
+# symbol. AsyncScheduler keeps the original Scheduler object as its base.
+import vllm_ascend.patch.platform.patch_layerwise_offload_scheduler  # noqa
 
 if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
