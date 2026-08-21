@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import importlib
 import math
 import threading
 from collections.abc import Generator
+from dataclasses import dataclass
 
 import torch
 import vllm.envs as envs
@@ -22,6 +24,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.utils import extract_layer_index
+
+from vllm_ascend.attention.cache_layout import stable_model_fingerprint
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
@@ -35,8 +40,18 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     get_block_hashes,
     get_cache_family_granularity,
     infer_group_cache_families,
-    resolve_hybrid_cache_c128_config,
+    build_layerwise_store_key,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_session import (
+    ChunkStoreSession,
+    PutBinding,
+    PutClaim,
+    RequestStoreLease,
+    StoreCommitError,
+    StorePutRegistry,
+    StoreReadLeaseRegistry,
+)
+from vllm_ascend.distributed.kv_transfer.layer_workspace_fence import RequestChunkKey
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
     AscendStoreCoordinator,
     ExternalCachedBlockPool,
@@ -70,6 +85,29 @@ backend_map = {
 }
 
 
+@dataclass(frozen=True)
+class _LayerwiseRangeBlock:
+    key: str
+    start: int
+    end: int
+    block_id: int
+    group_id: int = 0
+
+@dataclass(frozen=True)
+class _LayerwiseRangeComponent:
+    base_addr: int
+    block_len: int
+    block_stride: int
+    object_offset: int
+
+
+@dataclass
+class _LayerwiseRangeSessionState:
+    request: ReqMeta
+    session: ChunkStoreSession
+    records: list[_LayerwiseRangeBlock]
+
+
 class KVPoolWorker:
     # The main class for the cache engine.
 
@@ -82,6 +120,8 @@ class KVPoolWorker:
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         self.kv_cache_config = kv_cache_config
+        self.model_config = model_config
+        self.num_hidden_layers = getattr(model_config.hf_text_config, "num_hidden_layers", None)
         hf_text_config = getattr(model_config, "hf_text_config", None)
         hf_config = getattr(model_config, "hf_config", hf_text_config)
         self.hf_config = hf_text_config or hf_config
@@ -94,8 +134,10 @@ class KVPoolWorker:
         self.use_mla = False
         if hasattr(model_config, "use_mla") and isinstance(model_config.use_mla, bool) and model_config.use_mla:
             self.use_mla = True
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.use_sparse = hasattr(model_config.hf_text_config, "index_topk")
         self.use_layerwise = use_layerwize
+        self.use_layerwise_range = self.use_layerwise and bool(extra_config.get("use_layerwise_range", False))
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_size = parallel_config.pipeline_parallel_size
@@ -116,6 +158,10 @@ class KVPoolWorker:
         self.backend = vllm_config.kv_transfer_config.kv_connector_extra_config.get("backend", "mooncake")
         self.use_hybrid = self._uses_hybrid_kv_cache(vllm_config, kv_cache_config)
         self.use_mamba = self._uses_mamba_kv_cache(self.use_hybrid, kv_cache_config)
+        if self.use_layerwise_range and self.backend.lower() != "mooncake":
+            raise NotImplementedError(
+                "Layerwise Store range sessions currently require the Mooncake backend"
+            )
         self.original_block_size = self._infer_group_block_sizes(vllm_config, kv_cache_config)
         cp_scale = self.pcp_size * self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
@@ -243,6 +289,36 @@ class KVPoolWorker:
             parallel_config,
             **backend_kwargs,
         )
+        self._range_execution_id = -1
+        self._range_save_started = False
+        self._range_sessions: dict[str, _LayerwiseRangeSessionState] = {}
+        self._range_leases: dict[tuple[str, int], RequestStoreLease] = {}
+        self._range_read_plans: dict[
+            str, tuple[ReqMeta, RequestStoreLease, list[_LayerwiseRangeBlock]]
+        ] = {}
+        self._range_layer_futures: list[Future[None]] = []
+        self._range_finished_requests: set[str] = set()
+        self._range_executor: ThreadPoolExecutor | None = None
+        self._range_put_registry: StorePutRegistry | None = None
+        self._range_read_registry: StoreReadLeaseRegistry | None = None
+        self._range_components: dict[tuple[int, str], list[_LayerwiseRangeComponent]] = {}
+        self._range_object_sizes: dict[int, int] = {}
+        self._range_layer_ids: dict[tuple[int, str], int] = {}
+        self._range_layout_fingerprint: str | None = None
+        self._range_layout_version = 1
+        self._range_request_leases: dict[tuple[str, int], RequestStoreLease] = {}
+        # RequestTracker in vLLM 0.23 does not carry a generation field yet.
+        # Keep the generation at the worker boundary so a recycled request id
+        # cannot reuse an old Store lease or an old in-flight object.
+        self._range_request_generations: dict[str, int] = {}
+        self._range_generation_counters: dict[str, int] = {}
+        self._range_sessions_by_request: dict[str, _LayerwiseRangeSessionState] = {}
+        self._range_load_layers_seen: set[str] = set()
+        if self.use_layerwise_range:
+            self._range_executor = ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="layerwise-store-range"
+            )
+            self._range_put_registry = StorePutRegistry(self.m_store)
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = False
         if kv_event_config and kv_event_config.enable_kv_cache_events:
@@ -372,6 +448,150 @@ class KVPoolWorker:
             return cache.untyped_storage().data_ptr()
         except AttributeError:
             return cache.storage().data_ptr()
+
+    @staticmethod
+    def _align_up(value: int, alignment: int) -> int:
+        return (value + alignment - 1) // alignment * alignment
+
+    def _is_mtp_layer_name(self, layer_name: str) -> bool:
+        lowered = layer_name.lower()
+        if "mtp" in lowered or "draft" in lowered:
+            return True
+        if self.num_hidden_layers is None:
+            return False
+        try:
+            return extract_layer_index(layer_name) >= self.num_hidden_layers
+        except (IndexError, ValueError):
+            return False
+
+    def _range_group_layer_names(self, group_id: int) -> list[str]:
+        if self.kv_cache_config is None or group_id >= len(self.kv_cache_config.kv_cache_groups):
+            return [name for name in self.kv_caches if not self._is_mtp_layer_name(name)]
+        names = list(self.kv_cache_config.kv_cache_groups[group_id].layer_names)
+        return [name for name in names if name in self.kv_caches and not self._is_mtp_layer_name(name)]
+
+    def _init_layerwise_range_layout(self) -> None:
+        if not self.use_layerwise_range or self._range_layout_fingerprint is not None:
+            return
+        payload: list[dict[str, object]] = []
+        for group_id in range(self.num_kv_cache_groups):
+            offset = 0
+            layer_id = 0
+            names = self._range_group_layer_names(group_id)
+            for layer_name in names:
+                cache_tuple = self._as_cache_tuple(self.kv_caches[layer_name])
+                components: list[_LayerwiseRangeComponent] = []
+                for component_id, cache in enumerate(cache_tuple):
+                    block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
+                    offset = self._align_up(offset, 64)
+                    components.append(_LayerwiseRangeComponent(cache.data_ptr(), block_len, block_stride, offset))
+                    payload.append({"group": group_id, "layer": layer_name, "layer_id": layer_id, "component": component_id, "block_len": block_len, "block_stride": block_stride, "offset": offset})
+                    offset += block_len
+                self._range_components[(group_id, layer_name)] = components
+                self._range_layer_ids[(group_id, layer_name)] = layer_id
+                layer_id += 1
+            if names:
+                self._range_object_sizes[group_id] = self._align_up(offset, 64)
+        if not self._range_components:
+            raise RuntimeError("Layerwise range Store has no non-MTP attention layers")
+        self._range_layout_fingerprint = stable_model_fingerprint({"model": str(self.model_config.model), "groups": payload})
+        logger.info("Initialized layerwise range layout groups=%s object_sizes=%s fingerprint=%s", sorted(self._range_object_sizes), self._range_object_sizes, self._range_layout_fingerprint)
+
+    def _range_key(self, key, group_id: int) -> str:
+        self._init_layerwise_range_layout()
+        assert self._range_layout_fingerprint is not None
+        family = self._get_group_family(self.kv_cache_group_families, group_id)
+        return build_layerwise_store_key(key.key_metadata, key.chunk_hash, model_fingerprint=self._range_layout_fingerprint, cache_layout_version=self._range_layout_version, group_id=group_id, cache_family=family).to_string()
+
+    def _range_records(self, request: ReqMeta, token_len: int, group_id: int) -> list[_LayerwiseRangeBlock]:
+        if group_id >= len(request.block_ids_by_group):
+            return []
+        block_ids = request.block_ids_by_group[group_id]
+        block_size = self.grouped_block_size[group_id]
+        records: list[_LayerwiseRangeBlock] = []
+        skip_null = bool(request.skip_null_blocks_by_group and request.skip_null_blocks_by_group[group_id])
+        for start, end, key, block_id in self.token_database.process_tokens_with_block_ids(token_len, request.block_hashes, block_ids, kv_cache_group_id=group_id, skip_null_blocks=skip_null):
+            if end - start != block_size:
+                continue
+            records.append(_LayerwiseRangeBlock(self._range_key(key, group_id), start, end, block_id, group_id))
+        return records
+
+    def _range_destination(self, layer_name: str, records: list[_LayerwiseRangeBlock]):
+        keys: list[str] = []
+        ptrs: list[list[int]] = []
+        sizes: list[list[int]] = []
+        offsets: list[list[int]] = []
+        for record in records:
+            components = self._range_components.get((record.group_id, layer_name))
+            if not components:
+                continue
+            keys.append(record.key)
+            ptrs.append([c.base_addr + record.block_id * c.block_stride for c in components])
+            sizes.append([c.block_len for c in components])
+            offsets.append([c.object_offset for c in components])
+        return keys, ptrs, sizes, offsets
+
+    def _normalize_range_request_identity(self, request: ReqMeta) -> None:
+        """Attach a worker-local generation to vLLM 0.23 request metadata.
+
+        RequestTracker in the pinned vLLM does not expose a generation.  A
+        request id can nevertheless be recycled after completion, so the
+        Store lease owner must not be just that id.  Explicit generations are
+        accepted for newer vLLM callers but are checked against the worker
+        mapping to reject stale metadata.
+        """
+
+        request_id = request.req_id
+        supplied = int(getattr(request, "request_generation", 0) or 0)
+        current = self._range_request_generations.get(request_id)
+        if current is None:
+            if supplied > 0:
+                generation = supplied
+                self._range_generation_counters[request_id] = max(
+                    generation, self._range_generation_counters.get(request_id, 0)
+                )
+            else:
+                generation = self._range_generation_counters.get(request_id, 0) + 1
+                self._range_generation_counters[request_id] = generation
+            self._range_request_generations[request_id] = generation
+        else:
+            if supplied > 0 and supplied != current:
+                raise RuntimeError(
+                    f"stale Store request generation for {request_id}: "
+                    f"metadata={supplied}, active={current}"
+                )
+            generation = current
+        request.request_generation = generation
+        if int(getattr(request, "chunk_id", 0) or 0) < 0:
+            raise ValueError(f"invalid negative Store chunk id for {request_id}")
+
+    def _drop_range_request_identity(self, request_id: str) -> None:
+        """Forget only the active generation; keep the monotonic counter."""
+
+        self._range_request_generations.pop(request_id, None)
+
+    def _abort_range_read_plans(self) -> None:
+        """Release all active Store read leases after a range-load failure."""
+        owners = list(self._range_request_leases.items())
+        self._range_request_leases.clear()
+        self._range_read_plans.clear()
+        for owner, lease in owners:
+            try:
+                lease.release()
+            except BaseException:
+                logger.exception("Failed to release Store lease after range load failure: %s", owner)
+            self._drop_range_request_identity(owner[0])
+        self._range_load_layers_seen.clear()
+
+    def _get_range_lease(self, request: ReqMeta) -> RequestStoreLease:
+        if self._range_read_registry is None:
+            self._range_read_registry = StoreReadLeaseRegistry(self.m_store)
+        owner = (request.req_id, request.request_generation)
+        lease = self._range_request_leases.get(owner)
+        if lease is None:
+            lease = RequestStoreLease(owner, self._range_read_registry)
+            self._range_request_leases[owner] = lease
+        return lease
 
     def _infer_cache_group_metadata(self, group_id: int, layer_names: list[str]):
         group_addrs: list[int] = []
@@ -765,8 +985,9 @@ class KVPoolWorker:
             )
 
         self.m_store.register_buffer(ptrs, lengths)
-        if staging_ptrs:
-            self.m_store.register_additional_buffer(staging_ptrs, staging_lengths)
+        if self.use_layerwise_range:
+            self._init_layerwise_range_layout()
+            self._range_read_registry = StoreReadLeaseRegistry(self.m_store)
         self.token_database.set_group_buffers(
             self.group_kv_caches_base_addr,
             self.group_block_len,
@@ -776,7 +997,7 @@ class KVPoolWorker:
             group_num_layers=self.group_num_layers,
         )
 
-        if self.use_layerwise:
+        if self.use_layerwise and not self.use_layerwise_range:
             self.get_event = threading.Event()
             if self.kv_role in ["kv_producer", "kv_both"]:
                 ready_event_sending = threading.Event()
@@ -839,9 +1060,28 @@ class KVPoolWorker:
                 self.kv_recv_thread.start()
                 ready_event.wait()
 
+    def _start_load_range_request(self, request: ReqMeta, token_len: int) -> None:
+        self._normalize_range_request_identity(request)
+        request.skip_null_blocks_by_group = self.group_uses_align_state
+        load_group_ids = request.kv_cache_group_ids or [0]
+        records: list[_LayerwiseRangeBlock] = []
+        for group_id in load_group_ids:
+            records.extend(self._range_records(request, token_len, group_id))
+        lease = self._get_range_lease(request)
+        if records:
+            unique_records = list({record.key: record for record in records}.values())
+            keys = [record.key for record in unique_records]
+            exists = self.m_store.exists(keys)
+            if exists is None or len(exists) != len(keys):
+                raise RuntimeError(f"Layerwise range exists returned invalid result for {request.req_id}")
+            records = [record for record, code in zip(unique_records, exists, strict=True) if int(code) == 1]
+            lease.ensure_history([record.key for record in records])
+        self._range_read_plans[request.req_id] = (request, lease, records)
+
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         self.current_layer = 0
         self.layerwise_retrievers = []
+        self._range_load_layers_seen.clear()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         for request in metadata.requests:
             load_spec = request.load_spec
@@ -873,6 +1113,9 @@ class KVPoolWorker:
                 load_group_ids,
                 self.load_async,
             )
+            if self.use_layerwise_range:
+                self._start_load_range_request(request, token_len)
+                continue
             if self.use_layerwise:
                 layerwise_retriever = self.retrieve_layer(request)
                 next(layerwise_retriever)  # first layer load
@@ -912,7 +1155,48 @@ class KVPoolWorker:
                     len(key_list) + c128_page_count,
                 )
 
-    def wait_for_layer_load(self) -> None:
+    def _wait_for_layer_load_range(self, layer_name: str | None) -> None:
+        if layer_name is None:
+            return
+        self._range_load_layers_seen.add(layer_name)
+        for req_id, (request, lease, records) in list(self._range_read_plans.items()):
+            keys, ptrs, sizes, offsets = self._range_destination(layer_name, records)
+            if not keys:
+                continue
+            try:
+                result = lease.load_layer(keys, ptrs, sizes, offsets)
+                expected_bytes = tuple(sum(row) for row in sizes)
+                if len(result) != len(keys) or any(
+                    int(code) != expected
+                    for code, expected in zip(result, expected_bytes, strict=False)
+                ):
+                    raise StoreCommitError(
+                        f"Store range get failed for {req_id}: "
+                        f"result={result!r}, expected={expected_bytes!r}"
+                    )
+            except BaseException as error:
+                logger.error("Layerwise range load failed req=%s layer=%s error=%s", req_id, layer_name, error)
+                with self._invalid_block_ids_lock:
+                    self._invalid_block_ids.update(record.block_id for record in records if record.key in set(keys))
+                # A range miss is not a prefix-cache miss: the workspace may be
+                # partially written. Abort before Attention can consume it.
+                self._abort_range_read_plans()
+                raise StoreCommitError(
+                    f"Layerwise Store load failed for request {req_id}, layer {layer_name}"
+                ) from error
+        all_layers = {name for group_id, name in self._range_components}
+        if all_layers and all_layers.issubset(self._range_load_layers_seen):
+            for req_id, (request, lease, _) in list(self._range_read_plans.items()):
+                owner = (request.req_id, request.request_generation)
+                lease.release()
+                self._range_request_leases.pop(owner, None)
+                self._range_read_plans.pop(req_id, None)
+
+    def wait_for_layer_load(self, layer_name: str | None = None) -> None:
+        if self.use_layerwise_range:
+            self._wait_for_layer_load_range(layer_name)
+            return
+        del layer_name
         for layerwise_retriever in self.layerwise_retrievers:
             ret_token_mask = next(layerwise_retriever)
             if self.current_layer == self.num_layers - 1:
@@ -926,7 +1210,85 @@ class KVPoolWorker:
             self._invalid_block_ids.clear()
         return invalid_blocks
 
-    def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
+    def _completed_future(self) -> Future[None]:
+        future: Future[None] = Future()
+        future.set_result(None)
+        return future
+
+    def _start_range_save(self, connector_metadata: AscendConnectorMetadata) -> None:
+        if self._range_save_started:
+            return
+        self._range_save_started = True
+        self._range_execution_id += 1
+        self._range_sessions_by_request.clear()
+        self._range_layer_futures.clear()
+        assert self._range_put_registry is not None
+        for request in connector_metadata.requests:
+            self._normalize_range_request_identity(request)
+            request.skip_null_blocks_by_group = self.group_uses_align_state
+            records: list[_LayerwiseRangeBlock] = []
+            for group_id in request.kv_cache_group_ids or [0]:
+                records.extend(self._range_records(request, request.token_len_chunk, group_id))
+            lease = self._get_range_lease(request)
+            missing: list[_LayerwiseRangeBlock] = []
+            if records:
+                unique = list({record.key: record for record in records}.values())
+                known = set(lease.history_keys)
+                candidates = [record for record in unique if record.key not in known]
+                if candidates:
+                    exists = self.m_store.exists([record.key for record in candidates])
+                    if exists is None or len(exists) != len(candidates):
+                        raise RuntimeError(f"Layerwise range exists returned invalid result for {request.req_id}")
+                    for record, code in zip(candidates, exists, strict=True):
+                        if int(code) == 1:
+                            lease.ensure_history([record.key])
+                        else:
+                            missing.append(record)
+            # A final partial chunk may have no new full blocks. It still
+            # needs a session so its existing read lease can be released and
+            # get_finished() can observe completion.
+            bindings = (
+                [PutBinding(record.key, self._range_object_sizes[record.group_id]) for record in missing]
+                if request.can_save
+                else []
+            )
+            claim = self._range_put_registry.claim_execution(self._range_execution_id, bindings)
+            session = ChunkStoreSession(RequestChunkKey(request.req_id, request.request_generation, request.chunk_id), self.m_store, lease, self._range_put_registry)
+            session.start(sorted(lease.history_keys), claim)
+            self._range_sessions_by_request[request.req_id] = _LayerwiseRangeSessionState(request, session, missing)
+
+    def _save_range_layer(self, layer_name: str, connector_metadata: AscendConnectorMetadata, kv_ready_event=None) -> Future[None]:
+        self._start_range_save(connector_metadata)
+        if self._is_mtp_layer_name(layer_name):
+            return self._completed_future()
+        assert self._range_executor is not None
+        tasks: list[Future[list[int]]] = []
+        for state in self._range_sessions_by_request.values():
+            if not state.session.put_keys:
+                continue
+            records = [record for record in state.records if record.key in set(state.session.put_keys)]
+            keys, ptrs, sizes, offsets = self._range_destination(layer_name, records)
+            if not keys:
+                continue
+            tasks.append(self._range_executor.submit(state.session.save_layer, keys, ptrs, sizes, offsets, kv_ready_event))
+        def wait_tasks() -> None:
+            for task in tasks:
+                task.result()
+        aggregate = self._range_executor.submit(wait_tasks)
+        self._range_layer_futures.append(aggregate)
+        return aggregate
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer,
+        connector_metadata: AscendConnectorMetadata,
+        *,
+        kv_ready_event=None,
+    ) -> Future[None] | None:
+        if self.use_layerwise_range:
+            return self._save_range_layer(layer_name, connector_metadata, kv_ready_event)
+        del layer_name, kv_layer
         # MTP speculative decoding re-runs the base model's attention layers
         # during draft execution (_run_merged_draft), causing extra
         # save_kv_layer calls beyond num_layers. These extra calls would
@@ -935,14 +1297,7 @@ class KVPoolWorker:
             return
         if self.current_layer == 0:
             self.layerwise_storers = []
-            current_event = None
-            for request in connector_metadata.requests:
-                can_save = request.can_save
-                if can_save is None or not can_save:
-                    continue
-                current_event = torch.npu.Event()
-                current_event.record()
-                break
+            current_event = kv_ready_event
             for request in connector_metadata.requests:
                 can_save = request.can_save
                 if can_save is None or not can_save:
@@ -956,12 +1311,78 @@ class KVPoolWorker:
                 self.layerwise_storers.append(layerwise_storer)
         for layerwise_storer in self.layerwise_storers:
             try:
-                next(layerwise_storer)
+                if self.current_layer == 0:
+                    next(layerwise_storer)
+                else:
+                    layerwise_storer.send(kv_ready_event)
             except Exception:
                 raise
         self.current_layer = self.current_layer + 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
+        if self.use_layerwise_range:
+            states = list(self._range_sessions_by_request.items())
+            execution_put_keys: set[str] = set()
+            for _, state in states:
+                execution_put_keys.update(state.session.put_keys)
+            try:
+                errors: list[BaseException] = []
+                # Source-range futures must all settle before any put_end.
+                for future in self._range_layer_futures:
+                    try:
+                        future.result()
+                    except BaseException as error:
+                        errors.append(error)
+
+                # Commit every owner even when another owner failed, so all
+                # follower futures are resolved and no execution can deadlock.
+                for _, state in states:
+                    if errors:
+                        break
+                    try:
+                        state.session.commit_owned()
+                    except BaseException as error:
+                        errors.append(error)
+
+                if errors:
+                    raise errors[0]
+
+                for req_id, state in states:
+                    state.session.finalize_followed(
+                        has_more_prefill_chunks=state.request.is_last_chunk is not True
+                    )
+                    if state.request.is_last_chunk is True:
+                        owner = (state.request.req_id, state.request.request_generation)
+                        lease = self._range_request_leases.pop(owner, None)
+                        if lease is not None:
+                            lease.release()
+                    self._range_finished_requests.add(req_id)
+            except BaseException:
+                # Wake followers for every owner that did not reach put_end,
+                # then release the failed request's history lease.  A later
+                # scheduler retry can reacquire complete keys through exists().
+                for _, state in states:
+                    try:
+                        state.session.revoke_uncommitted()
+                    except BaseException:
+                        logger.exception("Failed to revoke Store session %s", state.request.req_id)
+                    owner = (state.request.req_id, state.request.request_generation)
+                    lease = self._range_request_leases.pop(owner, None)
+                    if lease is not None:
+                        try:
+                            lease.release()
+                        except BaseException:
+                            logger.exception("Failed to release Store lease %s", owner)
+                raise
+            finally:
+                # Put registry entries are scoped to one scheduler execution.
+                # Complete objects remain discoverable through exists; do not retain stale futures.
+                if self._range_put_registry is not None:
+                    self._range_put_registry.forget(sorted(execution_put_keys))
+                self._range_sessions_by_request.clear()
+                self._range_layer_futures.clear()
+                self._range_save_started = False
+            return
         current_event = None
         has_save_request = False
         for request in connector_metadata.requests:
@@ -1126,12 +1547,33 @@ class KVPoolWorker:
                 self.kv_send_thread.add_request(  # type: ignore[union-attr, call-arg]
                     req_meta
                 )  # type: ignore[union-attr, call-arg, arg-type]
-                yield
+                next_event = yield
+                if next_event is not None:
+                    current_event = next_event
         else:
             for layer_id in range(self.num_layers):
                 yield
 
     def get_finished(self, finished_req_ids: set[str], meta: AscendConnectorMetadata) -> tuple[set[str], set[str]]:
+        if self.use_layerwise_range:
+            # A preempted request may not reach another save hook. Quiescing is
+            # guaranteed by the scheduler before this callback, so release its
+            # Store read lease instead of leaking the native session.
+            for req_id in meta.preempted_req_ids:
+                for owner in [owner for owner in self._range_request_leases if owner[0] == req_id]:
+                    lease = self._range_request_leases.pop(owner)
+                    lease.release()
+                self._range_read_plans.pop(req_id, None)
+                self._drop_range_request_identity(req_id)
+            done_sending = self._range_finished_requests.intersection(finished_req_ids)
+            self._range_finished_requests.difference_update(done_sending)
+            for req_id in done_sending:
+                for owner in [owner for owner in self._range_request_leases if owner[0] == req_id]:
+                    lease = self._range_request_leases.pop(owner)
+                    lease.release()
+                self._range_read_plans.pop(req_id, None)
+                self._drop_range_request_identity(req_id)
+            return done_sending, set()
         done_sending = (
             self.get_and_clear_finished_requests(
                 finished_req_ids,
