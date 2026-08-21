@@ -44,7 +44,10 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.utils import all_gather_async
-from vllm_ascend.ops.dsa_offload import DsaOffloadConfig
+from vllm_ascend.ops.dsa_offload import (
+    DSA_SPECULATIVE_RAW_SEQ,
+    DsaOffloadConfig,
+)
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -1365,7 +1368,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         }:
             return None
         raw_seq = (
-            4
+            DSA_SPECULATIVE_RAW_SEQ
             if attn_metadata.attn_state is AscendAttentionState.SpecDecoding
             else 1
         )

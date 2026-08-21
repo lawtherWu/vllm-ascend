@@ -19,7 +19,7 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
 
 def _config(*, enabled: bool = True, role: str = "kv_producer"):
     return SimpleNamespace(
-        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None, block_size=128),
         kv_transfer_config=SimpleNamespace(
             kv_role=role,
             kv_connector_extra_config={
@@ -27,8 +27,9 @@ def _config(*, enabled: bool = True, role: str = "kv_producer"):
             },
         ),
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(num_hidden_layers=2),
+            hf_text_config=SimpleNamespace(num_hidden_layers=2, index_topk=2048),
         ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
     )
 
 
