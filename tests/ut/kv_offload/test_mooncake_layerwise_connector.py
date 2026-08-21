@@ -62,6 +62,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     ensure_zmq_send,
     group_concurrent_contiguous,
     string_to_int64_hash,
+    validate_existing_layer_metadata,
     zmq_ctx,
 )
 
@@ -76,10 +77,10 @@ DONE_SENDING_MSG = b"done_sending_msg"
 
 def _make_layer_metadata(**overrides):
     defaults = dict(
-        tensor_group_idx=[0],
+        tensor_group_idx=[0, 0],
         kv_caches_base_addr=[1000, 2000],
-        block_len=[1024],
-        block_size_scale=[1],
+        block_len=[1024, 1024],
+        block_size_scale=[1, 1],
     )
     defaults.update(overrides)
     return LayerMetadata(**defaults)
@@ -100,7 +101,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
     def setUp(self):
         self.engine = MagicMock()
         self.engine.register_memory.return_value = 0
-        self.engine.batch_transfer_sync_write.return_value = 1
+        self.engine.batch_transfer_sync_write.return_value = 0
         fake_stream = MagicMock(name="FakeStream")
         fake_stream.synchronize = MagicMock()
 
@@ -114,19 +115,19 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
 
         self.layer_metadata = {
             "layer0": _make_layer_metadata(
-                tensor_group_idx=[0],
+                tensor_group_idx=[0, 0],
                 kv_caches_base_addr=[1000, 2000],
                 block_len=[1024, 2048],
                 block_size_scale=[1, 1],
             ),
             "layer1": _make_layer_metadata(
-                tensor_group_idx=[0],
+                tensor_group_idx=[0, 0],
                 kv_caches_base_addr=[3000, 4000],
                 block_len=[1024, 2048],
                 block_size_scale=[1, 1],
             ),
             "layer2": _make_layer_metadata(
-                tensor_group_idx=[0],
+                tensor_group_idx=[0, 0],
                 kv_caches_base_addr=[5000, 6000],
                 block_len=[1024, 2048],
                 block_size_scale=[1, 1],
@@ -210,7 +211,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
 
         layer_metadata = {
             "layer0": _make_layer_metadata(
-                tensor_group_idx=[0],
+                tensor_group_idx=[0, 0],
                 kv_caches_base_addr=[1111, 2222],
                 block_len=[64, 64],
                 block_size_scale=[1, 1],
@@ -307,6 +308,56 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         self.thread._transfer_kv_cache(send_task)
         self.engine.batch_transfer_sync_write.assert_not_called()
 
+    def test_metadata_validation_rejects_zip_truncation(self):
+        local = _make_layer_metadata()
+        remote = _make_layer_metadata(tensor_group_idx=[0])
+        with self.assertRaisesRegex(ValueError, "equal length"):
+            validate_existing_layer_metadata("layer0", local, remote)
+
+    def test_handle_exception_fails_every_request_once(self):
+        first = self.req_meta_base
+        first.chunk_finish = True
+        second = ReqMeta(**{**first.__dict__})
+        send_task = SendTask(
+            send_request={"req-a": first, "req-b": second},
+            layer_idx=0,
+            layer_name="layer0",
+        )
+        self.thread._transfer_kv_cache = MagicMock(
+            side_effect=RuntimeError("metadata failure")
+        )
+
+        self.thread._handle_request(send_task)
+        self.thread._handle_request(send_task)
+
+        self.assertEqual(self.thread.callback_func.call_count, 2)
+        failed_ids = {
+            call.args[0] for call in self.thread.callback_func.call_args_list
+        }
+        self.assertEqual(failed_ids, {"req-a", "req-b"})
+        self.assertTrue(
+            all(
+                call.kwargs["trans_flag"] is False
+                for call in self.thread.callback_func.call_args_list
+            )
+        )
+
+        # A later request generation may reuse the same external request ID.
+        # Its independent ReqMeta must publish its own terminal notification.
+        reused = ReqMeta(
+            **{
+                **first.__dict__,
+                "_terminal_notified": False,
+            }
+        )
+        reused_task = SendTask(
+            send_request={"req-a": reused},
+            layer_idx=0,
+            layer_name="layer0",
+        )
+        self.thread._handle_request(reused_task)
+        self.assertEqual(self.thread.callback_func.call_count, 3)
+
     @patch(
         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.group_concurrent_contiguous",
         side_effect=group_concurrent_contiguous,
@@ -350,6 +401,40 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         self.thread._transfer_kv_cache(send_task)
 
         self.thread.callback_func.assert_called_once()
+
+
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.group_concurrent_contiguous",
+        side_effect=group_concurrent_contiguous,
+    )
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.torch.npu.synchronize")
+    def test_nonzero_transfer_status_is_failure(self, _mock_sync, _mock_group):
+        req_meta = self.req_meta_base
+        req_meta.chunk_finish = True
+        req_meta.local_block_ids = [[5, 6]]
+        req_meta.remote_block_ids = [[10, 11]]
+        req_meta.remote_layer_metadata = {
+            "layer0": _make_layer_metadata(
+                kv_caches_base_addr=[7000, 8000],
+                block_len=[1024, 2048],
+                block_size_scale=[1, 1],
+            )
+        }
+        self.engine.batch_transfer_sync_write.return_value = 1
+        send_task = SendTask(
+            send_request={"req-fail": req_meta},
+            wait_event=MagicMock(),
+            k_cache=torch.zeros((1, 8), dtype=torch.float32),
+            v_cache=torch.zeros((1, 8), dtype=torch.float32),
+            layer_idx=0,
+            layer_name="layer0",
+            group_rearrange_block_ids=[[]],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "layer transfer failed"):
+            self.thread._transfer_kv_cache(send_task)
+        self.thread.callback_func.assert_called_once()
+        self.assertFalse(self.thread.callback_func.call_args.kwargs["trans_flag"])
 
 
 class TestKVCacheRecvingLayerThread(unittest.TestCase):

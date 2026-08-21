@@ -262,6 +262,11 @@ class ExecuteModelState(NamedTuple):
 
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        # Populated only on a decode worker with layerwise host KV offload.
+        self.decode_host_kv_pool = None
+        # Fixed DSA resident/selection workspaces are initialized after model
+        # loading on Decode workers. Request/block ownership stays in vLLM.
+        self.dsa_offload_runtime = None
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
         # used to expand some buffers, which need to be reverted after
         # the following PR is merged:
@@ -3831,6 +3836,10 @@ class NPUModelRunner(GPUModelRunner):
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
+        # DSA fixed buffers are a separate Decode reservation. Allocate them
+        # after model-weight profiling so the KV planner subtracts their
+        # exact bytes once instead of double-counting them as weights.
+        self._init_dsa_offload_runtime()
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
         from vllm.model_executor.offloader.base import get_offloader
@@ -3862,6 +3871,149 @@ class NPUModelRunner(GPUModelRunner):
             "Model runner load_model total time: %.2f seconds",
             load_model_total_time,
         )
+
+    def _init_dsa_offload_runtime(self) -> None:
+        """Allocate fixed DSA workspaces and bind them to SFA implementations."""
+        if not self._use_decode_host_kv_offload():
+            return
+        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        if pp_size > 1 or self.pcp_size > 1 or self.dcp_size > 1:
+            raise NotImplementedError(
+                "Layerwise DSA Host offload currently requires PP/PCP/DCP=1"
+            )
+
+        from vllm_ascend.attention.dsa_offload_runtime import (
+            DsaGroupMetadata,
+            DsaOffloadRuntime,
+            build_dsa_group_specs,
+        )
+        from vllm_ascend.attention.dsa_offload_state import (
+            DsaLayerWorkspace,
+            DsaResidentState,
+        )
+
+        sfa_impls = {}
+        for layer_name, layer in self.compilation_config.static_forward_context.items():
+            impl = getattr(layer, "impl", None)
+            if impl is None or not hasattr(impl, "indexer_select_post_process"):
+                continue
+            layer_id = self._extract_model_layer_index(layer_name)
+            if layer_id is not None:
+                sfa_impls[layer_id] = impl
+
+        hf_config = self.model_config.hf_text_config
+        num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+        if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
+            raise RuntimeError("DSA Host offload requires num_hidden_layers")
+        sfa_impls = {
+            layer_id: impl
+            for layer_id, impl in sfa_impls.items()
+            if layer_id < num_hidden_layers
+        }
+        if set(sfa_impls) != set(range(num_hidden_layers)):
+            raise RuntimeError(
+                "DSA Host offload requires one SFA implementation for each "
+                f"base layer; found {sorted(sfa_impls)}"
+            )
+
+        groups = build_dsa_group_specs(
+            getattr(hf_config, "indexer_types", None), num_hidden_layers
+        )
+        extra_config = (
+            getattr(self.vllm_config.kv_transfer_config, "kv_connector_extra_config", None)
+            or {}
+        )
+        default_pool_size = 16384 if bool(getattr(hf_config, "enlarge_pool_size", False)) else 8192
+        pool_size = int(extra_config.get("dsa_pool_size", default_pool_size))
+        if pool_size <= 0 or pool_size > 16384 or pool_size % 16 != 0:
+            raise ValueError("dsa_pool_size must be in (0, 16384] and divisible by 16")
+        id_range = max(
+            int(self.model_config.max_model_len),
+            int(extra_config.get("dsa_id_range", 131072)),
+        )
+        batch_capacity = self.max_num_reqs
+        max_raw_seq = 4
+        selection_blocks = (2048 + 128 - 1) // 128
+        selection_rows = batch_capacity * max_raw_seq
+        workspaces = []
+        for layer_id in range(num_hidden_layers):
+            impl = sfa_impls[layer_id]
+            kv_dim = int(getattr(impl, "kv_lora_rank", 0))
+            rope_dim = int(getattr(impl, "qk_rope_head_dim", 0))
+            if kv_dim <= 0 or rope_dim <= 0:
+                raise RuntimeError(
+                    f"Invalid DSA cache dimensions at layer {layer_id}: {kv_dim}, {rope_dim}"
+                )
+            resident_kv = torch.empty(
+                (batch_capacity, pool_size, kv_dim), dtype=self.dtype, device=self.device
+            )
+            resident_rope = torch.empty(
+                (batch_capacity, pool_size, rope_dim), dtype=self.dtype, device=self.device
+            )
+            selection_kv = torch.empty(
+                (selection_rows * selection_blocks, 128, kv_dim),
+                dtype=self.dtype, device=self.device
+            )
+            selection_rope = torch.empty(
+                (selection_rows * selection_blocks, 128, rope_dim),
+                dtype=self.dtype, device=self.device
+            )
+            selection_block_table = torch.arange(
+                selection_rows * selection_blocks, dtype=torch.int32, device=self.device
+            ).view(selection_rows, selection_blocks)
+            selection_query_lens = torch.arange(
+                1, selection_rows + 1, dtype=torch.int32, device=self.device
+            )
+            selection_default_indices = torch.arange(
+                2048, dtype=torch.int32, device=self.device
+            ).view(1, 1, 2048).expand(selection_rows, 1, 2048)
+            workspaces.append(
+                DsaLayerWorkspace(
+                    layer_id=layer_id,
+                    resident_kv_cache=resident_kv,
+                    resident_k_rope=resident_rope,
+                    selection_kv_cache=selection_kv,
+                    selection_k_rope=selection_rope,
+                    selection_block_table=selection_block_table,
+                    selection_query_lens=selection_query_lens,
+                    selection_default_indices=selection_default_indices,
+                )
+            )
+
+        metadata = {}
+        for group in groups:
+            metadata[group.group_id] = DsaGroupMetadata(
+                pool_ids=torch.full(
+                    (batch_capacity, pool_size), -1, dtype=torch.int32, device=self.device
+                ),
+                id_to_slot=torch.full(
+                    (batch_capacity, id_range), -1, dtype=torch.int32, device=self.device
+                ),
+                lru_counter=torch.zeros(
+                    (batch_capacity, pool_size // 16), dtype=torch.int32, device=self.device
+                ),
+            )
+        runtime = DsaOffloadRuntime(groups, metadata, DsaResidentState(workspaces))
+        for layer_id, impl in sfa_impls.items():
+            impl.dsa_offload_runtime = runtime
+            impl.dsa_layer_id = layer_id
+        self.dsa_offload_runtime = runtime
+        if hasattr(self.input_batch, "set_dsa_row_change_callback"):
+            self.input_batch.set_dsa_row_change_callback(runtime.queue_row_changes)
+        logger.info(
+            "Initialized DSA Host offload runtime: layers=%d groups=%d batch=%d pool=%d bytes=%d",
+            num_hidden_layers, len(groups), batch_capacity, pool_size, runtime.workspace_bytes
+        )
+
+
+    @staticmethod
+    def _extract_model_layer_index(layer_name: str) -> int | None:
+        try:
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            return int(extract_layer_index(layer_name))
+        except (AssertionError, IndexError, ValueError, TypeError):
+            return None
 
     def _start_dump_data(self) -> None:
         if self.debugger is None or self._debugger_started:
@@ -3895,6 +4047,7 @@ class NPUModelRunner(GPUModelRunner):
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        self._validate_dsa_workspace_accounting(kv_cache_config)
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
@@ -3956,6 +4109,35 @@ class NPUModelRunner(GPUModelRunner):
         offset = (aligned_addr - data_ptr) // tensor.element_size()
         return tensor[int(offset) :]
 
+    def _validate_dsa_workspace_accounting(self, kv_cache_config: KVCacheConfig) -> None:
+        """Fail fast if planner and allocated DSA storage use different bytes."""
+        runtime = self.dsa_offload_runtime
+        if runtime is None:
+            return
+        if len(kv_cache_config.kv_cache_groups) != 1:
+            raise NotImplementedError(
+                "Decode DSA Host offload requires one KV cache group"
+            )
+        group = kv_cache_config.kv_cache_groups[0]
+        spec = group.kv_cache_spec
+        specs = getattr(spec, "kv_cache_specs", None)
+        if specs is None:
+            raise NotImplementedError(
+                "Decode DSA Host offload requires UniformTypeKVCacheSpecs"
+            )
+        from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+            _dsa_workspace_bytes,
+        )
+
+        expected = _dsa_workspace_bytes(self.vllm_config, group, specs)
+        actual = runtime.workspace_bytes
+        if actual != expected:
+            raise RuntimeError(
+                "DSA workspace accounting mismatch: "
+                f"planner={expected} bytes, allocated={actual} bytes"
+            )
+        logger.info("Validated DSA workspace reservation: %d bytes", actual)
+
     def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
         Initialize the memory buffer for KV cache.
@@ -3970,6 +4152,12 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+
+        self._validate_layerwise_prefill_workspace_aliases(
+            kv_cache_config,
+            kv_caches,
+        )
+        self._init_decode_host_kv_pool(kv_cache_config, kv_caches)
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -4006,6 +4194,49 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         return kv_caches
+
+    def _validate_layerwise_prefill_workspace_aliases(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
+        from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+            is_layerwise_host_offload_prefill,
+        )
+
+        if not is_layerwise_host_offload_prefill(self.vllm_config):
+            return
+        shared_tensors = [
+            tensor_spec
+            for tensor_spec in kv_cache_config.kv_cache_tensors
+            if len(tensor_spec.shared_by) > 1
+        ]
+        if len(shared_tensors) != 1:
+            raise RuntimeError(
+                "Layerwise Host Offload Prefill requires exactly one shared "
+                "base-layer workspace tensor"
+            )
+
+        def component_ptrs(cache) -> tuple[int, ...]:
+            components = (cache,) if isinstance(cache, torch.Tensor) else tuple(cache)
+            return tuple(component.data_ptr() for component in components)
+
+        workspace_layers = shared_tensors[0].shared_by
+        expected_ptrs = component_ptrs(kv_caches[workspace_layers[0]])
+        for layer_name in workspace_layers[1:]:
+            actual_ptrs = component_ptrs(kv_caches[layer_name])
+            if actual_ptrs != expected_ptrs:
+                raise RuntimeError(
+                    f"Layerwise workspace alias failed for {layer_name}: "
+                    f"expected={expected_ptrs}, actual={actual_ptrs}"
+                )
+        logger.info(
+            "Layerwise Host Offload Prefill bound %d base layers to one "
+            "workspace bundle with %d components and %d blocks",
+            len(workspace_layers),
+            len(expected_ptrs),
+            kv_cache_config.num_blocks,
+        )
 
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
@@ -4120,6 +4351,89 @@ class NPUModelRunner(GPUModelRunner):
         assert dsa_k_scale_tensor.numel() % scale_dtype_size == 0
 
         return dsa_k_tensor, dsa_k_scale_tensor
+
+    def _use_decode_host_kv_offload(self) -> bool:
+        from vllm_ascend.patch.platform.patch_kv_cache_utils import is_layerwise_host_offload_decode
+
+        return self.use_sparse and is_layerwise_host_offload_decode(self.vllm_config)
+
+    @staticmethod
+    def _is_mtp_cache_layer_name(layer_name: str, num_hidden_layers: int | None) -> bool:
+        lowered = layer_name.lower()
+        if "mtp" in lowered or "draft" in lowered:
+            return True
+        if num_hidden_layers is None:
+            return False
+        try:
+            from vllm.v1.worker.utils import extract_layer_index
+
+            return extract_layer_index(layer_name) >= num_hidden_layers
+        except (AssertionError, IndexError, ValueError):
+            return False
+
+    def _allocate_swapped_raw_tensor(self, size: int) -> torch.Tensor:
+        import torch_npu
+
+        return torch_npu.empty_with_swapped_memory((size,), dtype=torch.int8, device=self.device)
+
+    def _init_decode_host_kv_pool(self, kv_cache_config: KVCacheConfig, kv_caches: dict[str, torch.Tensor]) -> None:
+        if not self._use_decode_host_kv_offload():
+            return
+        from vllm_ascend.distributed.kv_transfer.kv_pool.decode_host_kv_pool import DecodeHostKVPool
+
+        descriptors = []
+        layer_specs = self._get_layer_kv_cache_specs(kv_cache_config)
+        num_hidden_layers = getattr(self.model_config.hf_text_config, "num_hidden_layers", None)
+        layer_ids: dict[int, int] = defaultdict(int)
+        # Layout interpretation belongs to the model's attention backend.  Keep
+        # the pool generic and ask the backend selected for each attention group
+        # to describe its tuple instead of duplicating GLM/DSV4 layout rules here.
+        backend_by_layer = {}
+        for attn_group in self._kv_cache_spec_attn_group_iterator():
+            backend = getattr(attn_group, "backend", None)
+            for layer_name in attn_group.layer_names:
+                backend_by_layer[layer_name] = backend
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                spec = layer_specs[layer_name]
+                if not isinstance(spec, AscendMLAAttentionSpec) or layer_name not in kv_caches:
+                    continue
+                backend = backend_by_layer.get(layer_name)
+                build_descriptor = getattr(backend, "build_layer_cache_descriptor", None)
+                if not callable(build_descriptor):
+                    raise RuntimeError(
+                        f"Layerwise host KV offload requires an attention backend "
+                        f"layout descriptor for {layer_name}, got {backend!r}"
+                    )
+                is_mtp = self._is_mtp_cache_layer_name(layer_name, num_hidden_layers)
+                ratio = getattr(spec, "compress_ratio", 1)
+                cache_family_id = f"c{ratio}" if isinstance(ratio, int) and ratio > 1 else "default"
+                descriptor = build_descriptor(
+                    layer_name=layer_name,
+                    layer_id=layer_ids[group_id],
+                    group_id=group_id,
+                    cache_family_id=cache_family_id,
+                    kv_cache_spec=spec,
+                    is_mtp_layer=is_mtp,
+                )
+                descriptors.append(descriptor)
+                layer = self.compilation_config.static_forward_context.get(layer_name)
+                impl = getattr(layer, "impl", None)
+                if impl is None or not hasattr(impl, "dsa_cache_layout_descriptor"):
+                    raise RuntimeError(
+                        "Layerwise host KV offload cannot bind the cache layout "
+                        f"to the attention implementation for {layer_name}"
+                    )
+                impl.dsa_cache_layout_descriptor = descriptor
+                if not is_mtp:
+                    layer_ids[group_id] += 1
+        pool = DecodeHostKVPool(None)
+        pool.adopt_existing(
+            {group_id: kv_cache_config.num_blocks for group_id in range(len(kv_cache_config.kv_cache_groups))},
+            descriptors,
+            kv_caches,
+        )
+        self.decode_host_kv_pool = pool
 
     def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
@@ -4246,14 +4560,20 @@ class NPUModelRunner(GPUModelRunner):
                     dsa_k_tensor = None
                     dsa_k_scale_tensor = None
                     v_tensor = None
-                    k_tensor = self._allocate_int8_cache_tensor(
-                        k_tensor_size,
-                        alignment,
+                    use_swapped_main = self._use_decode_host_kv_offload() and all(
+                        not self._is_mtp_cache_layer_name(name, getattr(self.model_config.hf_text_config, "num_hidden_layers", None))
+                        for name in kv_cache_tensor.shared_by
+                    )
+                    k_tensor = (
+                        self._allocate_swapped_raw_tensor(k_tensor_size)
+                        if use_swapped_main
+                        else self._allocate_int8_cache_tensor(k_tensor_size, alignment)
                     )
                     if v_tensor_size is not None:
-                        v_tensor = self._allocate_int8_cache_tensor(
-                            v_tensor_size,
-                            alignment,
+                        v_tensor = (
+                            self._allocate_swapped_raw_tensor(v_tensor_size)
+                            if use_swapped_main
+                            else self._allocate_int8_cache_tensor(v_tensor_size, alignment)
                         )
 
                     if self.use_sparse:
@@ -4778,6 +5098,8 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_groups=kv_cache_config.kv_cache_groups,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             )
+            if self.dsa_offload_runtime is not None:
+                self.input_batch.set_dsa_row_change_callback(self.dsa_offload_runtime.queue_row_changes)
 
     def initialize_attn_backend(
         self,
