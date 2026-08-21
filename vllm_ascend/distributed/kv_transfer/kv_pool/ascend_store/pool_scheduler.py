@@ -45,6 +45,12 @@ class KVPoolScheduler:
     ):
         self.use_layerwise = use_layerwise
         self.kv_cache_config = kv_cache_config
+        extra_config = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        )
+        self.use_layerwise_range = self.use_layerwise and bool(
+            extra_config.get("use_layerwise_range", False)
+        )
         hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
         hf_config = getattr(vllm_config.model_config, "hf_config", hf_text_config)
         self.hf_config = hf_text_config or hf_config
@@ -177,6 +183,22 @@ class KVPoolScheduler:
 
     def _floor_to_cache_transfer_granularity(self, token_len: int) -> int:
         return token_len // self.cache_transfer_granularity * self.cache_transfer_granularity
+
+    def _is_last_chunk(self, token_len: int, prompt_len: int) -> bool:
+        """Return whether Prefill has consumed the complete prompt.
+
+        Range Store keeps a request read lease across scheduler steps, so its
+        final-chunk signal must describe Prefill execution rather than the
+        last full block eligible for Store. Preserve the legacy Store
+        semantics outside the range path.
+        """
+
+        if self.use_layerwise_range or not self._discard_partial_chunks:
+            return token_len >= prompt_len
+        last_store_boundary = self._floor_to_cache_transfer_granularity(
+            prompt_len
+        )
+        return token_len >= last_store_boundary
 
     @staticmethod
     def _uses_hybrid_kv_cache(vllm_config: "VllmConfig", kv_cache_config: KVCacheConfig | None) -> bool:
@@ -417,22 +439,19 @@ class KVPoolScheduler:
                 block_sizes=self.grouped_block_size,
             )
             self._request_trackers[request.req_id] = request_tracker
-            last_chunk_tokens_num = (
-                self._floor_to_cache_transfer_granularity(len(request.prompt_token_ids))
-                if self._discard_partial_chunks
-                else len(request.prompt_token_ids)
-            )
-
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self.cache_transfer_granularity,
                 load_spec=load_spec,
                 skip_save=force_skip_save,
                 block_hashes=request_real.block_hashes,
-                is_last_chunk=request_tracker.token_len >= last_chunk_tokens_num,
+                is_last_chunk=self._is_last_chunk(
+                    request_tracker.token_len, len(request.prompt_token_ids)
+                ),
                 discard_partial_chunks=self._discard_partial_chunks,
                 original_block_size=self.original_block_size,
                 kv_cache_group_families=self.kv_cache_group_families,
+                retain_history_metadata=self.use_layerwise_range,
             )
             if req_meta is not None:
                 self.touch_sending_mamba_blocks(req_meta)
@@ -465,21 +484,20 @@ class KVPoolScheduler:
                         block_sizes=self.grouped_block_size,
                     )
                     self._request_trackers[req_id] = request_tracker
-                    last_chunk_tokens_num = (
-                        self._floor_to_cache_transfer_granularity(len(request_real.prompt_token_ids))
-                        if self._discard_partial_chunks
-                        else len(request_real.prompt_token_ids)
-                    )
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
                         self.cache_transfer_granularity,
                         load_spec=load_spec,
                         skip_save=force_skip_save,
                         block_hashes=request_real.block_hashes,
-                        is_last_chunk=request_tracker.token_len >= last_chunk_tokens_num,
+                        is_last_chunk=self._is_last_chunk(
+                            request_tracker.token_len,
+                            len(request_real.prompt_token_ids),
+                        ),
                         discard_partial_chunks=self._discard_partial_chunks,
                         original_block_size=self.original_block_size,
                         kv_cache_group_families=self.kv_cache_group_families,
+                        retain_history_metadata=self.use_layerwise_range,
                     )
 
                 # decode/chunked request
@@ -501,21 +519,20 @@ class KVPoolScheduler:
                         continue
                     request_tracker.update(new_block_ids, request.num_computed_tokens)
 
-                    last_chunk_tokens_num = (
-                        self._floor_to_cache_transfer_granularity(len(request.prompt_token_ids))
-                        if self._discard_partial_chunks
-                        else len(request.prompt_token_ids)
-                    )
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
                         self.cache_transfer_granularity,
                         load_spec=None,
                         skip_save=force_skip_save,
                         block_hashes=request.block_hashes,
-                        is_last_chunk=request_tracker.token_len >= last_chunk_tokens_num,
+                        is_last_chunk=self._is_last_chunk(
+                            request_tracker.token_len,
+                            len(request.prompt_token_ids),
+                        ),
                         discard_partial_chunks=self._discard_partial_chunks,
                         original_block_size=self.original_block_size,
                         kv_cache_group_families=self.kv_cache_group_families,
+                        retain_history_metadata=self.use_layerwise_range,
                     )
                 if req_meta is not None:
                     self.touch_sending_mamba_blocks(req_meta)
