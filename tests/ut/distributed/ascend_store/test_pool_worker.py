@@ -243,6 +243,25 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
                 require_all=True,
             )
 
+    def test_range_request_generation_uses_bounded_global_counter(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker._range_request_generations = {}
+        worker._next_range_request_generation = 0
+
+        first = ReqMeta("reused", 128)
+        worker._normalize_range_request_identity(first)
+        worker._drop_range_request_identity(first.req_id)
+        second = ReqMeta("reused", 128)
+        worker._normalize_range_request_identity(second)
+        worker._drop_range_request_identity(second.req_id)
+
+        self.assertEqual(first.request_generation, 1)
+        self.assertEqual(second.request_generation, 2)
+        self.assertEqual(worker._range_request_generations, {})
+        self.assertEqual(worker._next_range_request_generation, 2)
+        self.assertFalse(hasattr(worker, "_range_generation_counters"))
+
 
 class TestKVPoolWorkerInit(unittest.TestCase):
     """Test KVPoolWorker initialization with mocked dependencies."""
@@ -893,6 +912,121 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
             req,
             4096,
             require_all=True,
+        )
+
+    def test_start_range_save_rolls_back_every_request_and_can_retry(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_session import (
+            ChunkStoreSession,
+            StorePutRegistry,
+            StoreReadLeaseRegistry,
+        )
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            KVPoolWorker,
+            _LayerwiseRangeBlock,
+        )
+
+        worker = object.__new__(KVPoolWorker)
+        worker.use_layerwise_range = True
+        worker.group_uses_align_state = False
+        worker.m_store = MagicMock()
+        worker.m_store.exists.return_value = [0]
+        worker.m_store.batch_put_session_start.return_value = [0]
+        worker.m_store.batch_put_session_revoke.return_value = [0]
+        worker.m_store.batch_get_session_end.return_value = 0
+        worker._range_put_registry = StorePutRegistry(worker.m_store)
+        worker._range_read_registry = StoreReadLeaseRegistry(worker.m_store)
+        worker._range_execution_id = 0
+        worker._range_save_started = False
+        worker._range_sessions_by_request = {}
+        worker._range_layer_futures = []
+        worker._range_request_leases = {}
+        worker._range_read_plans = {}
+        worker._range_load_layers_seen = {"layer.0"}
+        worker._range_request_generations = {}
+        worker._next_range_request_generation = 0
+        worker._range_object_sizes = {0: 128}
+        worker._range_records = MagicMock(
+            side_effect=lambda request, _token_len, group_id: [
+                _LayerwiseRangeBlock(
+                    key=f"key-{request.req_id}",
+                    start=0,
+                    end=128,
+                    block_id=0,
+                    group_id=group_id,
+                )
+            ]
+        )
+        worker._shard_range_save_records = MagicMock(
+            side_effect=lambda _request, _group_id, records: records
+        )
+
+        leases = []
+
+        def tracked_get_lease(request):
+            lease = KVPoolWorker._get_range_lease(worker, request)
+            if lease not in leases:
+                leases.append(lease)
+            return lease
+
+        worker._get_range_lease = tracked_get_lease
+        first = ReqMeta(
+            req_id="first",
+            token_len_chunk=128,
+            block_ids=[0],
+            can_save=True,
+        )
+        second = ReqMeta(
+            req_id="second",
+            token_len_chunk=128,
+            block_ids=[1],
+            can_save=True,
+        )
+        metadata = AscendConnectorMetadata(set(), set())
+        metadata.add_request(first)
+        metadata.add_request(second)
+        original_start = ChunkStoreSession.start
+
+        def fail_second(session, history_keys, claim):
+            original_start(session, history_keys, claim)
+            if session.request_chunk.request_id == "first":
+                worker._range_read_plans["first"] = (
+                    first,
+                    session.request_lease,
+                    [],
+                )
+            if session.request_chunk.request_id == "second":
+                raise RuntimeError("second request initialization failed")
+
+        with patch.object(ChunkStoreSession, "start", new=fail_second):
+            with self.assertRaisesRegex(
+                RuntimeError, "second request initialization failed"
+            ):
+                worker._start_range_save(metadata)
+
+        revoked = {
+            key
+            for call in worker.m_store.batch_put_session_revoke.call_args_list
+            for key in call.args[0]
+        }
+        self.assertEqual(revoked, {"key-first", "key-second"})
+        self.assertTrue(all(lease.closed for lease in leases))
+        self.assertEqual(worker._range_request_leases, {})
+        self.assertEqual(worker._range_read_plans, {})
+        self.assertEqual(worker._range_load_layers_seen, set())
+        self.assertEqual(worker._range_request_generations, {})
+        self.assertEqual(worker._range_put_registry._entries, {})
+        self.assertEqual(worker._range_execution_id, 0)
+        self.assertFalse(worker._range_save_started)
+        self.assertEqual(worker._range_sessions_by_request, {})
+
+        worker._get_range_lease = KVPoolWorker._get_range_lease.__get__(
+            worker, KVPoolWorker
+        )
+        worker._start_range_save(metadata)
+        self.assertEqual(worker._range_execution_id, 1)
+        self.assertTrue(worker._range_save_started)
+        self.assertEqual(
+            set(worker._range_sessions_by_request), {"first", "second"}
         )
 
     def test_wait_for_save(self):

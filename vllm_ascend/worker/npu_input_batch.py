@@ -69,9 +69,8 @@ class NPUInputBatch(InputBatch):
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
         self._dsa_row_change_callback: Callable[
-            [list[tuple[int, int]], list[int], list[tuple[int, str, int]]], None
+            [list[tuple[int, int]], list[int]], None
         ] | None = None
-        self._dsa_request_generations: dict[str, int] = {}
 
         # TODO(woosuk): This buffer could be too large if max_model_len is big.
         # Find a way to reduce the CPU memory usage.
@@ -247,7 +246,7 @@ class NPUInputBatch(InputBatch):
     def set_dsa_row_change_callback(
         self,
         callback: Callable[
-            [list[tuple[int, int]], list[int], list[tuple[int, str, int]]], None
+            [list[tuple[int, int]], list[int]], None
         ] | None,
     ) -> None:
         """Attach the Decode DSA resident-row lifecycle sink."""
@@ -258,21 +257,16 @@ class NPUInputBatch(InputBatch):
         *,
         moves: list[tuple[int, int]] | None = None,
         invalidated: list[int] | None = None,
-        owners: list[tuple[int, str, int]] | None = None,
     ) -> None:
         if self._dsa_row_change_callback is not None:
-            self._dsa_row_change_callback(moves or [], invalidated or [], owners or [])
+            self._dsa_row_change_callback(moves or [], invalidated or [])
 
     def add_request(self, request):
-        old_req_ids = list(self._req_ids)
         req_index = super().add_request(request)
-        req_id = request.req_id
-        generation = self._dsa_request_generations.get(req_id, 0) + 1
-        self._dsa_request_generations[req_id] = generation
-        invalidated = []
-        if req_index < len(old_req_ids) and old_req_ids[req_index] not in (None, req_id):
-            invalidated.append(req_index)
-        self._notify_dsa_row_change(invalidated=invalidated, owners=[(req_index, req_id, generation)])
+        # Graph warmup/capture runs DSA Install with dummy inputs and can leave
+        # resident metadata in an otherwise empty InputBatch row. Always clear
+        # the row before a real request occupies it.
+        self._notify_dsa_row_change(invalidated=[req_index])
         return req_index
 
     def remove_request(self, req_id: str) -> int | None:
@@ -286,20 +280,15 @@ class NPUInputBatch(InputBatch):
         old_ids = (self._req_ids[i1], self._req_ids[i2])
         super().swap_states(i1, i2)
         if i1 != i2:
-            owners = []
             invalidated = []
             for row, req_id in zip((i1, i2), old_ids[::-1]):
-                if req_id is not None:
-                    owners.append((row, req_id, self._dsa_request_generations.get(req_id, 0)))
-                else:
+                if req_id is None:
                     # A swap with an empty row must clear the old resident
-                    # metadata at the source row. Otherwise the same owner
-                    # remains valid in both rows after the metadata copy.
+                    # metadata at the source row.
                     invalidated.append(row)
             self._notify_dsa_row_change(
                 moves=[(i1, i2), (i2, i1)],
                 invalidated=invalidated,
-                owners=owners,
             )
 
     def condense(self) -> None:
@@ -308,9 +297,4 @@ class NPUInputBatch(InputBatch):
         after = {req_id: index for index, req_id in enumerate(self._req_ids) if req_id is not None}
         moves = [(old, after[req_id]) for req_id, old in before.items() if req_id in after and after[req_id] != old]
         if moves:
-            owners = [
-                (after[req_id], req_id, self._dsa_request_generations.get(req_id, 0))
-                for req_id, old in before.items()
-                if req_id in after and after[req_id] != old
-            ]
-            self._notify_dsa_row_change(moves=moves, owners=owners)
+            self._notify_dsa_row_change(moves=moves)
