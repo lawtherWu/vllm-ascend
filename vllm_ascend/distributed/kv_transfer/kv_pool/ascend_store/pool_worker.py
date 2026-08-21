@@ -516,6 +516,28 @@ class KVPoolWorker:
             records.append(_LayerwiseRangeBlock(self._range_key(key, group_id), start, end, block_id, group_id))
         return records
 
+    def _shard_range_save_records(
+        self,
+        request: ReqMeta,
+        group_id: int,
+        records: list[_LayerwiseRangeBlock],
+    ) -> list[_LayerwiseRangeBlock]:
+        """Select the unique TP writer for replicated KV heads.
+
+        Keep this consistent with ``KVCacheStoreSendingThread``.  When the
+        number of KV heads is smaller than TP, multiple TP workers generate
+        the same Store key.  Only one of those workers may open a Mooncake put
+        session for each block.  Loads are intentionally not sharded because
+        every TP worker needs its local history workspace populated.
+        """
+        if (
+            self.dcp_size > 1
+            or request.disable_tp_key_sharding
+            or self.group_uses_align_state[group_id]
+        ):
+            return records
+        return records[self.tp_rank % self.put_step :: self.put_step]
+
     def _range_destination(self, layer_name: str, records: list[_LayerwiseRangeBlock]):
         keys: list[str] = []
         ptrs: list[list[int]] = []
@@ -1060,7 +1082,13 @@ class KVPoolWorker:
                 self.kv_recv_thread.start()
                 ready_event.wait()
 
-    def _start_load_range_request(self, request: ReqMeta, token_len: int) -> None:
+    def _start_load_range_request(
+        self,
+        request: ReqMeta,
+        token_len: int,
+        *,
+        require_all: bool = False,
+    ) -> None:
         self._normalize_range_request_identity(request)
         request.skip_null_blocks_by_group = self.group_uses_align_state
         load_group_ids = request.kv_cache_group_ids or [0]
@@ -1073,9 +1101,31 @@ class KVPoolWorker:
             keys = [record.key for record in unique_records]
             exists = self.m_store.exists(keys)
             if exists is None or len(exists) != len(keys):
-                raise RuntimeError(f"Layerwise range exists returned invalid result for {request.req_id}")
-            records = [record for record, code in zip(unique_records, exists, strict=True) if int(code) == 1]
-            lease.ensure_history([record.key for record in records])
+                raise RuntimeError(
+                    "Layerwise range exists returned invalid result for "
+                    f"{request.req_id}"
+                )
+            if require_all:
+                missing_keys = [
+                    record.key
+                    for record, code in zip(unique_records, exists, strict=True)
+                    if int(code) != 1
+                ]
+                if missing_keys:
+                    raise StoreCommitError(
+                        "Layerwise chunk history is incomplete for "
+                        f"{request.req_id}: missing_keys={missing_keys!r}"
+                    )
+            records = [
+                record
+                for record, code in zip(unique_records, exists, strict=True)
+                if int(code) == 1
+            ]
+            history_keys = [record.key for record in records]
+            if set(history_keys) - lease.history_keys:
+                lease.refresh_history(
+                    list(lease.history_keys) + history_keys
+                )
         self._range_read_plans[request.req_id] = (request, lease, records)
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
@@ -1085,6 +1135,31 @@ class KVPoolWorker:
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         for request in metadata.requests:
             load_spec = request.load_spec
+            history_token_len = int(getattr(request, "history_token_len", 0) or 0)
+            if self.use_layerwise_range and history_token_len > 0:
+                if history_token_len > request.token_len_chunk:
+                    raise ValueError(
+                        "Layerwise chunk history exceeds the complete Store "
+                        f"prefix for {request.req_id}: history={history_token_len}, "
+                        f"stored={request.token_len_chunk}"
+                    )
+                logger.debug(
+                    "KV pool worker prepare chunk history get req=%s "
+                    "history_token_len=%d token_len_chunk=%d",
+                    request.req_id,
+                    history_token_len,
+                    request.token_len_chunk,
+                )
+                try:
+                    self._start_load_range_request(
+                        request,
+                        history_token_len,
+                        require_all=True,
+                    )
+                except BaseException:
+                    self._abort_range_read_plans()
+                    raise
+                continue
             if load_spec is None or not load_spec.can_load:  # load =0
                 logger.debug(
                     "KV pool worker skip get req=%s reason=%s",
@@ -1164,6 +1239,12 @@ class KVPoolWorker:
             if not keys:
                 continue
             try:
+                logger.debug(
+                    "KV pool worker range get req=%s layer=%s keys=%d",
+                    req_id,
+                    layer_name,
+                    len(keys),
+                )
                 result = lease.load_layer(keys, ptrs, sizes, offsets)
                 expected_bytes = tuple(sum(row) for row in sizes)
                 if len(result) != len(keys) or any(
@@ -1228,7 +1309,16 @@ class KVPoolWorker:
             request.skip_null_blocks_by_group = self.group_uses_align_state
             records: list[_LayerwiseRangeBlock] = []
             for group_id in request.kv_cache_group_ids or [0]:
-                records.extend(self._range_records(request, request.token_len_chunk, group_id))
+                group_records = self._range_records(
+                    request, request.token_len_chunk, group_id
+                )
+                records.extend(
+                    self._shard_range_save_records(
+                        request,
+                        group_id,
+                        group_records,
+                    )
+                )
             lease = self._get_range_lease(request)
             missing: list[_LayerwiseRangeBlock] = []
             if records:
@@ -1239,11 +1329,16 @@ class KVPoolWorker:
                     exists = self.m_store.exists([record.key for record in candidates])
                     if exists is None or len(exists) != len(candidates):
                         raise RuntimeError(f"Layerwise range exists returned invalid result for {request.req_id}")
+                    complete_keys: list[str] = []
                     for record, code in zip(candidates, exists, strict=True):
                         if int(code) == 1:
-                            lease.ensure_history([record.key])
+                            complete_keys.append(record.key)
                         else:
                             missing.append(record)
+                    if complete_keys:
+                        lease.refresh_history(
+                            list(lease.history_keys) + complete_keys
+                        )
             # A final partial chunk may have no new full blocks. It still
             # needs a session so its existing read lease can be released and
             # get_finished() can observe completion.
@@ -1828,6 +1923,7 @@ class KVPoolWorker:
         block_hashes: list[BlockHash],
         kv_cache_group_ids: list[int] | None = None,
         use_layerwise: bool = False,
+        use_layerwise_range: bool = False,
     ) -> int:
         """
         Checks the existence of KV cache of the tokens from the cache engine.
@@ -1842,7 +1938,7 @@ class KVPoolWorker:
                 token_len,
                 block_hashes,
                 kv_cache_group_ids,
-                use_layerwise,
+                use_layerwise or use_layerwise_range,
                 include_all_ranks=True,
             )
             if coordinator_hit is not None:
@@ -1856,8 +1952,13 @@ class KVPoolWorker:
                     block_hashes,
                     kv_cache_group_id=group_id,
                 ):
-                    start, end, key = chunk.raw_start, chunk.raw_end, chunk.key
-                    if use_layerwise:
+                    if use_layerwise_range:
+                        # Range mode stores one object per block containing
+                        # every layer/component. Query the exact canonical key
+                        # used by _range_records() instead of the legacy
+                        # per-layer keys generated by split_layers().
+                        keys.append(self._range_key(key, group_id))
+                    elif use_layerwise:
                         keys_multi_layer = key.split_layers(self.num_layers)
                         for item in keys_multi_layer:
                             keys.append(item.to_string())
@@ -1888,7 +1989,7 @@ class KVPoolWorker:
 
                 res = self.m_store.exists(multi_tp_keys)  # type: ignore[assignment]
                 num_block = len(keys)
-                if use_layerwise:
+                if use_layerwise and not use_layerwise_range:
                     res = self.check_all_layers_exists(res, self.num_layers)
                     num_block = len(keys) // self.num_layers
                 multi_tp_values = [
