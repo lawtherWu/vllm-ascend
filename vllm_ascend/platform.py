@@ -453,12 +453,6 @@ class NPUPlatform(Platform):
         if not bool(extra_config.get("layerwise_host_kv_offload", False)):
             return
 
-        from vllm_ascend.ops.dsa_offload import (
-            DSA_BLOCK_SIZE,
-            DSA_SPECULATIVE_TOKENS,
-            DSA_TOPK,
-        )
-
         kv_role = getattr(kv_transfer_config, "kv_role", None)
         if kv_role not in {"kv_producer", "kv_consumer"}:
             raise ValueError(
@@ -510,29 +504,6 @@ class NPUPlatform(Platform):
                     "MooncakeLayerwiseConnector child"
                 )
 
-        block_size = getattr(vllm_config.cache_config, "block_size", None)
-        if block_size != DSA_BLOCK_SIZE:
-            raise ValueError(
-                f"layerwise_host_kv_offload requires block_size={DSA_BLOCK_SIZE}; "
-                f"got {block_size}"
-            )
-
-        speculative_config = getattr(vllm_config, "speculative_config", None)
-        num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
-        if num_speculative_tokens not in (None, DSA_SPECULATIVE_TOKENS):
-            raise ValueError(
-                "layerwise_host_kv_offload supports disabled MTP or MTP3 "
-                f"(num_speculative_tokens={DSA_SPECULATIVE_TOKENS}); "
-                f"got {num_speculative_tokens}"
-            )
-
-        hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
-        topk = getattr(hf_config, "index_topk", None)
-        if topk != DSA_TOPK:
-            raise ValueError(
-                f"layerwise_host_kv_offload requires index_topk={DSA_TOPK}; "
-                f"got {topk}"
-            )
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

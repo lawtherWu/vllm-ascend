@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
@@ -267,3 +268,8 @@ def test_group_builder_preserves_full_shared_ownership():
         DsaGroupSpec(group_id=0, owner_layer=0, layers=(0, 1)),
         DsaGroupSpec(group_id=1, owner_layer=2, layers=(2, 3)),
     )
+
+
+def test_group_builder_rejects_unresolved_owner_mapping():
+    with pytest.raises(TypeError, match="sequence"):
+        dsa_offload_runtime.build_dsa_group_specs({0: 0, 1: 0}, 2)

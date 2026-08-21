@@ -13,6 +13,10 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.attention.offload_capability import (
+    DsaOffloadAttentionBackendCapability,
+    DsaOffloadCacheMemory,
+)
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.patch.platform import patch_kv_cache_utils
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
@@ -23,7 +27,38 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_layerwise_decode_kv_cache_config,
     _get_layerwise_prefill_max_memory_usage_bytes,
     _get_layerwise_prefill_kv_cache_config,
+    is_layerwise_host_offload_decode,
+    is_layerwise_host_offload_prefill,
 )
+
+
+class _TestDsaOffloadBackend(DsaOffloadAttentionBackendCapability):
+    @classmethod
+    def get_dsa_offload_cache_memory(cls, *, layer_name, kv_cache_spec):
+        del layer_name
+        # Match the non-C8 SFA tuple used by the merged MLA fixture:
+        # latent KV + RoPE on host-visible memory and indexer K on device.
+        sparse_dims = kv_cache_spec.sparse_head_dim
+        assert sparse_dims is not None
+        dtype_size = torch.tensor([], dtype=kv_cache_spec.dtype).element_size()
+        main_bytes_per_token = (sparse_dims[0] + sparse_dims[1]) * dtype_size
+        return DsaOffloadCacheMemory(
+            main_bytes_per_token=main_bytes_per_token,
+            device_bytes_per_block=sparse_dims[2] * dtype_size * kv_cache_spec.block_size,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _patch_dsa_offload_backend_resolution(monkeypatch):
+    """Planner tests use synthetic configs without instantiated attention layers."""
+
+    monkeypatch.setattr(
+        patch_kv_cache_utils,
+        "get_dsa_offload_backends",
+        lambda _config, layer_names: {
+            layer_name: _TestDsaOffloadBackend for layer_name in layer_names
+        },
+    )
 
 
 def _config(*, enabled: bool = True, role: str = "kv_producer"):
@@ -61,6 +96,20 @@ def _group(*, second_head_size: int = 16):
     uniform = UniformTypeKVCacheSpecs.from_specs(specs)
     assert uniform is not None
     return KVCacheGroupSpec(list(specs), uniform)
+
+
+def test_layerwise_offload_requires_pd_separated_role() -> None:
+    config = _config(role="kv_both")
+    assert not is_layerwise_host_offload_prefill(config)
+    assert not is_layerwise_host_offload_decode(config)
+
+    config = _config(role="kv_producer")
+    assert is_layerwise_host_offload_prefill(config)
+    assert not is_layerwise_host_offload_decode(config)
+
+    config = _config(role="kv_consumer")
+    assert not is_layerwise_host_offload_prefill(config)
+    assert is_layerwise_host_offload_decode(config)
 
 
 def test_prefill_planner_shares_four_base_bundles_and_counts_mtp() -> None:

@@ -3,6 +3,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from vllm.distributed.parallel_state import get_world_group
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
@@ -28,6 +29,13 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
+
+
+def _set_layerwise_prefetch_device() -> None:
+    """Bind NPU calls in the prefetch worker to this process's local rank."""
+
+    local_rank = get_world_group().local_rank
+    torch.npu.set_device(torch.device(f"npu:{local_rank}"))
 
 
 class AscendMultiConnector(MultiConnector, SupportsHMA):
@@ -88,8 +96,8 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                     "MooncakeLayerwiseConnector child"
                 )
             if any(
-                not getattr(connector, "use_layerwise", False)
-                or not getattr(connector, "use_layerwise_range", False)
+                not connector.use_layerwise
+                or not connector.use_layerwise_range
                 for connector in store_children
             ):
                 raise ValueError(
@@ -149,6 +157,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             self._layer_load_executor = ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="layerwise-store-prefetch",
+                initializer=_set_layerwise_prefetch_device,
             )
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
@@ -361,7 +370,8 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             return
 
         if layer_name not in self._workspace_layer_to_index:
-            # GLM MTP3 executes the same physical MTP cache layer repeatedly.
+            # A speculative cache layer may execute the same physical layer
+            # repeatedly.
             # Its first invocation is the P2P snapshot that Decode consumes;
             # do not let a later invocation overwrite the source PA blocks
             # until that snapshot is complete. SFA calls this hook before its

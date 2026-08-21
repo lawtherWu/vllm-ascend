@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Mapping, Sequence
 
 import torch
 
@@ -85,7 +85,11 @@ def build_dsa_group_specs(
     indexer_types: Sequence[str] | None,
     num_hidden_layers: int,
 ) -> tuple[DsaGroupSpec, ...]:
-    """Build the same owner/shared groups used by the recipes GLM path."""
+    """Build owner/shared groups from normalized backend layer metadata.
+
+    ``full``/``shared`` remains accepted for compatibility with existing
+    model configs and is normalized by the attention backend.
+    """
 
     if num_hidden_layers <= 0:
         raise ValueError("num_hidden_layers must be positive")
@@ -94,6 +98,10 @@ def build_dsa_group_specs(
             DsaGroupSpec(layer, layer, (layer,))
             for layer in range(num_hidden_layers)
         )
+    if isinstance(indexer_types, (str, bytes)) or not isinstance(
+        indexer_types, Sequence
+    ):
+        raise TypeError("indexer_types must be a sequence of 'full'/'shared' values")
     if len(indexer_types) < num_hidden_layers:
         raise ValueError("indexer_types is shorter than num_hidden_layers")
 
@@ -114,7 +122,7 @@ def build_dsa_group_specs(
         )
 
     for layer_id, indexer_type in enumerate(indexer_types[:num_hidden_layers]):
-        normalized = indexer_type.lower()
+        normalized = str(indexer_type).lower()
         if normalized == "full":
             close_group()
             owner = layer_id
@@ -254,11 +262,7 @@ class DsaOffloadRuntime:
     def finish_step(self) -> None:
         """Record completion outside the eager/ACL Graph model wrapper."""
 
-        npu = getattr(torch, "npu", None)
-        event_cls = getattr(npu, "Event", None) if npu is not None else None
-        if event_cls is None:
-            return
-        event = event_cls()
+        event = torch.npu.Event()
         event.record()
         self.resident_state.record_final_install_event(event)
 
@@ -332,10 +336,8 @@ class DsaOffloadRuntime:
             raise RuntimeError("DSA Serve config differs from the active group plan")
         workspace = self.resident_state.workspace(layer_id)
         batch_size = active.state.batch_size
-        selection_rows = batch_size * config.raw_seq
-        selection_blocks = (
-            selection_rows * config.topk // config.selection_block_size
-        )
+        selection_rows = config.selection_rows(batch_size)
+        selection_blocks = config.selection_block_count(batch_size)
         dsa_serve(
             active.state.plan,
             full_kv_cache,
@@ -404,10 +406,8 @@ class DsaOffloadRuntime:
     ) -> None:
         workspace = self.resident_state.workspace(layer_id)
         batch_size = plan_state.batch_size
-        selection_rows = batch_size * config.raw_seq
-        selection_blocks = (
-            selection_rows * config.topk // config.selection_block_size
-        )
+        selection_rows = config.selection_rows(batch_size)
+        selection_blocks = config.selection_block_count(batch_size)
         dsa_install(
             plan_state.install_records,
             workspace.selection_kv_cache[:selection_blocks],
