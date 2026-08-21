@@ -170,8 +170,11 @@ class ReqMeta:
 @dataclass
 class SendTask:
     send_request: dict[str, ReqMeta] = field(default_factory=dict)
-    # pd_head_ratio == 1 use
+    # Source cache readiness. For resharding/quantization this event is
+    # synchronized by KVCacheSendingLayerThread before it reads source_kv_cache.
+    # For direct transfer it is synchronized before Mooncake reads the cache.
     wait_event: torch.npu.Event | None = None
+    source_kv_cache: tuple[torch.Tensor, ...] | None = None
     # pd_head_ratio > 1 use
     k_cache: torch.Tensor | None = None
     v_cache: torch.Tensor | None = None
@@ -187,9 +190,11 @@ class SendTask:
     group_block_table: list[torch.Tensor | None] | None = None
     group_block_len_tensor: list[torch.Tensor | None] | None = None
     group_seq_start_tensor: list[torch.Tensor | None] | None = None
-    # Completes only after the transfer engine has stopped reading every
-    # source address referenced by this layer task.
-    source_future: Future[None] = field(default_factory=Future)
+    # Worker-local completion handle. Scheduler connector metadata crosses a
+    # multiprocessing pickle boundary, so it must never carry a Future (whose
+    # internal Condition owns an unpicklable RLock). The worker installs this
+    # handle only when it creates the actual per-layer send task.
+    source_future: Future[None] | None = None
 
 
 @dataclass
@@ -321,11 +326,14 @@ class KVCacheSendingLayerThread(threading.Thread):
             self._handle_request(send_task)
 
     def _handle_request(self, send_task: SendTask):
+        source_future = send_task.source_future
         try:
+            if source_future is None:
+                raise RuntimeError("Layer send task is missing its source completion future")
             self._transfer_kv_cache(send_task)
         except Exception as e:
-            if not send_task.source_future.done():
-                send_task.source_future.set_exception(e)
+            if source_future is not None and not source_future.done():
+                source_future.set_exception(e)
             logger.error(
                 "Failed to transfer KV cache. layer_idx=%s, error=%s. Check transfer engine and memory state.",
                 send_task.layer_idx,
@@ -339,8 +347,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                 self.failed_reqs.add(req_id)
                 self._notify_terminal(req_id, req_meta, 0, success=False)
         else:
-            if not send_task.source_future.done():
-                send_task.source_future.set_result(None)
+            if not source_future.done():
+                source_future.set_result(None)
 
     def _notify_terminal(self, req_id: str, req_meta: ReqMeta, layer_group_idx: int, success: bool) -> None:
         if not req_meta.chunk_finish or req_meta._terminal_notified:
@@ -511,9 +519,182 @@ class KVCacheSendingLayerThread(threading.Thread):
                         length_list.append(block_len)
         return (src_list, dst_list, length_list)
 
+    def _prepare_kv_cache(self, send_task: SendTask, layer_group_idx: int) -> None:
+        """Prepare resharded or quantized KV in the sending thread."""
+        source_kv_cache = send_task.source_kv_cache
+        if source_kv_cache is None:
+            return
+
+        may_need_resharding = (
+            self.pd_head_ratio != 1
+            and isinstance(
+                self.kv_cache_specs[layer_group_idx],
+                (FullAttentionSpec, SlidingWindowSpec),
+            )
+        )
+        needs_c8_quant = (
+            self.enable_c8_quant
+            and send_task.layer_idx in self.vllm_config.quant_config.c8_quant_layers
+        )
+        needs_kv_quant = (
+            self.enable_kv_quant
+            and send_task.layer_idx in self.vllm_config.quant_config.kvcache_quant_layers
+        )
+        if not (may_need_resharding or needs_c8_quant or needs_kv_quant):
+            return
+
+        group_num_blocks = send_task.group_num_blocks
+        group_num_tokens = send_task.group_num_tokens
+        group_block_table = send_task.group_block_table
+        group_block_len_tensor = send_task.group_block_len_tensor
+        group_seq_start_tensor = send_task.group_seq_start_tensor
+        if (
+            group_num_blocks is None
+            or group_num_tokens is None
+            or group_block_table is None
+            or group_block_len_tensor is None
+            or group_seq_start_tensor is None
+        ):
+            raise RuntimeError("Layer send task is missing cache preparation metadata")
+
+        needs_resharding = may_need_resharding and group_num_blocks[layer_group_idx] > 0
+        if not (needs_resharding or needs_c8_quant or needs_kv_quant):
+            return
+
+        if send_task.wait_event is None:
+            raise RuntimeError("Layer send task is missing its source readiness event")
+        if self.resharding_stream is None:
+            raise RuntimeError("Layer send task requires a resharding stream")
+
+        # Mooncake's TP resharding path eventually launches ATB and HCCL work.
+        # Synchronize the producer Event in this background thread before any
+        # consumer work is submitted. A stream-local Event.wait() did not
+        # reliably propagate through that ATB/HCCL path on the target stack.
+        send_task.wait_event.synchronize()
+
+        if len(source_kv_cache) < 2:
+            raise RuntimeError("Cache preparation requires key and value tensors")
+        key_source, value_source = source_kv_cache[:2]
+        with npu_stream_switch(self.resharding_stream):
+            device = self.k_buffer.device
+            keys = torch.empty(
+                (
+                    group_num_tokens[layer_group_idx],
+                    *key_source.size()[-2:],
+                ),
+                dtype=key_source.dtype,
+                device=device,
+            )
+            values = torch.empty(
+                (
+                    group_num_tokens[layer_group_idx],
+                    *value_source.size()[-2:],
+                ),
+                dtype=value_source.dtype,
+                device=device,
+            )
+
+            block_table = group_block_table[layer_group_idx]
+            block_len_tensor = group_block_len_tensor[layer_group_idx]
+            seq_start_tensor = group_seq_start_tensor[layer_group_idx]
+            if block_table is None or block_len_tensor is None or seq_start_tensor is None:
+                raise RuntimeError("Layer send task has incomplete block metadata")
+            torch_npu.atb.npu_paged_cache_load(
+                key_source,
+                value_source,
+                block_table,
+                block_len_tensor,
+                seq_starts=seq_start_tensor,
+                key=keys,
+                value=values,
+            )
+
+            if self.pd_head_ratio != 1:
+                keys = (
+                    keys.view(
+                        group_num_blocks[layer_group_idx],
+                        self.pd_head_ratio,
+                        -1,
+                        *keys.shape[1:],
+                    )
+                    .transpose(0, 1)
+                    .reshape_as(keys)
+                )
+                values = (
+                    values.view(
+                        group_num_blocks[layer_group_idx],
+                        self.pd_head_ratio,
+                        -1,
+                        *values.shape[1:],
+                    )
+                    .transpose(0, 1)
+                    .reshape_as(values)
+                )
+                keys = keys.reshape(-1, *key_source.shape[2:])
+                values = values.reshape(-1, *value_source.shape[2:])
+                keys, values = kv_alltoall_and_rearrange(
+                    self.pd_head_ratio,
+                    keys,
+                    values,
+                )
+
+            quant_keys = None
+            quant_values = None
+            if self.enable_c8_quant:
+                layer = self.vllm_config.compilation_config.static_forward_context[
+                    send_task.layer_name
+                ]
+                quant_keys = torch.clamp(
+                    torch.round(keys * layer._c8_k_inv_scale + layer._c8_k_offset),
+                    -128,
+                    127,
+                ).to(torch.int8)
+                quant_values = torch.clamp(
+                    torch.round(
+                        values * layer._c8_v_inv_scale + layer._c8_v_offset
+                    ),
+                    -128,
+                    127,
+                ).to(torch.int8)
+                quant_keys = self._get_nz_cache(quant_keys, layer_group_idx)
+                quant_values = self._get_nz_cache(quant_values, layer_group_idx)
+            if needs_kv_quant:
+                layer = self.vllm_config.compilation_config.static_forward_context[
+                    send_task.layer_name
+                ]
+                keys = torch.ops.vllm.quantize(
+                    keys,
+                    layer.fak_descale,
+                    layer.fak_descale_reciprocal,
+                    layer.fak_offset,
+                )
+                quant_keys = self._get_nz_cache(keys, layer_group_idx)
+                quant_values = self._get_nz_cache(values, layer_group_idx)
+
+        send_task.k_cache = keys
+        send_task.v_cache = values
+        send_task.k_quant_cache = quant_keys
+        send_task.v_quant_cache = quant_values
+
+    def _get_nz_cache(
+        self,
+        cache_tensor: torch.Tensor,
+        layer_group_idx: int,
+    ) -> torch.Tensor:
+        head_num, head_dim = cache_tensor.shape[-2:]
+        block_size = self.kv_cache_specs[layer_group_idx].block_size
+        cache_tensor = cache_tensor.view(
+            -1,
+            block_size,
+            head_num * head_dim,
+        )
+        cache_tensor = trans_nd_to_nz(cache_tensor)
+        return cache_tensor.reshape(-1, head_num, head_dim)
+
     def _transfer_kv_cache(self, send_task: SendTask):
         layer_name = send_task.layer_name
         layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
+        self._prepare_kv_cache(send_task, layer_group_idx)
         key = send_task.k_cache
         value = send_task.v_cache
         if self.pd_head_ratio > 1 and key is not None and value is not None:
@@ -901,6 +1082,10 @@ class MooncakeLayerwiseConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int], list[list[int]]]] = {}
         self._reqs_need_send_layerwise: dict[str, SendReqInfo] = {}
+        # Scheduler computes local prefix hits before updating request state.
+        # Keep that value until update_state_after_alloc() builds the P2P
+        # request metadata, instead of rereading the stale request field.
+        self._remote_cached_tokens_by_request: dict[str, int] = {}
         self.need_truncate = self._has_attn_mamba_hybrid_cache(kv_cache_config)
         self.executor = ThreadPoolExecutor(32)
         tls_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("tls_config", {})
@@ -1002,6 +1187,10 @@ class MooncakeLayerwiseConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             assert num_computed_tokens % min(self.block_size) == 0
             count = max(self._hybrid_prefill_token_count(len(request.prompt_token_ids)) - num_computed_tokens, 0)
+            if count > 0:
+                self._remote_cached_tokens_by_request[request.request_id] = int(num_computed_tokens)
+            else:
+                self._remote_cached_tokens_by_request.pop(request.request_id, None)
             return count, count > 0
 
         if params is not None and params.get("do_remote_decode"):
@@ -1022,7 +1211,12 @@ class MooncakeLayerwiseConnectorScheduler:
             do_virtual = params.get("do_virtual", False)
             local_block_ids = (blocks.get_block_ids()) if num_external_tokens > 0 else []
             remote_block_ids = self._trim_hybrid_remote_block_ids(local_block_ids, len(request.prompt_token_ids))
-            remote_cached_tokens = request.num_computed_tokens
+            remote_cached_tokens = self._remote_cached_tokens_by_request.pop(request.request_id, None)
+            if remote_cached_tokens is None:
+                raise RuntimeError(
+                    "remote prefill allocation is missing the scheduler-computed "
+                    f"common prefix for {request.request_id}"
+                )
             # Get unhashed blocks to pull from remote.
             logger.debug(
                 "MooncakeLayerwiseConnector update_state_after_alloc: add %s to need recv queue", request.request_id
@@ -1193,6 +1387,7 @@ class MooncakeLayerwiseConnectorScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        self._remote_cached_tokens_by_request.pop(request.request_id, None)
         # layer_wise push, not need delay_free_blocks
         return False, None
 
@@ -1205,6 +1400,7 @@ class MooncakeLayerwiseConnectorScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        self._remote_cached_tokens_by_request.pop(request.request_id, None)
         # layer_wise push, not need delay_free_blocks
         return False, None
 
@@ -1804,102 +2000,20 @@ class MooncakeLayerwiseConnectorWorker:
 
             send_task = connector_metadata.send_task
             layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
-            keys = None
-            values = None
-            quant_keys = None
-            quant_values = None
-            if (
-                (
-                    self.pd_head_ratio != 1
-                    and (isinstance(self.kv_cache_specs[layer_group_idx], (FullAttentionSpec, SlidingWindowSpec)))
-                    and send_task.group_num_blocks[layer_group_idx] > 0
-                )
-                or (self.enable_c8_quant and self.current_layer in self.vllm_config.quant_config.c8_quant_layers)
-                or (self.enable_kv_quant and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers)
-            ):
-                assert self.resharding_stream is not None
-                with npu_stream_switch(self.resharding_stream):
-                    reshape_cache_event.wait()
-                    device = self.k_buffer.device  # type: ignore
-                    # Initialize buffers
-                    keys = torch.empty(
-                        (send_task.group_num_tokens[layer_group_idx], *kv_layer[0].size()[-2:]),
-                        dtype=kv_layer[0].dtype,
-                        device=device,
-                    )
-                    values = torch.empty(
-                        (send_task.group_num_tokens[layer_group_idx], *kv_layer[1].size()[-2:]),
-                        dtype=kv_layer[1].dtype,
-                        device=device,
-                    )
-
-                    # Load cache data into buffers
-                    torch_npu.atb.npu_paged_cache_load(
-                        kv_layer[0],
-                        kv_layer[1],
-                        send_task.group_block_table[layer_group_idx],
-                        send_task.group_block_len_tensor[layer_group_idx],
-                        seq_starts=send_task.group_seq_start_tensor[layer_group_idx],
-                        key=keys,
-                        value=values,
-                    )
-                    if self.pd_head_ratio != 1:
-                        # sort kv caches for each block
-                        keys = (
-                            keys.view(
-                                send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *keys.shape[1:]
-                            )
-                            .transpose(0, 1)
-                            .reshape_as(keys)
-                        )
-                        values = (
-                            values.view(
-                                send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *values.shape[1:]
-                            )
-                            .transpose(0, 1)
-                            .reshape_as(values)
-                        )
-                        # reshard kv cache
-                        keys = keys.reshape(-1, *kv_layer[0].shape[2:])
-                        values = values.reshape(-1, *kv_layer[1].shape[2:])
-
-                        (keys, values) = kv_alltoall_and_rearrange(self.pd_head_ratio, keys, values)
-                    if self.enable_c8_quant:
-                        layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
-                        quant_keys = torch.clamp(
-                            torch.round(keys * layer._c8_k_inv_scale + layer._c8_k_offset),
-                            -128,
-                            127,
-                        ).to(torch.int8)
-                        quant_values = torch.clamp(
-                            torch.round(values * layer._c8_v_inv_scale + layer._c8_v_offset),
-                            -128,
-                            127,
-                        ).to(torch.int8)
-                        quant_keys = self.get_nz_cache(quant_keys, layer_group_idx)
-                        quant_values = self.get_nz_cache(quant_values, layer_group_idx)
-                    if (
-                        self.enable_kv_quant
-                        and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers
-                    ):
-                        layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
-                        keys = torch.ops.vllm.quantize(
-                            keys, layer.fak_descale, layer.fak_descale_reciprocal, layer.fak_offset
-                        )
-                        quant_keys = self.get_nz_cache(keys, layer_group_idx)
-                        quant_values = self.get_nz_cache(values, layer_group_idx)
 
             assert self.kv_send_layer_thread is not None
             assert reshape_cache_event is not None
             layer_send_task = SendTask(
                 wait_event=reshape_cache_event,
-                k_cache=keys,
-                v_cache=values,
-                k_quant_cache=quant_keys,
-                v_quant_cache=quant_values,
+                source_kv_cache=tuple(kv_layer),
                 layer_idx=self.current_layer,
                 layer_name=layer_name,
                 group_rearrange_block_ids=send_task.group_rearrange_block_ids,
+                group_num_blocks=send_task.group_num_blocks,
+                group_num_tokens=send_task.group_num_tokens,
+                group_block_table=send_task.group_block_table,
+                group_block_len_tensor=send_task.group_block_len_tensor,
+                group_seq_start_tensor=send_task.group_seq_start_tensor,
                 source_future=source_future,
             )
             for req_id, req_meta in connector_metadata.requests.items():
@@ -1932,15 +2046,6 @@ class MooncakeLayerwiseConnectorWorker:
 
         source_future.set_result(None)
         return source_future
-
-    # NOTE: Due to the FIA operator constraints, the expected kv cache is ND format, NZ shape,
-    # while the npu_format_cast method only modifies the memory layout, we manually convert it to NZ shape here
-    def get_nz_cache(self, cache_tensor: torch.Tensor, layer_group_idx: int):
-        head_num, head_dim = cache_tensor.shape[-2], cache_tensor.shape[-1]
-        cache_tensor = cache_tensor.view(-1, self.block_size[layer_group_idx], head_num * head_dim)
-        cache_tensor = trans_nd_to_nz(cache_tensor)
-        cache_tensor = cache_tensor.reshape(-1, head_num, head_dim)
-        return cache_tensor
 
     def _get_remote_socket(self, remote_host: str, remote_handshake_port: int) -> zmq.Socket:  # type: ignore
         """Get a socket to the remote host."""
@@ -2072,6 +2177,10 @@ class MooncakeLayerwiseConnectorWorker:
                 req_meta.remote_port,
                 e,
             )
+            # The source future/fence must observe terminal-notification
+            # failures. Silently returning here would mark the transfer as
+            # successful while the receiver waits forever for trans_count.
+            raise
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass

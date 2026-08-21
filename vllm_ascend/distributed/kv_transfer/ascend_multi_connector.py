@@ -134,9 +134,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         try:
             for connector in self._connectors:
                 result = connector.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
-                source_futures.extend(self._source_futures(result))
-            for future in source_futures:
-                fence.add_source_future(future, key)
+                # Register each child result before invoking the next child.
+                # If a later connector raises, _abort_fence() must still wait
+                # for an earlier Store/P2P source reader using the shared
+                # workspace.
+                for future in self._source_futures(result):
+                    fence.add_source_future(future, key)
+                    source_futures.append(future)
             fence.close_registration()
         except BaseException:
             self._abort_fence(fence)
