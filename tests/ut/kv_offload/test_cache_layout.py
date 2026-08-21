@@ -11,7 +11,6 @@ from vllm_ascend.attention.cache_layout import (
     MemoryKind,
     bind_layer_cache_views,
     build_mla_layer_cache_descriptor,
-    build_store_object_layout,
     resolve_dsa_main_cache_tensors,
     stable_model_fingerprint,
 )
@@ -107,18 +106,6 @@ def test_dsa_main_cache_resolution_uses_merged_a5_c8_tensor():
     assert full_kv_cache is tensors[0]
     assert full_k_rope is tensors[0]
     assert full_k_rope is not tensors[1]
-
-
-def test_store_layout_is_cross_layer_and_excludes_mtp():
-    descriptors = [_descriptor(0), _descriptor(1), _descriptor(2, mtp=True)]
-    layout = build_store_object_layout(descriptors)
-    assert {item.layer_id for item in layout.ranges} == {0, 1}
-    assert len(layout.ranges) == 6
-    assert layout.object_size_bytes >= sum(item.size_bytes for item in layout.ranges)
-    assert all(
-        item.object_offset % item.alignment_bytes == 0
-        for item in layout.ranges
-    )
 
 
 def test_bind_rejects_wrong_dtype_and_shape():

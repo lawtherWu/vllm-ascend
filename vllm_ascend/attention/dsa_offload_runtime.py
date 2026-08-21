@@ -13,7 +13,6 @@ import torch
 from vllm_ascend.attention.dsa_offload_state import (
     DsaLayerWorkspace,
     DsaResidentState,
-    ResidentOwner,
 )
 from vllm_ascend.ops.dsa_offload import (
     DsaOffloadConfig,
@@ -186,7 +185,6 @@ class DsaOffloadRuntime:
         self._completed_groups: set[int] = set()
         self._pending_row_moves: list[tuple[int, int]] = []
         self._pending_invalidated_rows: set[int] = set()
-        self._pending_row_owners: dict[int, ResidentOwner] = {}
         seen_storages: set[int] = set()
         self.workspace_bytes = 0
         for workspace in resident_state.workspaces.values():
@@ -209,64 +207,33 @@ class DsaOffloadRuntime:
         self,
         moves: Sequence[tuple[int, int]],
         invalidated: Sequence[int],
-        owners: Sequence[tuple[int, str, int]],
     ) -> None:
         """Queue InputBatch row changes until the next DSA Plan boundary."""
         self._pending_row_moves.extend(moves)
         self._pending_invalidated_rows.update(invalidated)
-        for row, request_id, generation in owners:
-            self._pending_row_owners[row] = ResidentOwner(request_id, generation)
 
     def _apply_pending_row_changes(self) -> None:
-        if not (
-            self._pending_row_moves
-            or self._pending_invalidated_rows
-            or self._pending_row_owners
-        ):
+        if not (self._pending_row_moves or self._pending_invalidated_rows):
             return
-        moves = list(self._pending_row_moves)
         invalidated = set(self._pending_invalidated_rows)
-        owners = dict(self._pending_row_owners)
-        # A removed row can also be a destination of a later condense move.  A
-        # destination must retain the copied source metadata; a replacement
-        # request without a move must still clear the old metadata before bind.
-        moved_destinations = {destination for _, destination in moves}
-        swap_pairs = {(source, destination) for source, destination in moves}
-        for source, destination in moves:
-            if (destination, source) not in swap_pairs:
-                invalidated.add(source)
-        invalidated.difference_update(moved_destinations)
+        # Resident payload is physically indexed by the InputBatch row in every
+        # layer workspace. Moving only the shared metadata would make the new
+        # row describe stale payload from its previous occupant. Moving all
+        # per-layer resident tensors is both expensive and unnecessary: cold
+        # invalidate every row touched by a condense/reorder and let DsaInstall
+        # repopulate it from Host Main KV in the next step. This also avoids
+        # ambiguous snapshot semantics when several row moves are queued before
+        # one Plan boundary.
+        for source, destination in self._pending_row_moves:
+            invalidated.add(source)
+            invalidated.add(destination)
         for metadata in self.group_metadata.values():
-            # Snapshot sources so SWAP and overlapping UNIDIRECTIONAL moves do
-            # not overwrite a source row before it is copied.
-            source_rows = {source for source, _ in moves}
-            snapshots = {
-                source: (
-                    metadata.pool_ids[source].clone(),
-                    metadata.id_to_slot[source].clone(),
-                    metadata.lru_counter[source].clone(),
-                )
-                for source in source_rows
-            }
-            for source, destination in moves:
-                pool_ids, id_to_slot, lru_counter = snapshots[source]
-                metadata.pool_ids[destination].copy_(pool_ids)
-                metadata.id_to_slot[destination].copy_(id_to_slot)
-                metadata.lru_counter[destination].copy_(lru_counter)
             for row in invalidated:
                 metadata.pool_ids[row].fill_(-1)
                 metadata.id_to_slot[row].fill_(-1)
                 metadata.lru_counter[row].zero_()
-        if invalidated:
-            self.resident_state.invalidate_rows(
-                {layer_id: tuple(invalidated) for layer_id in self.resident_state.workspaces}
-            )
-        for row, owner in owners.items():
-            for layer_id in self.resident_state.workspaces:
-                self.resident_state.bind_row(layer_id, row, owner)
         self._pending_row_moves.clear()
         self._pending_invalidated_rows.clear()
-        self._pending_row_owners.clear()
 
     def group_for_layer(self, layer_id: int) -> DsaGroupSpec:
         try:
@@ -274,14 +241,31 @@ class DsaOffloadRuntime:
         except KeyError as error:
             raise KeyError(f"Unknown DSA layer {layer_id}") from error
 
+    def prepare_step(self) -> None:
+        """Submit row metadata updates before eager execution or graph replay.
+
+        DSA Install, these updates, and the next DSA Plan all use the current
+        NPU stream, which gives eager and ACL Graph one ordering contract.
+        """
+
+        self.resident_state.wait_previous_install()
+        self._apply_pending_row_changes()
+
+    def finish_step(self) -> None:
+        """Record completion outside the eager/ACL Graph model wrapper."""
+
+        npu = getattr(torch, "npu", None)
+        event_cls = getattr(npu, "Event", None) if npu is not None else None
+        if event_cls is None:
+            return
+        event = event_cls()
+        event.record()
+        self.resident_state.record_final_install_event(event)
+
     def begin_step(self) -> None:
         if self._active or self._step_open:
             raise RuntimeError("Cannot begin a DSA step before the previous step finishes")
-        self.resident_state.begin_step()
-        # DsaResidentState.begin_step is the single barrier for all previous-group
-        # Install events. Apply InputBatch row changes only after that barrier
-        # so an event is never waited twice in one step.
-        self._apply_pending_row_changes()
+        self.prepare_step()
         self._completed_groups.clear()
         self._step_open = True
 
@@ -333,7 +317,7 @@ class DsaOffloadRuntime:
         full_kv_actual_seq: torch.Tensor,
         *,
         config: DsaOffloadConfig,
-    ) -> tuple[DsaLayerWorkspace, DsaGroupPlan, object | None]:
+    ) -> tuple[DsaLayerWorkspace, DsaGroupPlan]:
         group_id = self._layer_to_group[layer_id]
         group = self.groups[group_id]
         active = self._active.get(group_id)
@@ -352,7 +336,7 @@ class DsaOffloadRuntime:
         selection_blocks = (
             selection_rows * config.topk // config.selection_block_size
         )
-        ready_event = dsa_serve(
+        dsa_serve(
             active.state.plan,
             full_kv_cache,
             full_k_rope,
@@ -364,14 +348,14 @@ class DsaOffloadRuntime:
             full_kv_actual_seq=full_kv_actual_seq[:batch_size],
             config=config,
         )
-        return workspace, active.state, ready_event
+        return workspace, active.state
 
     def install_after_layer(
         self,
         layer_id: int,
         *,
         config: DsaOffloadConfig,
-    ) -> tuple[object | None, ...]:
+    ) -> None:
         group_id = self._layer_to_group[layer_id]
         group = self.groups[group_id]
         active = self._active.get(group_id)
@@ -386,34 +370,28 @@ class DsaOffloadRuntime:
         if config != active.state.config:
             raise RuntimeError("DSA Install config differs from the active group plan")
         metadata = self.group_metadata[group_id]
-        events: list[object | None] = []
         if layer_id != group.owner_layer:
-            events.append(
-                self._install_layer(
-                    layer_id,
-                    active.state,
-                    metadata,
-                    config,
-                    metadata_update=0,
-                )
+            self._install_layer(
+                layer_id,
+                active.state,
+                metadata,
+                config,
+                metadata_update=0,
             )
         if layer_id == group.layers[-1]:
-            final_event = self._install_layer(
+            self._install_layer(
                 group.owner_layer,
                 active.state,
                 metadata,
                 config,
                 metadata_update=1,
             )
-            events.append(final_event)
-            self.resident_state.record_final_install_event(final_event)
             self._active.pop(group_id)
             self._completed_groups.add(group_id)
             if self._completed_groups == set(self.groups):
                 self._step_open = False
         else:
             active.next_layer_index += 1
-        return tuple(events)
 
     def _install_layer(
         self,
@@ -423,14 +401,14 @@ class DsaOffloadRuntime:
         config: DsaOffloadConfig,
         *,
         metadata_update: int,
-    ) -> object | None:
+    ) -> None:
         workspace = self.resident_state.workspace(layer_id)
         batch_size = plan_state.batch_size
         selection_rows = batch_size * config.raw_seq
         selection_blocks = (
             selection_rows * config.topk // config.selection_block_size
         )
-        return dsa_install(
+        dsa_install(
             plan_state.install_records,
             workspace.selection_kv_cache[:selection_blocks],
             workspace.selection_k_rope[:selection_blocks],
