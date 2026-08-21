@@ -484,9 +484,9 @@ class NPUPlatform(Platform):
                 if isinstance(child, dict)
                 and child.get("kv_connector") == "AscendStoreConnector"
             ]
-            if not store_configs:
+            if len(store_configs) != 1:
                 raise ValueError(
-                    "layerwise_host_kv_offload Prefill requires an "
+                    "layerwise_host_kv_offload Prefill requires exactly one "
                     "AscendStoreConnector child"
                 )
             for store_config in store_configs:
