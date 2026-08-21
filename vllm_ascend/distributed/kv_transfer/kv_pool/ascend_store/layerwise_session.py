@@ -13,7 +13,11 @@ from vllm_ascend.distributed.kv_transfer.layer_workspace_fence import RequestChu
 
 
 class LayerwiseStoreBackend(Protocol):
-    def batch_put_session_start(self, keys: list[str], sizes: list[int], config=None) -> list[int]: ...
+    def exists(self, keys: list[str]) -> list[int]: ...
+
+    def batch_put_session_start(
+        self, keys: list[str], sizes: list[int], config=None
+    ) -> list[int]: ...
 
     def batch_put_from_multi_buffer_ranges(
         self,
@@ -45,6 +49,7 @@ class PutState(str, Enum):
     COMMITTED = "committed"
     REVOKED = "revoked"
     END_FAILED = "end_failed"
+    CLEANUP_FAILED = "cleanup_failed"
     ERROR = "error"
 
 
@@ -104,13 +109,24 @@ class StorePutRegistry:
                 seen.add(binding.key)
                 existing = self._entries.get(binding.key)
                 if existing is not None and existing.state in {
-                    PutState.ERROR, PutState.END_FAILED, PutState.REVOKED,
+                    PutState.ERROR,
+                    PutState.REVOKED,
                 }:
                     # Failed sessions are terminal for their execution only.
                     # Do not turn a later scheduler retry into a follower of a
                     # stale failed future.
                     self._entries.pop(binding.key, None)
                     existing = None
+                if existing is not None and existing.state in {
+                    PutState.END_FAILED,
+                    PutState.CLEANUP_FAILED,
+                }:
+                    # Mooncake retains the native put session when put_end or
+                    # put_revoke fails. Do not open a second session for the
+                    # same canonical key until native cleanup is confirmed.
+                    claim.failed_keys.append(binding.key)
+                    claim.commit_futures[binding.key] = existing.future
+                    continue
                 if existing is not None:
                     claim.followed_keys.append(binding.key)
                     claim.commit_futures[binding.key] = existing.future
@@ -189,18 +205,63 @@ class StorePutRegistry:
                     entry.future.set_result([code])
                 else:
                     entry.state = PutState.END_FAILED
-                    entry.future.set_exception(StoreCommitError(f"put_end failed for {key}: {code}"))
+                    entry.future.set_exception(
+                        StoreCommitError(f"put_end failed for {key}: {code}")
+                    )
 
     def wait_followed(self, keys: list[str], timeout: float | None = None) -> None:
         for key in keys:
             entry = self._entries[key]
             entry.future.result(timeout=timeout)
 
+    def mark_native_state(self, keys: list[str], state: PutState) -> None:
+        with self._lock:
+            for key in keys:
+                entry = self._entries.get(key)
+                if entry is not None:
+                    entry.state = state
+
+    def publish_revoke_result(
+        self,
+        keys: list[str],
+        result_or_error: list[int] | BaseException,
+        terminal_error: BaseException,
+    ) -> None:
+        with self._lock:
+            if isinstance(result_or_error, BaseException):
+                for key in keys:
+                    entry = self._entries.get(key)
+                    if entry is None:
+                        continue
+                    entry.state = PutState.CLEANUP_FAILED
+                    if not entry.future.done():
+                        entry.future.set_exception(terminal_error)
+                return
+            if len(keys) != len(result_or_error):
+                error = RuntimeError("Mooncake put_revoke returned an invalid result length")
+                return self.publish_revoke_result(keys, error, terminal_error)
+            for key, code in zip(keys, result_or_error, strict=True):
+                entry = self._entries.get(key)
+                if entry is None:
+                    continue
+                entry.state = PutState.REVOKED if code == 0 else PutState.CLEANUP_FAILED
+                if not entry.future.done():
+                    entry.future.set_exception(terminal_error)
+
     def forget(self, keys: list[str]) -> None:
         with self._lock:
             for key in keys:
                 entry = self._entries.get(key)
-                if entry is not None and entry.future.done():
+                if (
+                    entry is not None
+                    and entry.future.done()
+                    and entry.state
+                    in {
+                        PutState.COMMITTED,
+                        PutState.REVOKED,
+                        PutState.ERROR,
+                    }
+                ):
                     self._entries.pop(key, None)
 
 
@@ -359,7 +420,9 @@ class StoreReadLeaseRegistry:
                 entry.references.discard(owner)
                 if not entry.references:
                     if entry.inflight_ranges:
-                        raise RuntimeError(f"Cannot release Store key {key!r} with an in-flight range")
+                        raise RuntimeError(
+                            f"Cannot release Store key {key!r} with an in-flight range"
+                        )
                     to_end.append(key)
             if to_end:
                 try:
@@ -520,15 +583,124 @@ class ChunkStoreSession:
             result = self.backend.batch_put_session_end(self.put_keys)
         except BaseException as error:
             self.put_registry.publish_commit_result(self.put_keys, error)
+            for key in self.put_keys:
+                self.put_state[key] = PutState.END_FAILED
             self.closed = True
+            try:
+                self._reconcile_unknown_end(error)
+            except BaseException as cleanup_error:
+                raise StoreCommitError(
+                    f"Store put_end failed with {error!r}; cleanup failed with "
+                    f"{cleanup_error!r}"
+                ) from error
             raise
+        if len(result) != len(self.put_keys):
+            error = StoreCommitError(
+                "Mooncake put_end returned an invalid result length: "
+                f"expected={len(self.put_keys)}, actual={len(result)}"
+            )
+            self.put_registry.publish_commit_result(self.put_keys, error)
+            for key in self.put_keys:
+                self.put_state[key] = PutState.END_FAILED
+            self.closed = True
+            try:
+                self._reconcile_unknown_end(error)
+            except BaseException as cleanup_error:
+                raise StoreCommitError(
+                    f"{error}; cleanup failed with {cleanup_error!r}"
+                ) from error
+            raise error
         self.put_registry.publish_commit_result(self.put_keys, result)
         for key, code in zip(self.put_keys, result, strict=True):
             self.put_state[key] = PutState.COMMITTED if code == 0 else PutState.END_FAILED
         self.closed = True
-        if any(code != 0 for code in result):
-            raise StoreCommitError(f"Store put_end failed: {result!r}")
+        failed_keys = [
+            key
+            for key, code in zip(self.put_keys, result, strict=True)
+            if code != 0
+        ]
+        if failed_keys:
+            error = StoreCommitError(f"Store put_end failed: {result!r}")
+            try:
+                self._revoke_keys(failed_keys, error)
+            except BaseException as cleanup_error:
+                raise StoreCommitError(
+                    f"{error}; cleanup failed with {cleanup_error!r}"
+                ) from error
+            raise error
         return result
+
+    def _reconcile_unknown_end(self, terminal_error: BaseException) -> None:
+        """Resolve native sessions after an ambiguous put_end result."""
+
+        try:
+            exists = self.backend.exists(self.put_keys)
+        except BaseException as error:
+            self.put_registry.mark_native_state(
+                self.put_keys, PutState.CLEANUP_FAILED
+            )
+            for key in self.put_keys:
+                self.put_state[key] = PutState.CLEANUP_FAILED
+            raise StoreCommitError(
+                f"Store complete lookup failed after put_end: {error!r}"
+            ) from error
+        if len(exists) != len(self.put_keys) or any(code not in (0, 1) for code in exists):
+            self.put_registry.mark_native_state(
+                self.put_keys, PutState.CLEANUP_FAILED
+            )
+            for key in self.put_keys:
+                self.put_state[key] = PutState.CLEANUP_FAILED
+            raise StoreCommitError(
+                "Store complete lookup returned an invalid result after "
+                f"put_end: {exists!r}"
+            )
+
+        complete_keys = [
+            key
+            for key, is_complete in zip(self.put_keys, exists, strict=True)
+            if is_complete == 1
+        ]
+        pending_keys = [
+            key
+            for key, is_complete in zip(self.put_keys, exists, strict=True)
+            if is_complete == 0
+        ]
+        self.put_registry.mark_native_state(complete_keys, PutState.COMMITTED)
+        for key in complete_keys:
+            self.put_state[key] = PutState.COMMITTED
+        self._revoke_keys(pending_keys, terminal_error)
+
+    def _revoke_keys(
+        self,
+        keys: list[str],
+        terminal_error: BaseException,
+    ) -> None:
+        if not keys:
+            return
+        try:
+            result = self.backend.batch_put_session_revoke(keys)
+        except BaseException as error:
+            self.put_registry.publish_revoke_result(keys, error, terminal_error)
+            for key in keys:
+                self.put_state[key] = PutState.CLEANUP_FAILED
+            raise
+        self.put_registry.publish_revoke_result(keys, result, terminal_error)
+        if len(result) != len(keys):
+            for key in keys:
+                self.put_state[key] = PutState.CLEANUP_FAILED
+            raise StoreCommitError(
+                "Mooncake put_revoke returned an invalid result length: "
+                f"expected={len(keys)}, actual={len(result)}"
+            )
+        failed: dict[str, int] = {}
+        for key, code in zip(keys, result, strict=True):
+            if code == 0:
+                self.put_state[key] = PutState.REVOKED
+            else:
+                self.put_state[key] = PutState.CLEANUP_FAILED
+                failed[key] = int(code)
+        if failed:
+            raise StoreCommitError(f"Store put_revoke failed: {failed!r}")
 
     def finalize_followed(self, has_more_prefill_chunks: bool) -> None:
         self.put_registry.wait_followed(self.followed_put_keys)
@@ -539,23 +711,21 @@ class ChunkStoreSession:
             )
 
     def revoke_uncommitted(self) -> None:
-        if self.put_end_attempted or not self.put_keys:
+        if not self.put_keys:
             return
-        keys = [key for key in self.put_keys if self.put_state.get(key) is PutState.OPEN]
+        keys = [
+            key
+            for key in self.put_keys
+            if self.put_state.get(key)
+            in {
+                PutState.OPEN,
+                PutState.END_FAILED,
+                PutState.CLEANUP_FAILED,
+            }
+        ]
         if not keys:
             return
-        try:
-            result = self.backend.batch_put_session_revoke(keys)
-        except BaseException as error:
-            self.put_registry.publish_commit_result(keys, error)
-            raise
-        if len(result) != len(keys) or any(code != 0 for code in result):
-            error = StoreCommitError(f"Store put_revoke failed: {result!r}")
-            self.put_registry.publish_commit_result(keys, error)
-            raise error
-        self.put_registry.publish_commit_result(
+        self._revoke_keys(
             keys,
             StoreCommitError("Store put was revoked before commit"),
         )
-        for key in keys:
-            self.put_state[key] = PutState.REVOKED
