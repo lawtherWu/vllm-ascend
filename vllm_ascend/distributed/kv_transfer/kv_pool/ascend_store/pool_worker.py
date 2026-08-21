@@ -313,7 +313,7 @@ class KVPoolWorker:
         self._range_load_layers_seen: set[str] = set()
         if self.use_layerwise_range:
             self._range_executor = ThreadPoolExecutor(
-                max_workers=4, thread_name_prefix="layerwise-store-range"
+                max_workers=4, thread_name_prefix="layerwise-store-range", initializer=self.m_store.set_device
             )
             self._range_put_registry = StorePutRegistry(self.m_store)
         kv_event_config = vllm_config.kv_events_config
