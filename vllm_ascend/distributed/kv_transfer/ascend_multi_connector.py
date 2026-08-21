@@ -50,15 +50,35 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         self._active_workspace_fence: LayerWorkspaceFence | None = None
         self._workspace_arena_id = 0
         if self._layerwise_workspace_fences_enabled:
-            store_children = [c for c in self._connectors if hasattr(c, "use_layerwise")]
+            from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import (
+                AscendStoreConnector,
+            )
+
+            store_children = [
+                connector
+                for connector in self._connectors
+                if isinstance(connector, AscendStoreConnector)
+            ]
+            p2p_children = [
+                connector
+                for connector in self._connectors
+                if isinstance(connector, MooncakeLayerwiseConnector)
+            ]
+            if not store_children or not p2p_children:
+                raise ValueError(
+                    "Prefill layerwise host offload requires both an "
+                    "AscendStoreConnector child and a "
+                    "MooncakeLayerwiseConnector child"
+                )
             if any(
-                getattr(c, "use_layerwise", False)
-                and not getattr(c, "use_layerwise_range", False)
-                for c in store_children
+                not getattr(connector, "use_layerwise", False)
+                or not getattr(connector, "use_layerwise_range", False)
+                for connector in store_children
             ):
                 raise ValueError(
                     "Prefill layerwise host offload requires the Store child "
-                    "configuration use_layerwise_range=true"
+                    "configuration use_layerwise=true and "
+                    "use_layerwise_range=true"
                 )
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
