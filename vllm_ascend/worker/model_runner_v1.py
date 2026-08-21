@@ -4228,41 +4228,64 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_config: KVCacheConfig,
         kv_caches: dict[str, torch.Tensor],
     ) -> None:
+        from vllm_ascend.attention.cache_layout import (
+            LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT,
+        )
         from vllm_ascend.patch.platform.patch_kv_cache_utils import (
             is_layerwise_host_offload_prefill,
         )
 
         if not is_layerwise_host_offload_prefill(self.vllm_config):
             return
-        shared_tensors = [
-            tensor_spec
-            for tensor_spec in kv_cache_config.kv_cache_tensors
-            if len(tensor_spec.shared_by) > 1
+        workspace_tensors = kv_cache_config.kv_cache_tensors[
+            :LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
         ]
-        if len(shared_tensors) != 1:
+        if len(workspace_tensors) != LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT:
             raise RuntimeError(
-                "Layerwise Host Offload Prefill requires exactly one shared "
-                "base-layer workspace tensor"
+                "Layerwise Host Offload Prefill requires exactly "
+                f"{LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT} base-layer "
+                "workspace tensors"
             )
 
         def component_ptrs(cache) -> tuple[int, ...]:
             components = (cache,) if isinstance(cache, torch.Tensor) else tuple(cache)
             return tuple(component.data_ptr() for component in components)
 
-        workspace_layers = shared_tensors[0].shared_by
-        expected_ptrs = component_ptrs(kv_caches[workspace_layers[0]])
-        for layer_name in workspace_layers[1:]:
-            actual_ptrs = component_ptrs(kv_caches[layer_name])
-            if actual_ptrs != expected_ptrs:
+        arena_ptrs: list[tuple[int, ...]] = []
+        layer_count = 0
+        for arena_id, tensor_spec in enumerate(workspace_tensors):
+            workspace_layers = tensor_spec.shared_by
+            if not workspace_layers:
                 raise RuntimeError(
-                    f"Layerwise workspace alias failed for {layer_name}: "
-                    f"expected={expected_ptrs}, actual={actual_ptrs}"
+                    f"Layerwise workspace arena {arena_id} has no layers"
                 )
+            expected_ptrs = component_ptrs(kv_caches[workspace_layers[0]])
+            for layer_name in workspace_layers[1:]:
+                actual_ptrs = component_ptrs(kv_caches[layer_name])
+                if actual_ptrs != expected_ptrs:
+                    raise RuntimeError(
+                        f"Layerwise workspace alias failed for {layer_name}: "
+                        f"expected={expected_ptrs}, actual={actual_ptrs}"
+                    )
+            arena_ptrs.append(expected_ptrs)
+            layer_count += len(workspace_layers)
+        for arena_id, ptrs in enumerate(arena_ptrs):
+            for other_arena_id, other_ptrs in enumerate(
+                arena_ptrs[arena_id + 1 :],
+                start=arena_id + 1,
+            ):
+                if set(ptrs) & set(other_ptrs):
+                    raise RuntimeError(
+                        "Layerwise workspace arenas unexpectedly share "
+                        "physical components: "
+                        f"arena {arena_id} and arena {other_arena_id}"
+                    )
         logger.info(
-            "Layerwise Host Offload Prefill bound %d base layers to one "
-            "workspace bundle with %d components and %d blocks",
-            len(workspace_layers),
-            len(expected_ptrs),
+            "Layerwise Host Offload Prefill bound %d base layers to %d "
+            "grouped-prefetch workspace bundles with %d components and %d blocks",
+            layer_count,
+            len(workspace_tensors),
+            len(arena_ptrs[0]),
             kv_cache_config.num_blocks,
         )
 

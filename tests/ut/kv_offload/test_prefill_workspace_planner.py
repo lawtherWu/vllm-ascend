@@ -50,58 +50,51 @@ def _config(*, enabled: bool = True, role: str = "kv_producer"):
 
 def _group(*, second_head_size: int = 16):
     specs = {
-        "model.layers.0.self_attn.attn": FullAttentionSpec(
+        f"model.layers.{layer_id}.self_attn.attn": FullAttentionSpec(
             block_size=128,
             num_kv_heads=1,
-            head_size=16,
+            head_size=second_head_size if layer_id == 1 else 16,
             dtype=torch.float16,
-        ),
-        "model.layers.1.self_attn.attn": FullAttentionSpec(
-            block_size=128,
-            num_kv_heads=1,
-            head_size=second_head_size,
-            dtype=torch.float16,
-        ),
-        "model.layers.2.self_attn.attn": FullAttentionSpec(
-            block_size=128,
-            num_kv_heads=1,
-            head_size=16,
-            dtype=torch.float16,
-        ),
+        )
+        for layer_id in range(9)
     }
     uniform = UniformTypeKVCacheSpecs.from_specs(specs)
     assert uniform is not None
     return KVCacheGroupSpec(list(specs), uniform)
 
 
-def test_prefill_planner_shares_one_base_bundle_and_counts_mtp() -> None:
+def test_prefill_planner_shares_four_base_bundles_and_counts_mtp() -> None:
+    config = _config()
+    config.model_config.hf_text_config.num_hidden_layers = 8
     group = _group()
     page_size = group.kv_cache_spec.kv_cache_specs[
         "model.layers.0.self_attn.attn"
     ].page_size_bytes
-    available_memory = page_size * 2 * 17
+    available_memory = page_size * 5 * 17
 
     result = _get_layerwise_prefill_kv_cache_config(
-        _config(),
+        config,
         [group],
         available_memory,
     )
 
     assert result.num_blocks == 17
-    assert len(result.kv_cache_tensors) == 2
-    assert result.kv_cache_tensors[0].shared_by == [
-        "model.layers.0.self_attn.attn",
-        "model.layers.1.self_attn.attn",
-    ]
-    assert result.kv_cache_tensors[1].shared_by == [
-        "model.layers.2.self_attn.attn"
+    assert len(result.kv_cache_tensors) == 5
+    for arena_id in range(4):
+        assert result.kv_cache_tensors[arena_id].shared_by == [
+            f"model.layers.{layer_id}.self_attn.attn"
+            for layer_id in range(arena_id, 8, 4)
+        ]
+    assert result.kv_cache_tensors[4].shared_by == [
+        "model.layers.8.self_attn.attn"
     ]
     assert sum(item.size for item in result.kv_cache_tensors) == available_memory
 
 
-def test_prefill_memory_check_counts_one_base_bundle_and_mtp() -> None:
+def test_prefill_memory_check_counts_four_base_bundles_and_mtp() -> None:
     config = _config()
-    config.model_config.max_model_len = 1024
+    config.model_config.hf_text_config.num_hidden_layers = 8
+    config.model_config.max_model_len = 1_024_000
     config.parallel_config = SimpleNamespace(
         decode_context_parallel_size=1,
         prefill_context_parallel_size=1,
@@ -113,13 +106,64 @@ def test_prefill_memory_check_counts_one_base_bundle_and_mtp() -> None:
 
     result = _get_layerwise_prefill_max_memory_usage_bytes(config, [group])
 
-    assert result == 8 * page_size * 2
+    assert result == 8000 * page_size * 5
+
+
+def test_prefill_planner_reuses_arena_after_four_layers() -> None:
+    config = _config()
+    config.model_config.hf_text_config.num_hidden_layers = 12
+    specs = {
+        f"model.layers.{layer_id}.self_attn.attn": FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=16,
+            dtype=torch.float16,
+        )
+        for layer_id in range(13)
+    }
+    uniform = UniformTypeKVCacheSpecs.from_specs(specs)
+    assert uniform is not None
+    group = KVCacheGroupSpec(list(specs), uniform)
+    page_size = next(iter(specs.values())).page_size_bytes
+
+    result = _get_layerwise_prefill_kv_cache_config(
+        config,
+        [group],
+        page_size * 5 * 7,
+    )
+
+    assert result.num_blocks == 7
+    assert result.kv_cache_tensors[0].shared_by == [
+        "model.layers.0.self_attn.attn",
+        "model.layers.4.self_attn.attn",
+        "model.layers.8.self_attn.attn",
+    ]
+    assert result.kv_cache_tensors[1].shared_by == [
+        "model.layers.1.self_attn.attn",
+        "model.layers.5.self_attn.attn",
+        "model.layers.9.self_attn.attn",
+    ]
+    assert result.kv_cache_tensors[2].shared_by == [
+        "model.layers.2.self_attn.attn",
+        "model.layers.6.self_attn.attn",
+        "model.layers.10.self_attn.attn",
+    ]
+    assert result.kv_cache_tensors[3].shared_by == [
+        "model.layers.3.self_attn.attn",
+        "model.layers.7.self_attn.attn",
+        "model.layers.11.self_attn.attn",
+    ]
+    assert result.kv_cache_tensors[4].shared_by == [
+        "model.layers.12.self_attn.attn",
+    ]
 
 
 def test_prefill_planner_rejects_incompatible_workspace_layers() -> None:
+    config = _config()
+    config.model_config.hf_text_config.num_hidden_layers = 8
     with pytest.raises(NotImplementedError, match="compatible base-layer"):
         _get_layerwise_prefill_kv_cache_config(
-            _config(),
+            config,
             [_group(second_head_size=32)],
             1 << 30,
         )
@@ -142,7 +186,9 @@ def test_feature_gate_delegates_when_disabled(monkeypatch) -> None:
     )
 
 
-def _merged_mla_group() -> tuple[KVCacheGroupSpec, AscendMLAAttentionSpec]:
+def _merged_mla_group(
+    num_layers: int = 2,
+) -> tuple[KVCacheGroupSpec, AscendMLAAttentionSpec]:
     spec = AscendMLAAttentionSpec(
         block_size=128,
         num_kv_heads=1,
@@ -153,10 +199,13 @@ def _merged_mla_group() -> tuple[KVCacheGroupSpec, AscendMLAAttentionSpec]:
         c8_k_cache_dtype=torch.int8,
         c8_k_scale_cache_dtype=torch.float16,
     )
-    return KVCacheGroupSpec([
-        "model.layers.0.self_attn.attn",
-        "model.layers.1.self_attn.attn",
-    ], spec), spec
+    return KVCacheGroupSpec(
+        [
+            f"model.layers.{layer_id}.self_attn.attn"
+            for layer_id in range(num_layers)
+        ],
+        spec,
+    ), spec
 
 
 def test_merged_mla_group_is_expanded_per_layer() -> None:
@@ -170,15 +219,22 @@ def test_merged_mla_group_is_expanded_per_layer() -> None:
 
 
 def test_prefill_planner_accepts_merged_ascend_mla_spec() -> None:
-    group, spec = _merged_mla_group()
+    config = _config()
+    config.model_config.hf_text_config.num_hidden_layers = 8
+    group, spec = _merged_mla_group(num_layers=8)
     result = _get_layerwise_prefill_kv_cache_config(
-        _config(),
+        config,
         [group],
-        spec.page_size_bytes * 3,
+        spec.page_size_bytes * 4 * 3,
     )
 
     assert result.num_blocks == 3
-    assert result.kv_cache_tensors[0].shared_by == group.layer_names
+    assert len(result.kv_cache_tensors) == 4
+    for arena_id in range(4):
+        assert result.kv_cache_tensors[arena_id].shared_by == [
+            group.layer_names[layer_id]
+            for layer_id in range(arena_id, len(group.layer_names), 4)
+        ]
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [None, 3])
