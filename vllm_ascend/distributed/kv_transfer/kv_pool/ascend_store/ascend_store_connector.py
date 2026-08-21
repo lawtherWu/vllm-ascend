@@ -221,6 +221,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return
         self.connector_worker.wait_for_layer_load(layer_name)
 
+    def wait_for_layer_loads(self, layer_names: tuple[str, ...]) -> None:
+        if not self.use_layerwise:
+            return
+        self.connector_worker.wait_for_layer_loads(layer_names)
+
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> Any:

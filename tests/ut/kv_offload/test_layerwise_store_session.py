@@ -9,6 +9,7 @@ import pytest
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_session import (
     ChunkStoreSession,
     PutBinding,
+    PutState,
     RequestStoreLease,
     StoreCommitError,
     StorePutRegistry,
@@ -23,9 +24,23 @@ class FakeBackend:
         self.get_start_keys = []
         self.get_end_keys = []
         self.get_start_result = None
+        self.exists_result = None
+        self.exists_error = None
         self.put_start_result = None
         self.put_end_result = None
+        self.put_end_error = None
+        self.put_revoke_result = None
+        self.put_revoke_error = None
         self.put_range_result = None
+        self.put_revoke_keys = []
+
+    def exists(self, keys):
+        self.calls["exists"] += 1
+        if self.exists_error is not None:
+            raise self.exists_error
+        if self.exists_result is not None:
+            return list(self.exists_result)
+        return [0] * len(keys)
 
     def batch_put_session_start(self, keys, sizes, config=None):
         del sizes, config
@@ -39,10 +54,19 @@ class FakeBackend:
 
     def batch_put_session_end(self, keys):
         self.calls["put_end"] += 1
-        return self.put_end_result or [0] * len(keys)
+        if self.put_end_error is not None:
+            raise self.put_end_error
+        if self.put_end_result is not None:
+            return list(self.put_end_result)
+        return [0] * len(keys)
 
     def batch_put_session_revoke(self, keys):
         self.calls["put_revoke"] += 1
+        self.put_revoke_keys.append(list(keys))
+        if self.put_revoke_error is not None:
+            raise self.put_revoke_error
+        if self.put_revoke_result is not None:
+            return list(self.put_revoke_result)
         return [0] * len(keys)
 
     def batch_get_session_start(self, keys):
@@ -276,7 +300,7 @@ def test_range_put_rejects_unexpected_positive_byte_count():
         session.save_layer(["new"], [[1000]], [[64]], [[0]])
 
 
-def test_put_end_failure_is_terminal_and_not_revoked():
+def test_put_end_failure_revokes_retained_native_session():
     backend = FakeBackend()
     backend.put_end_result = [-7]
     registry = StorePutRegistry(backend)
@@ -289,4 +313,108 @@ def test_put_end_failure_is_terminal_and_not_revoked():
     with pytest.raises(StoreCommitError):
         session.commit_owned()
     session.revoke_uncommitted()
-    assert backend.calls["put_revoke"] == 0
+    assert backend.put_revoke_keys == [["new"]]
+    assert session.put_state == {"new": PutState.REVOKED}
+
+
+def test_put_end_partial_failure_revokes_only_failed_key():
+    backend = FakeBackend()
+    backend.put_end_result = [0, -7]
+    registry = StorePutRegistry(backend)
+    lease = RequestStoreLease(("request", 0), StoreReadLeaseRegistry(backend))
+    claim = registry.claim_execution(
+        1,
+        [PutBinding("complete", 128), PutBinding("failed", 128)],
+    )
+    session = ChunkStoreSession(
+        RequestChunkKey("request", 0, 0), backend, lease, registry
+    )
+    session.start([], claim)
+
+    with pytest.raises(StoreCommitError, match="put_end failed"):
+        session.commit_owned()
+
+    assert backend.put_revoke_keys == [["failed"]]
+    assert session.put_state == {
+        "complete": PutState.COMMITTED,
+        "failed": PutState.REVOKED,
+    }
+    assert claim.commit_futures["complete"].result() == [0]
+    with pytest.raises(StoreCommitError, match="failed"):
+        claim.commit_futures["failed"].result()
+
+
+def test_put_end_exception_reconciles_complete_keys_before_revoke():
+    backend = FakeBackend()
+    backend.put_end_error = RuntimeError("end rpc failed")
+    backend.exists_result = [1, 0]
+    registry = StorePutRegistry(backend)
+    lease = RequestStoreLease(("request", 0), StoreReadLeaseRegistry(backend))
+    claim = registry.claim_execution(
+        1,
+        [PutBinding("complete", 128), PutBinding("pending", 128)],
+    )
+    session = ChunkStoreSession(
+        RequestChunkKey("request", 0, 0), backend, lease, registry
+    )
+    session.start([], claim)
+
+    with pytest.raises(RuntimeError, match="end rpc failed"):
+        session.commit_owned()
+
+    assert backend.put_revoke_keys == [["pending"]]
+    assert session.put_state == {
+        "complete": PutState.COMMITTED,
+        "pending": PutState.REVOKED,
+    }
+
+
+def test_put_end_invalid_result_length_reconciles_native_sessions():
+    backend = FakeBackend()
+    backend.put_end_result = [0]
+    backend.exists_result = [1, 0]
+    registry = StorePutRegistry(backend)
+    lease = RequestStoreLease(("request", 0), StoreReadLeaseRegistry(backend))
+    claim = registry.claim_execution(
+        1,
+        [PutBinding("complete", 128), PutBinding("pending", 128)],
+    )
+    session = ChunkStoreSession(
+        RequestChunkKey("request", 0, 0), backend, lease, registry
+    )
+    session.start([], claim)
+
+    with pytest.raises(StoreCommitError, match="invalid result length"):
+        session.commit_owned()
+
+    assert backend.calls["exists"] == 1
+    assert backend.put_revoke_keys == [["pending"]]
+
+
+def test_put_revoke_failure_blocks_restart_until_cleanup_succeeds():
+    backend = FakeBackend()
+    backend.put_end_result = [-7]
+    backend.put_revoke_result = [-9]
+    registry = StorePutRegistry(backend)
+    lease = RequestStoreLease(("request", 0), StoreReadLeaseRegistry(backend))
+    claim = registry.claim_execution(1, [PutBinding("new", 128)])
+    session = ChunkStoreSession(
+        RequestChunkKey("request", 0, 0), backend, lease, registry
+    )
+    session.start([], claim)
+
+    with pytest.raises(StoreCommitError, match="cleanup failed"):
+        session.commit_owned()
+
+    registry.forget(["new"])
+    assert registry._entries["new"].state is PutState.CLEANUP_FAILED
+    retry = registry.claim_execution(2, [PutBinding("new", 128)])
+    assert retry.failed_keys == ["new"]
+    assert backend.calls["put_start"] == 1
+
+    backend.put_revoke_result = [0]
+    session.revoke_uncommitted()
+    registry.forget(["new"])
+    recovered = registry.claim_execution(3, [PutBinding("new", 128)])
+    assert recovered.owned_keys == ["new"]
+    assert backend.calls["put_start"] == 2
