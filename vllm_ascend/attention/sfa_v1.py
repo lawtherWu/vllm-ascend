@@ -22,6 +22,13 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+from vllm_ascend.attention.cache_layout import (
+    LayerCacheLayoutDescriptor,
+    LayerCacheViews,
+    bind_layer_cache_views,
+    build_mla_layer_cache_descriptor,
+    resolve_dsa_main_cache_tensors,
+)
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
@@ -37,6 +44,7 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.ops.dsa_offload import DsaOffloadConfig
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -138,6 +146,59 @@ class AscendSFABackend(AttentionBackend):
     def get_supported_kernel_block_sizes() -> list[int]:
         return [128]
 
+    @staticmethod
+    def build_layer_cache_descriptor(
+        *,
+        layer_name: str,
+        layer_id: int,
+        group_id: int,
+        cache_family_id: str,
+        kv_cache_spec,
+        is_mtp_layer: bool = False,
+    ) -> LayerCacheLayoutDescriptor:
+        """Describe the physical SFA cache tuple for offload consumers."""
+
+        return build_mla_layer_cache_descriptor(
+            layer_name=layer_name,
+            layer_id=layer_id,
+            group_id=group_id,
+            cache_family_id=cache_family_id,
+            kv_cache_spec=kv_cache_spec,
+            is_mtp_layer=is_mtp_layer,
+        )
+
+    @staticmethod
+    def bind_layer_cache_views(
+        descriptor: LayerCacheLayoutDescriptor,
+        raw_cache_tuple: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    ) -> LayerCacheViews:
+        return bind_layer_cache_views(descriptor, raw_cache_tuple)
+
+
+    @staticmethod
+    def update_host_main_cache(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write current-step Main KV into the PA cache.
+
+        Decode may pass device-visible Host-backed tensors here. The Ascend PA
+        update operator supports that address space directly, so no landing
+        buffer or Host-to-Device gather is introduced.
+        """
+        if key.numel() == 0:
+            return
+        DeviceOperator.reshape_and_cache(
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=slot_mapping,
+        )
+
 
 @dataclass
 class DSACPContext:
@@ -149,6 +210,10 @@ class DSACPContext:
     slot_mapping_cp: torch.Tensor
     actual_seq_lengths_query: torch.Tensor
     actual_seq_lengths_key: torch.Tensor
+
+@dataclass(frozen=True)
+class DsaSelectionAttentionMetadata:
+    block_table: torch.Tensor
 
 
 @dataclass
@@ -517,6 +582,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
         self.layer_name = kwargs.get("layer_name")
+        self.dsa_offload_runtime = None
+        self.dsa_layer_id = None
+        self.dsa_cache_layout_descriptor: LayerCacheLayoutDescriptor | None = None
         hf_config = self.vllm_config.model_config.hf_config
         hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
         config_candidates = (hf_config, hf_text_config)
@@ -1288,6 +1356,127 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key,
         )
 
+    def _dsa_offload_config(self, attn_metadata: M) -> DsaOffloadConfig | None:
+        if self.dsa_offload_runtime is None or self.dsa_layer_id is None:
+            return None
+        if attn_metadata.attn_state not in {
+            AscendAttentionState.DecodeOnly,
+            AscendAttentionState.SpecDecoding,
+        }:
+            return None
+        raw_seq = (
+            4
+            if attn_metadata.attn_state is AscendAttentionState.SpecDecoding
+            else 1
+        )
+        return DsaOffloadConfig(raw_seq=raw_seq)
+
+    @staticmethod
+    def _reshape_dsa_topk(
+        topk_indices: torch.Tensor,
+        batch: int,
+        raw_seq: int,
+        topk: int,
+    ) -> torch.Tensor:
+        topk_indices = topk_indices.to(dtype=torch.int32)
+        if topk_indices.shape[-1] != topk:
+            raise ValueError(
+                f"DSA top-k width must be {topk}, got {topk_indices.shape[-1]}"
+            )
+        if raw_seq == 1:
+            if topk_indices.ndim == 2:
+                topk_indices = topk_indices.unsqueeze(1)
+            if topk_indices.ndim != 3 or topk_indices.shape[:2] != (batch, 1):
+                raise ValueError(
+                    "Decode DSA top-k must be [batch, 1, topk], got "
+                    f"{tuple(topk_indices.shape)}"
+                )
+            return topk_indices
+        if topk_indices.ndim == 3 and topk_indices.shape[:2] == (batch * raw_seq, 1):
+            return topk_indices.view(batch, raw_seq, 1, topk)
+        if topk_indices.ndim == 4 and topk_indices.shape[:3] == (batch, raw_seq, 1):
+            return topk_indices
+        raise ValueError(
+            "MTP DSA top-k must be [batch*raw_seq, 1, topk] or "
+            f"[batch, raw_seq, 1, topk], got {tuple(topk_indices.shape)}"
+        )
+
+    def _execute_dsa_offload_attention(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        topk_indices: torch.Tensor,
+        attn_metadata: M,
+        config: DsaOffloadConfig,
+    ) -> torch.Tensor:
+        runtime = self.dsa_offload_runtime
+        layer_id = self.dsa_layer_id
+        if runtime is None or layer_id is None:
+            raise RuntimeError("DSA Host offload runtime is not initialized")
+        batch = attn_metadata.block_table.shape[0]
+        topk_for_plan = self._reshape_dsa_topk(
+            topk_indices, batch, config.raw_seq, config.topk
+        )
+        full_actual_seq = attn_metadata.seq_lens[:batch].to(dtype=torch.int32)
+        group = runtime.group_for_layer(layer_id)
+        if layer_id == group.owner_layer:
+            runtime.plan_group(
+                group.group_id,
+                topk_for_plan,
+                full_actual_seq,
+                config=config,
+            )
+        cache_layout = self.dsa_cache_layout_descriptor
+        if cache_layout is None:
+            raise RuntimeError(
+                "DSA Host offload cache layout is not initialized for "
+                f"{self.layer_name}"
+            )
+        full_kv_cache, full_k_rope = resolve_dsa_main_cache_tensors(
+            cache_layout,
+            kv_cache,
+        )
+        workspace, plan_state, _ = runtime.serve_layer(
+            layer_id,
+            full_kv_cache,
+            full_k_rope,
+            attn_metadata.block_table[:batch].to(dtype=torch.int32),
+            full_actual_seq,
+            config=config,
+        )
+
+        rows = batch * config.raw_seq
+        selection_blocks_per_row = config.topk // config.selection_block_size
+        selected_blocks = rows * selection_blocks_per_row
+        if workspace.selection_query_lens is None or workspace.selection_default_indices is None:
+            raise RuntimeError("DSA selection metadata buffers are not initialized")
+        actual_seq = plan_state.selection_kv_actual_seq[:rows].to(dtype=torch.int32)
+        default_indices = workspace.selection_default_indices[:rows]
+        sparse_indices = torch.where(
+            default_indices < actual_seq.view(rows, 1, 1),
+            default_indices,
+            -1,
+        )
+        selection_cache = (
+            workspace.selection_kv_cache[:selected_blocks].unsqueeze(2),
+            workspace.selection_k_rope[:selected_blocks].unsqueeze(2),
+        )
+        selection_metadata = DsaSelectionAttentionMetadata(
+            workspace.selection_block_table[:rows]
+        )
+        attn_output = self._execute_sparse_flash_attention_process(
+            ql_nope,
+            q_pe,
+            selection_cache,
+            sparse_indices,
+            selection_metadata,
+            workspace.selection_query_lens[:rows],
+            actual_seq,
+        )
+        runtime.install_after_layer(layer_id, config=config)
+        return attn_output
+
     def forward(
         self,
         layer_name,
@@ -1535,7 +1724,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         assert k_nope is not None
                         k_nope = k_nope.view(k_nope.shape[0], 1, -1)
                         k_pe = k_pe.view(k_pe.shape[0], 1, -1)
-                        DeviceOperator.reshape_and_cache(
+                        AscendSFABackend.update_host_main_cache(
                             key=k_nope[: attn_metadata.num_actual_tokens],
                             value=k_pe[: attn_metadata.num_actual_tokens],
                             key_cache=kv_cache[0],
@@ -1547,7 +1736,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_li is not None
                 k_li = self._get_full_kv(k_li, attn_metadata)
 
-        if kv_cache is not None and self.is_kv_producer:
+        # Decode Host offload also needs a producer-side fence: the decode
+        # worker writes the current-step Main KV into the Host-backed PA
+        # tensor before DsaServe reads it, even though it is not a KV-transfer
+        # producer for the prefill request.
+        if kv_cache is not None and (self.is_kv_producer or self.dsa_offload_runtime is not None):
             attn_metadata.reshape_cache_event = torch.npu.Event()
 
         if kv_cache is not None and self.has_indexer:
@@ -1596,8 +1789,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
 
-            if self.is_kv_producer:
-                attn_metadata.reshape_cache_event.record()
+        # The event denotes completion of every cache component that this
+        # layer actually wrote.  Shared-indexer layers have no independent
+        # Indexer write, so their Main write above is the event boundary too.
+        if kv_cache is not None and (self.is_kv_producer or self.dsa_offload_runtime is not None):
+            assert attn_metadata.reshape_cache_event is not None
+            attn_metadata.reshape_cache_event.record()
 
         if self.enable_dsa_cp and attn_metadata.dsa_cp_context is not None:
             topk_num_tokens = attn_metadata.dsa_cp_context.local_end_with_pad - attn_metadata.dsa_cp_context.local_start
@@ -1621,9 +1818,26 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
 
-        attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
-        )
+        dsa_config = self._dsa_offload_config(attn_metadata)
+        if dsa_config is None:
+            attn_output = self._execute_sparse_flash_attention_process(
+                ql_nope,
+                q_pe,
+                kv_cache,
+                topk_indices,
+                attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+            )
+        else:
+            attn_output = self._execute_dsa_offload_attention(
+                ql_nope,
+                q_pe,
+                kv_cache,
+                topk_indices,
+                attn_metadata,
+                dsa_config,
+            )
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
@@ -1651,7 +1865,11 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         output[...] = self.o_proj(attn_output)[0]
 
-        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+        maybe_save_kv_layer_to_connector(
+            layer_name,
+            list(kv_cache),
+            kv_ready_event=attn_metadata.reshape_cache_event,
+        )
 
         return output_padded
 
