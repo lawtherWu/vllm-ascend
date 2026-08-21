@@ -243,6 +243,37 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
                 require_all=True,
             )
 
+    def test_range_load_rotates_keys_and_destinations_by_tp_rank(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.tp_rank = 2
+        worker._range_load_layers_seen = set()
+        worker._range_components = {(0, "layer.0"): MagicMock()}
+        worker._range_destination = MagicMock(
+            return_value=(
+                ["key-0", "key-1", "key-2"],
+                [[100], [200], [300]],
+                [[10], [20], [30]],
+                [[1], [2], [3]],
+            )
+        )
+        request = MagicMock()
+        lease = MagicMock()
+        lease.load_layer.return_value = [30, 10, 20]
+        worker._range_read_plans = {
+            "request": (request, lease, [MagicMock()])
+        }
+
+        worker._wait_for_layer_load_range("layer.0")
+
+        lease.load_layer.assert_called_once_with(
+            ["key-2", "key-0", "key-1"],
+            [[300], [100], [200]],
+            [[30], [10], [20]],
+            [[3], [1], [2]],
+        )
+        self.assertEqual(worker._range_read_plans, {})
+
     def test_range_request_generation_uses_bounded_global_counter(self):
         cls = self._make_worker_class()
         worker = object.__new__(cls)
