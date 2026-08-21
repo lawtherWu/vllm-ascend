@@ -22,6 +22,12 @@ from vllm_ascend.attention.cache_layout import (
     CacheComponentRole,
     build_mla_layer_cache_descriptor,
 )
+from vllm_ascend.ops.dsa_offload import (
+    DSA_BLOCK_SIZE,
+    DSA_RAW_SEQ,
+    DSA_TOPK,
+)
+from vllm_ascend.utils import vllm_version_is
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_config_from_groups = (
@@ -66,6 +72,35 @@ def _is_mtp_cache_layer(
     return bool(group.is_eagle_group and len(group.layer_names) == 1)
 
 
+def _get_group_layer_kv_cache_specs(
+    group: KVCacheGroupSpec,
+) -> dict[str, KVCacheSpec]:
+    """Expand vLLM group specs into a per-layer mapping.
+
+    vLLM keeps per-layer specs in ``UniformTypeKVCacheSpecs`` when layer
+    sizes differ, but uses one merged attention spec when all layers are
+    equivalent.  Both representations are valid group contracts.
+    """
+
+    group_spec = group.kv_cache_spec
+    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        missing = set(group.layer_names) - set(group_spec.kv_cache_specs)
+        if missing:
+            raise ValueError(
+                f"KV cache group is missing specs for layers: {sorted(missing)!r}"
+            )
+        return {
+            layer_name: group_spec.kv_cache_specs[layer_name]
+            for layer_name in group.layer_names
+        }
+    if isinstance(group_spec, MLAAttentionSpec):
+        return {layer_name: group_spec for layer_name in group.layer_names}
+    raise NotImplementedError(
+        "Layerwise Host offload requires UniformTypeKVCacheSpecs or a merged "
+        f"MLAAttentionSpec, got {type(group_spec).__name__}"
+    )
+
+
 def _get_layerwise_prefill_kv_cache_config(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -85,12 +120,7 @@ def _get_layerwise_prefill_kv_cache_config(
             "GLM cache group"
         )
     group = kv_cache_groups[0]
-    if not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-        raise NotImplementedError(
-            "Layerwise Host Offload Prefill requires UniformTypeKVCacheSpecs"
-        )
-
-    per_layer_specs = group.kv_cache_spec.kv_cache_specs
+    per_layer_specs = _get_group_layer_kv_cache_specs(group)
     workspace_layers: list[str] = []
     mtp_layers: list[str] = []
     for layer_name in group.layer_names:
@@ -184,7 +214,7 @@ def _dsa_group_count(vllm_config: VllmConfig, num_hidden_layers: int) -> int:
 def _dsa_workspace_bytes(
     vllm_config: VllmConfig,
     group: KVCacheGroupSpec,
-    specs: dict[str, MLAAttentionSpec],
+    specs: dict[str, KVCacheSpec],
 ) -> int:
     """Return the fixed Decode DSA workspace reservation."""
     extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
@@ -202,7 +232,22 @@ def _dsa_workspace_bytes(
     if num_hidden_layers <= 0:
         raise ValueError("DSA workspace accounting requires num_hidden_layers")
     metadata_groups = _dsa_group_count(vllm_config, num_hidden_layers)
-    raw_seq, topk, block_size = 4, 2048, 128
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
+    raw_seq = num_speculative_tokens + 1 if isinstance(num_speculative_tokens, int) else 1
+    if raw_seq not in DSA_RAW_SEQ:
+        raise ValueError(
+            "DSA workspace accounting supports disabled MTP or the "
+            "first-release MTP3 shape; "
+            f"got raw_seq={raw_seq}"
+        )
+    topk = getattr(hf_config, "index_topk", None)
+    if topk != DSA_TOPK:
+        raise ValueError(f"DSA workspace accounting requires index_topk={DSA_TOPK}; got {topk}")
+    topk = int(topk)
+    block_size = int(group.kv_cache_spec.block_size)
+    if block_size != DSA_BLOCK_SIZE:
+        raise ValueError(f"DSA workspace accounting requires block_size={DSA_BLOCK_SIZE}; got {block_size}")
     if pool_size <= 0 or pool_size > 16384 or pool_size % 16 != 0:
         raise ValueError("dsa_pool_size must be in (0, 16384] and divisible by 16")
     selection_rows = batch_capacity * raw_seq
@@ -271,15 +316,13 @@ def _get_layerwise_decode_kv_cache_config(
             "Decode Layerwise Host offload requires exactly one KV cache group; "
             "hybrid groups are not supported in the first release"
         )
-    if not isinstance(kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs):
-        raise NotImplementedError("Decode Layerwise Host offload requires UniformTypeKVCacheSpecs")
     group = kv_cache_groups[0]
     if group.kv_cache_spec.block_size != 128:
         raise NotImplementedError(
             "Decode Layerwise Host offload requires block_size=128 for the "
             "recipes DsaServe PA block table"
         )
-    specs = group.kv_cache_spec.kv_cache_specs
+    specs = _get_group_layer_kv_cache_specs(group)
     hbm_bytes_per_block = 0
     for layer_name in group.layer_names:
         spec = specs[layer_name]
@@ -318,16 +361,36 @@ def _get_layerwise_decode_kv_cache_config(
     if hbm_bytes_per_block <= 0:
         raise ValueError("Decode Layerwise Host offload has no device Indexer cache")
     dsa_bytes = _dsa_workspace_bytes(vllm_config, group, specs)
-    effective_memory = available_memory - dsa_bytes
-    if effective_memory <= 0:
-        raise MemoryError(
-            "Decode Layerwise Host offload cannot reserve fixed DSA workspace "
-            f"({dsa_bytes} bytes) from {available_memory} bytes"
+    # vLLM deliberately passes available_memory=0 while creating the minimal
+    # KV cache used by CUDA/ACL graph profiling. In that call path
+    # num_gpu_blocks_override is temporarily set to min_blocks, so zero is a
+    # profiling sentinel rather than the real HBM budget. Do not subtract the
+    # fixed DSA reservation from it or reject the request as an actual OOM.
+    is_minimal_profile = (
+        available_memory == 0
+        and vllm_config.cache_config.num_gpu_blocks_override is not None
+    )
+    if is_minimal_profile:
+        effective_memory = 0
+        num_blocks = may_override_num_blocks(vllm_config, 0)
+        if num_blocks <= 0:
+            raise ValueError(
+                "Minimal KV cache profiling requires a positive "
+                "num_gpu_blocks_override"
+            )
+    else:
+        effective_memory = available_memory - dsa_bytes
+        if effective_memory <= 0:
+            raise MemoryError(
+                "Decode Layerwise Host offload cannot reserve fixed DSA workspace "
+                f"({dsa_bytes} bytes) from {available_memory} bytes"
+            )
+        num_blocks = may_override_num_blocks(
+            vllm_config, effective_memory // hbm_bytes_per_block
         )
-    num_blocks = may_override_num_blocks(vllm_config, effective_memory // hbm_bytes_per_block)
     if num_blocks <= 0:
         raise ValueError("No KV cache block fits Decode Indexer-only HBM budget")
-    if num_blocks * hbm_bytes_per_block > effective_memory:
+    if not is_minimal_profile and num_blocks * hbm_bytes_per_block > effective_memory:
         raise MemoryError(
             "Configured KV cache block override exceeds Decode HBM budget after "
             f"DSA workspace reservation ({dsa_bytes} bytes)"

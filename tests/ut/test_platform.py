@@ -79,6 +79,28 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(NPUPlatform.dispatch_key, "PrivateUse1")
         self.assertEqual(NPUPlatform.supported_quantization, [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD])
 
+    def test_validate_layerwise_host_offload_config_accepts_frozen_shape(self):
+        for role in ("kv_producer", "kv_consumer"):
+            for num_speculative_tokens in (None, 3):
+                config = self.mock_layerwise_host_offload_config(
+                    role=role,
+                    num_speculative_tokens=num_speculative_tokens,
+                )
+                NPUPlatform._validate_layerwise_host_offload_config(config)
+
+    def test_validate_layerwise_host_offload_config_rejects_unsupported_shape(self):
+        cases = [
+            ({"role": "kv_both"}, "PD-disaggregated"),
+            ({"block_size": 64}, "block_size=128"),
+            ({"num_speculative_tokens": 2}, "disabled MTP or MTP3"),
+            ({"topk": 1024}, "index_topk=2048"),
+        ]
+        for overrides, match in cases:
+            with self.subTest(overrides=overrides):
+                config = self.mock_layerwise_host_offload_config(**overrides)
+                with self.assertRaisesRegex(ValueError, match):
+                    NPUPlatform._validate_layerwise_host_offload_config(config)
+
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
 
