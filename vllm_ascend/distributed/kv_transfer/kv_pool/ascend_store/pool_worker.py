@@ -1234,6 +1234,11 @@ class KVPoolWorker:
             keys, ptrs, sizes, offsets = self._range_destination(layer_name, records)
             if not keys:
                 continue
+            rank_offset = self.tp_rank % len(keys)
+            keys = keys[rank_offset:] + keys[:rank_offset]
+            ptrs = ptrs[rank_offset:] + ptrs[:rank_offset]
+            sizes = sizes[rank_offset:] + sizes[:rank_offset]
+            offsets = offsets[rank_offset:] + offsets[:rank_offset]
             try:
                 logger.debug(
                     "KV pool worker range get req=%s layer=%s keys=%d",
