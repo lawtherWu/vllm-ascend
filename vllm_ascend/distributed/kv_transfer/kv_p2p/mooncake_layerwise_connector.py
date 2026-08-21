@@ -156,6 +156,7 @@ class ReqMeta:
     remote_pcp_size: int | None
     remote_dcp_size: int | None
     chunk_finish: bool = False
+    request_generation: int = 0
     prompt_len: int = 0
     trans_count: list[int] | None = None
     remote_cache_tokens: int = 0
@@ -197,6 +198,19 @@ class SendTask:
     source_future: Future[None] | None = None
 
 
+@dataclass(frozen=True)
+class FailedRequestTask:
+    req_id: str
+    req_meta: ReqMeta
+    layer_group_idx: int
+    completion_future: Future[None]
+
+
+@dataclass(frozen=True)
+class CleanupRequestsTask:
+    req_ids: frozenset[str]
+
+
 @dataclass
 class TransferMeta:
     src: list[int]
@@ -211,6 +225,7 @@ class SendReqInfo:
     local_transferred_tokens: int
     local_computed_tokens: int
     request: "Request"
+    request_generation: int
 
     def extend_local_block_ids(self, new_block_ids: list[list[int]]) -> None:
         """extend local block ids for this step"""
@@ -231,6 +246,7 @@ class SendReqInfo:
             self.local_transferred_tokens,
             self.local_computed_tokens,
             self.request,
+            self.request_generation,
         )
 
 
@@ -307,8 +323,12 @@ class KVCacheSendingLayerThread(threading.Thread):
                 send_queue_size = len(self.kv_cache_specs)
             else:
                 send_queue_size = 1
-        self.send_queue = queue.Queue[SendTask](maxsize=send_queue_size)
-        self.failed_reqs: set[str] = set()
+        self.send_queue = queue.Queue[
+            SendTask | FailedRequestTask | CleanupRequestsTask
+        ](
+            maxsize=send_queue_size
+        )
+        self.failed_reqs: set[tuple[str, int]] = set()
         self.k_buffer = k_buffer
         self.v_buffer = v_buffer
         self.enable_kv_quant = enable_kv_quant
@@ -322,8 +342,23 @@ class KVCacheSendingLayerThread(threading.Thread):
         torch.npu.set_device(device)
         self.ready_event.set()
         while True:
-            send_task = self.send_queue.get()
-            self._handle_request(send_task)
+            task = self.send_queue.get()
+            try:
+                if isinstance(task, FailedRequestTask):
+                    self._handle_failed_request(task)
+                elif isinstance(task, CleanupRequestsTask):
+                    self._handle_cleanup_requests(task)
+                else:
+                    self._handle_request(task)
+            except Exception as error:
+                # One request must not terminate the process-wide sending
+                # thread and strand all later requests.
+                logger.exception("Unhandled P2P sending task failure")
+                if (
+                    isinstance(task, FailedRequestTask)
+                    and not task.completion_future.done()
+                ):
+                    task.completion_future.set_exception(error)
 
     def _handle_request(self, send_task: SendTask):
         source_future = send_task.source_future
@@ -332,8 +367,6 @@ class KVCacheSendingLayerThread(threading.Thread):
                 raise RuntimeError("Layer send task is missing its source completion future")
             self._transfer_kv_cache(send_task)
         except Exception as e:
-            if source_future is not None and not source_future.done():
-                source_future.set_exception(e)
             logger.error(
                 "Failed to transfer KV cache. layer_idx=%s, error=%s. Check transfer engine and memory state.",
                 send_task.layer_idx,
@@ -343,9 +376,31 @@ class KVCacheSendingLayerThread(threading.Thread):
             # a merged batch waiting for a DONE message forever.  Notify every
             # request in the task once; the receiver still aggregates normal
             # successful senders by its existing trans_count contract.
+            terminal_error: BaseException | None = None
             for req_id, req_meta in send_task.send_request.items():
-                self.failed_reqs.add(req_id)
-                self._notify_terminal(req_id, req_meta, 0, success=False)
+                try:
+                    completion_future: Future[None] = Future()
+                    self._handle_failed_request(
+                        FailedRequestTask(
+                            req_id,
+                            req_meta,
+                            0,
+                            completion_future,
+                        )
+                    )
+                    completion_future.result()
+                except BaseException as error:
+                    if terminal_error is None:
+                        terminal_error = error
+                    # send_done_send_signal() already retries. Keep processing
+                    # the rest of a merged batch if this request still cannot
+                    # publish its terminal state.
+                    logger.exception(
+                        "Failed to publish P2P terminal failure for %s",
+                        req_id,
+                    )
+            if source_future is not None and not source_future.done():
+                source_future.set_exception(terminal_error or e)
         else:
             if not source_future.done():
                 source_future.set_result(None)
@@ -353,8 +408,88 @@ class KVCacheSendingLayerThread(threading.Thread):
     def _notify_terminal(self, req_id: str, req_meta: ReqMeta, layer_group_idx: int, success: bool) -> None:
         if not req_meta.chunk_finish or req_meta._terminal_notified:
             return
-        req_meta._terminal_notified = True
         self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=success)
+        req_meta._terminal_notified = True
+
+    def _notify_terminal_isolated(
+        self,
+        req_id: str,
+        req_meta: ReqMeta,
+        layer_group_idx: int,
+        success: bool,
+    ) -> bool:
+        """Publish one terminal result without failing unrelated sessions."""
+
+        try:
+            self._notify_terminal(req_id, req_meta, layer_group_idx, success)
+        except Exception:
+            logger.exception("Failed to publish P2P terminal result for %s", req_id)
+            return False
+        return True
+
+    def _request_key(self, req_id: str, req_meta: ReqMeta) -> tuple[str, int]:
+        return req_id, req_meta.request_generation
+
+    def _discard_older_request_generations(
+        self, req_id: str, request_generation: int
+    ) -> None:
+        stale_keys = {
+            key
+            for key in self.failed_reqs
+            if key[0] == req_id and key[1] != request_generation
+        }
+        self.failed_reqs.difference_update(stale_keys)
+
+    def _handle_failed_request(self, task: FailedRequestTask) -> None:
+        key = self._request_key(task.req_id, task.req_meta)
+        self._discard_older_request_generations(*key)
+        self.failed_reqs.add(key)
+        try:
+            self._notify_terminal(
+                task.req_id,
+                task.req_meta,
+                task.layer_group_idx,
+                success=False,
+            )
+        except BaseException as error:
+            if not task.completion_future.done():
+                task.completion_future.set_exception(error)
+            raise
+        else:
+            if task.req_meta.chunk_finish:
+                self.failed_reqs.discard(key)
+            if not task.completion_future.done():
+                task.completion_future.set_result(None)
+
+    def mark_request_failed(
+        self,
+        req_id: str,
+        req_meta: ReqMeta,
+        layer_group_idx: int,
+    ) -> Future[None]:
+        """Queue a Worker-side metadata failure for the sending thread."""
+
+        completion_future: Future[None] = Future()
+        self.send_queue.put(
+            FailedRequestTask(
+                req_id,
+                req_meta,
+                layer_group_idx,
+                completion_future,
+            )
+        )
+        return completion_future
+
+    def cleanup_requests(self, req_ids: set[str]) -> None:
+        """Drop per-request failure state after finish or cancellation."""
+
+        if req_ids:
+            self.send_queue.put(CleanupRequestsTask(frozenset(req_ids)))
+
+    def _handle_cleanup_requests(self, task: CleanupRequestsTask) -> None:
+        self.failed_reqs = {
+            key for key in self.failed_reqs if key[0] not in task.req_ids
+        }
 
     def get_transfer_meta(self, send_task: SendTask, req_id: str, req_meta: ReqMeta, layer_group_idx: int):
         src_list: list[int] = []
@@ -367,7 +502,15 @@ class KVCacheSendingLayerThread(threading.Thread):
         remote_layer_metadata = req_meta.remote_layer_metadata[layer_name]
         local_layer_metadata = self.layer_metadata[layer_name]
         validate_existing_layer_metadata(layer_name, local_layer_metadata, remote_layer_metadata)
+        if local_layer_metadata.block_size_scale != remote_layer_metadata.block_size_scale:
+            raise ValueError(
+                f"{layer_name}: local/remote block_size_scale differ: "
+                f"{local_layer_metadata.block_size_scale!r} != "
+                f"{remote_layer_metadata.block_size_scale!r}"
+            )
         local_block_ids = req_meta.local_block_ids[layer_group_idx]
+        if not local_block_ids:
+            return (src_list, dst_list, length_list)
 
         if isinstance(layer_kv_cache_spec, MambaSpec):
             # only support one block transfer for mamba
@@ -453,6 +596,12 @@ class KVCacheSendingLayerThread(threading.Thread):
                         quant_block_lens = [block_lens[0] // 2, block_lens[1]]
                     else:
                         quant_block_lens = [block_lens[0] // 2, block_lens[1] // 2]
+                    if quant_block_lens != remote_layer_metadata.block_len:
+                        raise ValueError(
+                            f"{layer_name}: direct quantized transfer block "
+                            f"lengths {quant_block_lens!r} do not match remote "
+                            f"block strides {remote_layer_metadata.block_len!r}"
+                        )
                     layer_local_quant_kv_addr = [self.k_buffer.data_ptr(), self.v_buffer.data_ptr()]
                     rearrange_block_ids = send_task.group_rearrange_block_ids[layer_group_idx]
                     # eg:[5,6,7,9] -> {5:0, 6:1, 7:2, 9:3}
@@ -473,6 +622,12 @@ class KVCacheSendingLayerThread(threading.Thread):
                             dst_list.append(dst)
                             length_list.append(length)
                 else:
+                    if block_lens != remote_layer_metadata.block_len:
+                        raise ValueError(
+                            f"{layer_name}: direct transfer block lengths "
+                            f"{block_lens!r} do not match remote block strides "
+                            f"{remote_layer_metadata.block_len!r}"
+                        )
                     for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
                         zip(layer_local_kv_base_addr, layer_remote_kv_base_addr)
                     ):
@@ -507,12 +662,23 @@ class KVCacheSendingLayerThread(threading.Thread):
                     if self.enable_c8_quant:
                         block_len = block_len // 2
                     remote_block_len = remote_block_lens[k]
+                    destination_offset = block_len * (
+                        (self.tp_rank // self.num_head_replica)
+                        % self.pd_head_ratio
+                    )
+                    if destination_offset + block_len > remote_block_len:
+                        raise ValueError(
+                            f"{layer_name}: resharded component {k} exceeds "
+                            f"remote block stride: offset={destination_offset}, "
+                            f"transfer_bytes={block_len}, "
+                            f"remote_block_len={remote_block_len}"
+                        )
                     for remote_block_id, local_block_id in zip(remote_block_ids, local_block_ids):
                         src = src_layer_base_addr + rearrange_block_dict[local_block_id] * block_len
                         dst = (
                             dst_layer_base_addr
                             + remote_block_id * remote_block_len
-                            + block_len * ((self.tp_rank // self.num_head_replica) % self.pd_head_ratio)
+                            + destination_offset
                         )
                         src_list.append(src)
                         dst_list.append(dst)
@@ -715,6 +881,9 @@ class KVCacheSendingLayerThread(threading.Thread):
         # Merge transmission tasks of the same session
         session_meta: dict[str, TransferMeta] = {}
         for req_id, req_meta in send_task.send_request.items():
+            self._discard_older_request_generations(
+                req_id, req_meta.request_generation
+            )
             session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
             if session_id not in session_meta:
                 session_meta[session_id] = TransferMeta(src=[], dst=[], length=[], req_ids=[])
@@ -739,7 +908,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         elif self.pd_head_ratio > 1:
             self.resharding_stream.synchronize()
 
-        failed_sessions: list[tuple[str, int]] = []
+        terminal_delivery_failed = False
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
                 req_start_time = time.perf_counter()
@@ -756,11 +925,11 @@ class KVCacheSendingLayerThread(threading.Thread):
                         session_id,
                         ret,
                     )
-                    self.failed_reqs.update(transfer_meta.req_ids)
                     for req_id in transfer_meta.req_ids:
                         req_meta = send_task.send_request[req_id]
-                        self._notify_terminal(req_id, req_meta, layer_group_idx, success=False)
-                    failed_sessions.append((session_id, ret))
+                        self.failed_reqs.add(
+                            self._request_key(req_id, req_meta)
+                        )
                 else:
                     req_end_time = time.perf_counter()
                     total_transfer_size = sum(transfer_meta.length) / 1024
@@ -776,16 +945,31 @@ class KVCacheSendingLayerThread(threading.Thread):
                     for req_id in transfer_meta.req_ids:
                         req_meta = send_task.send_request[req_id]
                         if req_meta.chunk_finish:
-                            if req_id in self.failed_reqs:
-                                self._notify_terminal(req_id, req_meta, layer_group_idx, success=False)
-                                self.failed_reqs.discard(req_id)
+                            request_key = self._request_key(req_id, req_meta)
+                            if request_key in self.failed_reqs:
+                                delivered = self._notify_terminal_isolated(
+                                    req_id,
+                                    req_meta,
+                                    layer_group_idx,
+                                    success=False,
+                                )
+                                if delivered:
+                                    self.failed_reqs.discard(request_key)
                             else:
-                                self._notify_terminal(req_id, req_meta, layer_group_idx, success=True)
-        if failed_sessions:
-            raise RuntimeError(
-                "Mooncake layer transfer failed for sessions "
-                + ", ".join(f"{session_id} (ret={ret})" for session_id, ret in failed_sessions)
-            )
+                                delivered = self._notify_terminal_isolated(
+                                    req_id,
+                                    req_meta,
+                                    layer_group_idx,
+                                    success=True,
+                                )
+                            terminal_delivery_failed |= not delivered
+
+        if terminal_delivery_failed:
+            source_future = send_task.source_future
+            if source_future is not None and not source_future.done():
+                source_future.set_exception(
+                    RuntimeError("Failed to publish one or more P2P terminal results")
+                )
 
 
 class KVCacheRecvingLayerThread(threading.Thread):
@@ -809,7 +993,10 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.lock = threading.Lock()
         self.done_requests = set[str]()
         self.failed_requests = set[str]()
-        self.task_tracker = dict[str, int]()
+        self.task_tracker = dict[str, set[str]]()
+        # Keep a terminal tombstone until the worker observes request finish.
+        # This makes ACK retries idempotent without adding a second protocol.
+        self.terminal_requests = set[str]()
         self.ready_event = ready_event
         self.metadata = metadata
 
@@ -842,10 +1029,11 @@ class KVCacheRecvingLayerThread(threading.Thread):
             req_id: The ID of the request that has failed.
         """
         with self.lock:
-            if req_id not in self.task_tracker:
-                self.task_tracker[req_id] = set()
+            if req_id in self.terminal_requests:
+                return
             self.task_tracker.pop(req_id, None)
             self.failed_requests.add(req_id)
+            self.terminal_requests.add(req_id)
 
     def update_done_task(self, req_id, trans_count, side_channel_path):
         """
@@ -854,12 +1042,26 @@ class KVCacheRecvingLayerThread(threading.Thread):
             req_id: The ID of the request that has completed.
         """
         with self.lock:
+            if req_id in self.terminal_requests:
+                return
             if req_id not in self.task_tracker:
                 self.task_tracker[req_id] = set()
             self.task_tracker[req_id].add(side_channel_path)
             if len(self.task_tracker[req_id]) == trans_count:
                 self.task_tracker.pop(req_id)
                 self.done_requests.add(req_id)
+                self.terminal_requests.add(req_id)
+
+
+    def discard_requests(self, req_ids: set[str]) -> None:
+        """Release receiver state after requests finish or are cancelled."""
+
+        with self.lock:
+            for req_id in req_ids:
+                self.task_tracker.pop(req_id, None)
+                self.done_requests.discard(req_id)
+                self.failed_requests.discard(req_id)
+                self.terminal_requests.discard(req_id)
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -930,6 +1132,7 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
         remote_cache_tokens: int = 0,
         local_computed_tokens: int = 0,
         local_transed_tokens: int = 0,
+        request_generation: int = 0,
     ):
         self.requests[request_id] = ReqMeta(
             token_ids=token_ids or [],
@@ -947,6 +1150,7 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
             remote_dcp_size=kv_transfer_params.get("remote_dcp_size"),
             do_virtual=kv_transfer_params.get("do_virtual"),
             chunk_finish=chunk_finish,
+            request_generation=request_generation,
             remote_cache_tokens=remote_cache_tokens,
             local_computed_tokens=local_computed_tokens,
             prompt_len=prompt_len,
@@ -1016,7 +1220,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
-        return self.connector_worker.get_finished()
+        return self.connector_worker.get_finished(finished_req_ids)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Get the block ids that have load errors."""
@@ -1036,7 +1240,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: list[torch.Tensor], attn_metadata: "AttentionMetadata", **kwargs
-    ) -> Future[None]:
+    ) -> Future[None] | list[Future[None]]:
         """MooncakeLayerwiseConnector does not save explicitly."""
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, MooncakeLayerwiseConnectorMetadata)
@@ -1082,6 +1286,7 @@ class MooncakeLayerwiseConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int], list[list[int]]]] = {}
         self._reqs_need_send_layerwise: dict[str, SendReqInfo] = {}
+        self._send_request_generation = 0
         # Scheduler computes local prefix hits before updating request state.
         # Keep that value until update_state_after_alloc() builds the P2P
         # request metadata, instead of rereading the stale request field.
@@ -1187,10 +1392,11 @@ class MooncakeLayerwiseConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             assert num_computed_tokens % min(self.block_size) == 0
             count = max(self._hybrid_prefill_token_count(len(request.prompt_token_ids)) - num_computed_tokens, 0)
-            if count > 0:
-                self._remote_cached_tokens_by_request[request.request_id] = int(num_computed_tokens)
-            else:
-                self._remote_cached_tokens_by_request.pop(request.request_id, None)
+            # update_state_after_alloc() is called for remote-prefill requests
+            # even when the local prefix covers the full prompt and no remote
+            # blocks need to be allocated. Preserve the scheduler-computed
+            # prefix for both the transfer and zero-transfer paths.
+            self._remote_cached_tokens_by_request[request.request_id] = int(num_computed_tokens)
             return count, count > 0
 
         if params is not None and params.get("do_remote_decode"):
@@ -1269,11 +1475,14 @@ class MooncakeLayerwiseConnectorScheduler:
             remote_cache_tokens = params["remote_cached_tokens"]
             local_transferred_tokens = remote_cache_tokens
             local_computed_tokens = 0
+            self._send_request_generation += 1
+            request_generation = self._send_request_generation
             self._reqs_need_send_layerwise[request.request_id] = SendReqInfo(
                 local_block_ids=local_block_ids,
                 local_transferred_tokens=local_transferred_tokens,
                 local_computed_tokens=local_computed_tokens,
                 request=request,
+                request_generation=request_generation,
             )
 
     def build_connector_meta(
@@ -1330,6 +1539,7 @@ class MooncakeLayerwiseConnectorScheduler:
                             local_transed_tokens,
                             local_computed_tokens,
                             request,
+                            request_generation,
                         ) = send_req_info.unpack()
                         meta.add_new_req(
                             request_id=req_id,
@@ -1341,6 +1551,7 @@ class MooncakeLayerwiseConnectorScheduler:
                             prompt_len=len(request.all_token_ids),
                             local_computed_tokens=local_computed_tokens,
                             local_transed_tokens=local_transed_tokens,
+                            request_generation=request_generation,
                         )
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(
@@ -1388,6 +1599,8 @@ class MooncakeLayerwiseConnectorScheduler:
         should be freed now or will be sent asynchronously and freed later.
         """
         self._remote_cached_tokens_by_request.pop(request.request_id, None)
+        self._reqs_need_recv.pop(request.request_id, None)
+        self._reqs_need_send_layerwise.pop(request.request_id, None)
         # layer_wise push, not need delay_free_blocks
         return False, None
 
@@ -1401,6 +1614,8 @@ class MooncakeLayerwiseConnectorScheduler:
         should be freed now or will be sent asynchronously and freed later.
         """
         self._remote_cached_tokens_by_request.pop(request.request_id, None)
+        self._reqs_need_recv.pop(request.request_id, None)
+        self._reqs_need_send_layerwise.pop(request.request_id, None)
         # layer_wise push, not need delay_free_blocks
         return False, None
 
@@ -1678,7 +1893,16 @@ class MooncakeLayerwiseConnectorWorker:
             self.kv_recv_layer_thread.start()
             ready_event.wait()
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def get_finished(
+        self, finished_req_ids: set[str] | None = None
+    ) -> tuple[set[str], set[str]]:
+        finished_req_ids = finished_req_ids or set()
+        if finished_req_ids and self.kv_send_layer_thread is not None:
+            self.kv_send_layer_thread.cleanup_requests(finished_req_ids)
+        if finished_req_ids and self.kv_recv_layer_thread is not None:
+            self.kv_recv_layer_thread.discard_requests(
+                {get_external_request_id(req_id) for req_id in finished_req_ids}
+            )
         done_recving = (
             self.kv_recv_layer_thread.get_and_clear_done_requests(  # type: ignore[union-attr]
             )
@@ -1698,6 +1922,10 @@ class MooncakeLayerwiseConnectorWorker:
         for req_id in failed_recving:
             if meta := self._recving_metadata.get(req_id):
                 self._invalid_block_ids.update(block_id for group in meta.local_block_ids for block_id in group)
+        # A failed receive has completed its asynchronous wait. Returning it as
+        # finished lets the scheduler leave WAITING_FOR_REMOTE_KVS; invalid
+        # blocks above select recomputation instead of cache admission.
+        done_recving.update(failed_recving)
         for req_id in done_recving.union(failed_recving):
             org_req_id = req_id[:-9]
             self.request_map.pop(org_req_id, None)
@@ -1975,7 +2203,7 @@ class MooncakeLayerwiseConnectorWorker:
         attn_metadata: "AttentionMetadata",
         connector_metadata: MooncakeLayerwiseConnectorMetadata,
         **kwargs,
-    ) -> Future[None]:
+    ) -> Future[None] | list[Future[None]]:
         """MooncakeLayerwiseConnector does not save explicitly."""
         source_future: Future[None] = Future()
         if self.vllm_config.kv_transfer_config.is_kv_producer and connector_metadata.requests.keys():
@@ -2016,6 +2244,7 @@ class MooncakeLayerwiseConnectorWorker:
                 group_seq_start_tensor=send_task.group_seq_start_tensor,
                 source_future=source_future,
             )
+            failure_futures: list[Future[None]] = []
             for req_id, req_meta in connector_metadata.requests.items():
                 if len(req_meta.local_block_ids[layer_group_idx]) == 0:
                     continue
@@ -2032,16 +2261,25 @@ class MooncakeLayerwiseConnectorWorker:
                     # merged transfer session. Keep the source fence usable for
                     # other requests, but carry this request to the same FAILED
                     # terminal path used by transfer errors.
-                    self.failed_reqs.add(req_id)
-                    self._notify_terminal(
-                        req_id, req_meta, layer_group_idx, success=False
+                    failure_futures.append(
+                        self.kv_send_layer_thread.mark_request_failed(
+                            req_id,
+                            req_meta,
+                            layer_group_idx,
+                        )
                     )
                     continue
                 logger.debug("Add request %s to kv send layer thread. req_meta_update=%r", req_id, req_meta_update)
                 layer_send_task.send_request[req_id] = req_meta_update
 
-            self.kv_send_layer_thread.send_queue.put(layer_send_task)
+            if layer_send_task.send_request:
+                self.kv_send_layer_thread.send_queue.put(layer_send_task)
+            else:
+                # No transfer reads the shared workspace for this layer.
+                source_future.set_result(None)
             self.current_layer += 1
+            if failure_futures:
+                return [source_future, *failure_futures]
             return source_future
 
         source_future.set_result(None)

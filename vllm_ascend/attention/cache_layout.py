@@ -114,43 +114,6 @@ class LayerCacheViews:
         return self.by_role[role]
 
 
-@dataclass(frozen=True)
-class StoreRangeDescriptor:
-    layer_id: int
-    group_id: int
-    cache_family_id: str
-    component_role: CacheComponentRole
-    object_offset: int
-    size_bytes: int
-    alignment_bytes: int
-
-
-@dataclass(frozen=True)
-class StoreObjectLayoutDescriptor:
-    schema_version: int
-    group_id: int
-    cache_family_id: str
-    object_size_bytes: int
-    ranges: tuple[StoreRangeDescriptor, ...]
-
-    def range_for(
-        self,
-        layer_id: int,
-        component_role: CacheComponentRole,
-    ) -> StoreRangeDescriptor:
-        for range_descriptor in self.ranges:
-            if (
-                range_descriptor.layer_id == layer_id
-                and range_descriptor.component_role is component_role
-            ):
-                return range_descriptor
-        raise KeyError((layer_id, component_role))
-
-
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
 def _component(
     role: CacheComponentRole,
     tensor_index: int,
@@ -366,46 +329,6 @@ def resolve_dsa_main_cache_tensors(
     main_kv = views[CacheComponentRole.MAIN_KV]
     main_k_rope = views.by_role.get(CacheComponentRole.MAIN_K_ROPE, main_kv)
     return main_kv, main_k_rope
-
-
-def build_store_object_layout(
-    descriptors: Sequence[LayerCacheLayoutDescriptor],
-    *,
-    schema_version: int = LAYERWISE_CACHE_LAYOUT_SCHEMA_VERSION,
-) -> StoreObjectLayoutDescriptor:
-    stored = [descriptor for descriptor in descriptors if not descriptor.is_mtp_layer]
-    if not stored:
-        raise ValueError("A Store object requires at least one non-MTP layer")
-    group_ids = {descriptor.group_id for descriptor in stored}
-    families = {descriptor.cache_family_id for descriptor in stored}
-    if len(group_ids) != 1 or len(families) != 1:
-        raise ValueError("A Store object cannot span cache groups or cache families")
-
-    ranges: list[StoreRangeDescriptor] = []
-    offset = 0
-    for descriptor in sorted(stored, key=lambda item: item.layer_id):
-        for component in sorted(descriptor.components, key=lambda item: item.tensor_index):
-            offset = _align_up(offset, component.alignment_bytes)
-            ranges.append(
-                StoreRangeDescriptor(
-                    layer_id=descriptor.layer_id,
-                    group_id=descriptor.group_id,
-                    cache_family_id=descriptor.cache_family_id,
-                    component_role=component.component_role,
-                    object_offset=offset,
-                    size_bytes=component.page_bytes,
-                    alignment_bytes=component.alignment_bytes,
-                )
-            )
-            offset += component.page_bytes
-    object_alignment = max(item.alignment_bytes for item in ranges)
-    return StoreObjectLayoutDescriptor(
-        schema_version=schema_version,
-        group_id=next(iter(group_ids)),
-        cache_family_id=next(iter(families)),
-        object_size_bytes=_align_up(offset, object_alignment),
-        ranges=tuple(ranges),
-    )
 
 
 def stable_model_fingerprint(model_identity: Mapping[str, Any]) -> str:

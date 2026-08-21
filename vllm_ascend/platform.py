@@ -466,6 +466,50 @@ class NPUPlatform(Platform):
                 "kv_role ('kv_producer' or 'kv_consumer')"
             )
 
+        if kv_role == "kv_producer":
+            connector_name = getattr(kv_transfer_config, "kv_connector", None)
+            if connector_name != "MultiConnector":
+                raise ValueError(
+                    "layerwise_host_kv_offload Prefill requires "
+                    "kv_connector='MultiConnector'"
+                )
+            child_configs = extra_config.get("connectors")
+            if not isinstance(child_configs, (list, tuple)):
+                raise ValueError(
+                    "layerwise_host_kv_offload Prefill requires a connectors list"
+                )
+            store_configs = [
+                child
+                for child in child_configs
+                if isinstance(child, dict)
+                and child.get("kv_connector") == "AscendStoreConnector"
+            ]
+            if not store_configs:
+                raise ValueError(
+                    "layerwise_host_kv_offload Prefill requires an "
+                    "AscendStoreConnector child"
+                )
+            for store_config in store_configs:
+                store_extra = store_config.get("kv_connector_extra_config") or {}
+                if not (
+                    bool(store_extra.get("use_layerwise", False))
+                    and bool(store_extra.get("use_layerwise_range", False))
+                ):
+                    raise ValueError(
+                        "layerwise_host_kv_offload Prefill requires every "
+                        "AscendStoreConnector child to set use_layerwise=true "
+                        "and use_layerwise_range=true"
+                    )
+            if not any(
+                isinstance(child, dict)
+                and child.get("kv_connector") == "MooncakeLayerwiseConnector"
+                for child in child_configs
+            ):
+                raise ValueError(
+                    "layerwise_host_kv_offload Prefill requires a "
+                    "MooncakeLayerwiseConnector child"
+                )
+
         block_size = getattr(vllm_config.cache_config, "block_size", None)
         if block_size != DSA_BLOCK_SIZE:
             raise ValueError(
@@ -475,9 +519,9 @@ class NPUPlatform(Platform):
 
         speculative_config = getattr(vllm_config, "speculative_config", None)
         num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
-        if num_speculative_tokens != DSA_SPECULATIVE_TOKENS:
+        if num_speculative_tokens not in (None, DSA_SPECULATIVE_TOKENS):
             raise ValueError(
-                "layerwise_host_kv_offload requires MTP3 "
+                "layerwise_host_kv_offload supports disabled MTP or MTP3 "
                 f"(num_speculative_tokens={DSA_SPECULATIVE_TOKENS}); "
                 f"got {num_speculative_tokens}"
             )
