@@ -39,7 +39,7 @@ class ResidentRow:
 
 @dataclass(frozen=True)
 class DsaLayerWorkspace:
-    """Fixed tensors and completion event for one non-MTP sparse layer."""
+    """Fixed tensors for one non-MTP sparse layer."""
 
     layer_id: int
     resident_kv_cache: torch.Tensor
@@ -49,7 +49,6 @@ class DsaLayerWorkspace:
     selection_block_table: torch.Tensor
     selection_query_lens: torch.Tensor | None = None
     selection_default_indices: torch.Tensor | None = None
-    install_event: object | None = None
 
     def __post_init__(self) -> None:
         if self.layer_id < 0:
@@ -72,7 +71,7 @@ class DsaLayerWorkspace:
 
 
 class DsaResidentState:
-    """Per-layer row ownership and install ordering without allocation logic."""
+    """Per-layer row ownership without allocation logic."""
 
     def __init__(self, workspaces: Sequence[DsaLayerWorkspace]):
         self._workspaces = {workspace.layer_id: workspace for workspace in workspaces}
@@ -103,9 +102,10 @@ class DsaResidentState:
             raise KeyError(f"Unknown non-MTP DSA layer {layer_id}") from error
 
     def wait_previous_install(self) -> None:
-        """Wait for the final install of the previous step before row reuse."""
+        """Wait for step-complete events before resident metadata reuse."""
 
-        for event in tuple(self._last_install_events):
+        events = tuple(self._last_install_events)
+        for event in events:
             wait = getattr(event, "wait", None)
             if callable(wait):
                 wait()
@@ -115,15 +115,15 @@ class DsaResidentState:
                 synchronize()
                 continue
             raise TypeError("DSA install event must provide wait() or synchronize()")
+        # A successful wait consumes the events. prepare_step can be called
+        # again by the eager Plan path without emitting a duplicate wait.
+        with self._lock:
+            del self._last_install_events[: len(events)]
 
     def begin_step(self) -> None:
         """Make pending row invalidations visible before the next DsaPlan."""
 
-        self.wait_previous_install()
         with self._lock:
-            # The events are only needed to protect the transition into this
-            # step. Drop them after the barrier so they do not accumulate.
-            self._last_install_events.clear()
             for layer_id, rows in self._pending_invalidations.items():
                 valid = self._valid[layer_id]
                 owners = self._rows[layer_id]
@@ -172,7 +172,7 @@ class DsaResidentState:
             )
 
     def record_final_install_event(self, event: object | None) -> None:
-        """Record one group's final install event for the next-step barrier."""
+        """Record a model-step completion event after all DSA Install ops."""
 
         if event is not None:
             self._last_install_events.append(event)

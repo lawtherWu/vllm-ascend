@@ -2904,6 +2904,12 @@ class NPUModelRunner(GPUModelRunner):
         }
         run_model = partial(self.model, **model_inputs)
 
+        if self.dsa_offload_runtime is not None:
+            # Keep the cross-step fence outside run_model: ACLGraphWrapper
+            # enters capture/replay inside its __call__, so eager and graph
+            # share the same wait -> forward -> record boundary.
+            self.dsa_offload_runtime.prepare_step()
+
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
             self._update_full_graph_params_if_needed(
@@ -2918,6 +2924,10 @@ class NPUModelRunner(GPUModelRunner):
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+        if self.dsa_offload_runtime is not None:
+            # Record after every layer's DSA Install and after ACLGraphWrapper
+            # has left capture/replay.
+            self.dsa_offload_runtime.finish_step()
         return hidden_states
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
