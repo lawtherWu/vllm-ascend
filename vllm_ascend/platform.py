@@ -444,6 +444,52 @@ class NPUPlatform(Platform):
             "pipeline_parallel_size=1 and may combine data parallelism with MTP."
         )
 
+    @staticmethod
+    def _validate_layerwise_host_offload_config(vllm_config: VllmConfig) -> None:
+        """Validate the frozen first-release DSA offload shape."""
+
+        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+        if not bool(extra_config.get("layerwise_host_kv_offload", False)):
+            return
+
+        from vllm_ascend.ops.dsa_offload import (
+            DSA_BLOCK_SIZE,
+            DSA_SPECULATIVE_TOKENS,
+            DSA_TOPK,
+        )
+
+        kv_role = getattr(kv_transfer_config, "kv_role", None)
+        if kv_role not in {"kv_producer", "kv_consumer"}:
+            raise ValueError(
+                "layerwise_host_kv_offload requires a PD-disaggregated "
+                "kv_role ('kv_producer' or 'kv_consumer')"
+            )
+
+        block_size = getattr(vllm_config.cache_config, "block_size", None)
+        if block_size != DSA_BLOCK_SIZE:
+            raise ValueError(
+                f"layerwise_host_kv_offload requires block_size={DSA_BLOCK_SIZE}; "
+                f"got {block_size}"
+            )
+
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
+        if num_speculative_tokens != DSA_SPECULATIVE_TOKENS:
+            raise ValueError(
+                "layerwise_host_kv_offload requires MTP3 "
+                f"(num_speculative_tokens={DSA_SPECULATIVE_TOKENS}); "
+                f"got {num_speculative_tokens}"
+            )
+
+        hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+        topk = getattr(hf_config, "index_topk", None)
+        if topk != DSA_TOPK:
+            raise ValueError(
+                f"layerwise_host_kv_offload requires index_topk={DSA_TOPK}; "
+                f"got {topk}"
+            )
+
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
@@ -697,16 +743,7 @@ class NPUPlatform(Platform):
         kv_extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
         layerwise_host_offload = bool(kv_extra.get("layerwise_host_kv_offload", False))
         if layerwise_host_offload:
-            if kv_role not in {"kv_producer", "kv_consumer"}:
-                raise ValueError(
-                    "layerwise_host_kv_offload requires a PD-disaggregated "
-                    "kv_role ('kv_producer' or 'kv_consumer')"
-                )
-            if cache_config.block_size != 128:
-                raise ValueError(
-                    "layerwise_host_kv_offload currently requires block-size=128 "
-                    f"(got {cache_config.block_size})"
-                )
+            cls._validate_layerwise_host_offload_config(vllm_config)
             if kv_role == "kv_producer":
                 if ascend_config.enable_balance_scheduling:
                     raise ValueError(
