@@ -262,8 +262,6 @@ class ExecuteModelState(NamedTuple):
 
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # Populated only on a decode worker with layerwise host KV offload.
-        self.decode_host_kv_pool = None
         # Fixed DSA resident/selection workspaces are initialized after model
         # loading on Decode workers. Request/block ownership stays in vLLM.
         self.dsa_offload_runtime = None
@@ -2904,6 +2902,12 @@ class NPUModelRunner(GPUModelRunner):
         }
         run_model = partial(self.model, **model_inputs)
 
+        if self.dsa_offload_runtime is not None:
+            # Keep the cross-step fence outside run_model: ACLGraphWrapper
+            # enters capture/replay inside its __call__, so eager and graph
+            # share the same wait -> forward -> record boundary.
+            self.dsa_offload_runtime.prepare_step()
+
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
             self._update_full_graph_params_if_needed(
@@ -2918,6 +2922,10 @@ class NPUModelRunner(GPUModelRunner):
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+        if self.dsa_offload_runtime is not None:
+            # Record after every layer's DSA Install and after ACLGraphWrapper
+            # has left capture/replay.
+            self.dsa_offload_runtime.finish_step()
         return hidden_states
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
@@ -3893,7 +3901,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         from vllm_ascend.ops.dsa_offload import (
             DSA_BLOCK_SIZE,
-            DSA_SPECULATIVE_TOKENS,
+            DSA_RAW_SEQ,
             DSA_TOPK,
         )
 
@@ -3940,16 +3948,20 @@ class NPUModelRunner(GPUModelRunner):
         num_speculative_tokens = getattr(self.vllm_config.speculative_config, "num_speculative_tokens", None)
         topk = getattr(hf_config, "index_topk", None)
         block_size = int(self.cache_config.block_size)
-        if num_speculative_tokens != DSA_SPECULATIVE_TOKENS:
+        max_raw_seq = (
+            num_speculative_tokens + 1
+            if isinstance(num_speculative_tokens, int)
+            else 1
+        )
+        if max_raw_seq not in DSA_RAW_SEQ:
             raise RuntimeError(
-                "DSA Host offload requires MTP3; "
+                "DSA Host offload supports disabled MTP or MTP3; "
                 f"got num_speculative_tokens={num_speculative_tokens}"
             )
         if topk != DSA_TOPK:
             raise RuntimeError(f"DSA Host offload requires index_topk={DSA_TOPK}; got {topk}")
         if block_size != DSA_BLOCK_SIZE:
             raise RuntimeError(f"DSA Host offload requires block_size={DSA_BLOCK_SIZE}; got {block_size}")
-        max_raw_seq = num_speculative_tokens + 1
         selection_blocks = (topk + block_size - 1) // block_size
         selection_rows = batch_capacity * max_raw_seq
         workspaces = []
@@ -4136,17 +4148,16 @@ class NPUModelRunner(GPUModelRunner):
                 "Decode DSA Host offload requires one KV cache group"
             )
         group = kv_cache_config.kv_cache_groups[0]
-        spec = group.kv_cache_spec
-        specs = getattr(spec, "kv_cache_specs", None)
-        if specs is None:
-            raise NotImplementedError(
-                "Decode DSA Host offload requires UniformTypeKVCacheSpecs"
-            )
         from vllm_ascend.patch.platform.patch_kv_cache_utils import (
             _dsa_workspace_bytes,
+            _get_group_layer_kv_cache_specs,
         )
 
-        expected = _dsa_workspace_bytes(self.vllm_config, group, specs)
+        expected = _dsa_workspace_bytes(
+            self.vllm_config,
+            group,
+            _get_group_layer_kv_cache_specs(group),
+        )
         actual = runtime.workspace_bytes
         if actual != expected:
             raise RuntimeError(
@@ -4174,7 +4185,7 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config,
             kv_caches,
         )
-        self._init_decode_host_kv_pool(kv_cache_config, kv_caches)
+        self._validate_decode_host_kv_caches(kv_cache_config, kv_caches)
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -4393,10 +4404,16 @@ class NPUModelRunner(GPUModelRunner):
 
         return torch_npu.empty_with_swapped_memory((size,), dtype=torch.int8, device=self.device)
 
-    def _init_decode_host_kv_pool(self, kv_cache_config: KVCacheConfig, kv_caches: dict[str, torch.Tensor]) -> None:
+    def _validate_decode_host_kv_caches(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
         if not self._use_decode_host_kv_offload():
             return
-        from vllm_ascend.distributed.kv_transfer.kv_pool.decode_host_kv_pool import DecodeHostKVPool
+        from vllm_ascend.distributed.kv_transfer.kv_pool.decode_host_kv_pool import (
+            validate_decode_host_kv_caches,
+        )
 
         descriptors = []
         layer_specs = self._get_layer_kv_cache_specs(kv_cache_config)
@@ -4413,8 +4430,17 @@ class NPUModelRunner(GPUModelRunner):
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             for layer_name in group.layer_names:
                 spec = layer_specs[layer_name]
-                if not isinstance(spec, AscendMLAAttentionSpec) or layer_name not in kv_caches:
-                    continue
+                if not isinstance(spec, AscendMLAAttentionSpec):
+                    raise NotImplementedError(
+                        "Layerwise host KV offload requires "
+                        "AscendMLAAttentionSpec for "
+                        f"{layer_name}, got {type(spec).__name__}"
+                    )
+                if layer_name not in kv_caches:
+                    raise KeyError(
+                        "Layerwise host KV offload is missing cache tensor "
+                        f"for {layer_name}"
+                    )
                 backend = backend_by_layer.get(layer_name)
                 build_descriptor = getattr(backend, "build_layer_cache_descriptor", None)
                 if not callable(build_descriptor):
@@ -4444,13 +4470,15 @@ class NPUModelRunner(GPUModelRunner):
                 impl.dsa_cache_layout_descriptor = descriptor
                 if not is_mtp:
                     layer_ids[group_id] += 1
-        pool = DecodeHostKVPool(None)
-        pool.adopt_existing(
-            {group_id: kv_cache_config.num_blocks for group_id in range(len(kv_cache_config.kv_cache_groups))},
+        num_blocks_by_group = {
+            group_id: kv_cache_config.num_blocks
+            for group_id in range(len(kv_cache_config.kv_cache_groups))
+        }
+        validate_decode_host_kv_caches(
+            num_blocks_by_group,
             descriptors,
             kv_caches,
         )
-        self.decode_host_kv_pool = pool
 
     def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
