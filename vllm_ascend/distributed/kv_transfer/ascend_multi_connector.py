@@ -1,6 +1,8 @@
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, cast
 
+import torch
+
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
@@ -73,7 +75,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         if fence is None:
             return
         self._active_workspace_fence = None
-        fence.wait_source_safe()
+        fence.wait_workspace_reusable()
 
     @staticmethod
     def _source_futures(result: Any) -> list[Future[Any]]:
@@ -96,7 +98,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         # shared workspace after the model has already unwound the forward.
         fence.close_registration()
         try:
-            fence.wait_source_safe()
+            fence.wait_workspace_reusable()
         except BaseException:
             pass
 
@@ -132,6 +134,15 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         self._active_workspace_fence = fence
         source_futures: list[Future[Any]] = []
         try:
+            # This hook runs after the layer attention and output projection
+            # have been submitted to the current stream. Store GET is issued
+            # by a CPU thread and is not ordered by that stream, so the next
+            # layer must not overwrite the shared workspace until this event
+            # completes. This is intentionally separate from kv_ready_event,
+            # which lets PUT/D2RH overlap with the layer computation.
+            compute_release_event = torch.npu.Event()
+            compute_release_event.record()
+            fence.set_compute_release_event(compute_release_event, key)
             for connector in self._connectors:
                 result = connector.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
                 # Register each child result before invoking the next child.
@@ -156,7 +167,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         first_error: BaseException | None = None
         if fence is not None:
             try:
-                fence.wait_source_safe()
+                fence.wait_workspace_reusable()
             except BaseException as error:
                 first_error = error
             self._active_workspace_fence = None
