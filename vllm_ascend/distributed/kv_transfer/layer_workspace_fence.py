@@ -48,13 +48,14 @@ class WorkspaceTransferError(RuntimeError):
 
 
 class LayerWorkspaceFence:
-    """Aggregates every asynchronous source reader of one workspace use."""
+    """Protect one workspace use from transfer readers and device compute."""
 
     def __init__(self, key: WorkspaceKey):
         self.key = key
         self._pending = 0
         self._closed = False
         self._failure: BaseException | None = None
+        self._compute_release_event: Any | None = None
         self._condition = threading.Condition()
 
     @property
@@ -81,6 +82,28 @@ class LayerWorkspaceFence:
                 raise RuntimeError("Cannot add a source future after registration closes")
             self._pending += 1
         future.add_done_callback(self._complete)
+
+    def set_compute_release_event(
+        self,
+        event: Any,
+        identity: WorkspaceKey,
+    ) -> None:
+        if identity != self.key:
+            raise WorkspaceIdentityError(
+                f"Compute release identity {identity!r} does not match "
+                f"fence {self.key!r}"
+            )
+        synchronize = getattr(event, "synchronize", None)
+        if synchronize is None or not callable(synchronize):
+            raise TypeError("Compute release event must support synchronize()")
+        with self._condition:
+            if self._closed:
+                raise RuntimeError(
+                    "Cannot set a compute release event after registration closes"
+                )
+            if self._compute_release_event is not None:
+                raise RuntimeError("Compute release event is already set")
+            self._compute_release_event = event
 
     def close_registration(self) -> None:
         with self._condition:
@@ -116,3 +139,30 @@ class LayerWorkspaceFence:
                 raise WorkspaceTransferError(
                     f"Workspace source transfer failed for {self.key!r}"
                 ) from self._failure
+
+    def wait_workspace_reusable(self, timeout: float | None = None) -> None:
+        """Wait until neither transfer nor compute can access the workspace."""
+        source_error: BaseException | None = None
+        try:
+            self.wait_source_safe(timeout=timeout)
+        except BaseException as error:
+            source_error = error
+
+        with self._condition:
+            compute_release_event = self._compute_release_event
+
+        compute_error: BaseException | None = None
+        if compute_release_event is None:
+            compute_error = RuntimeError(
+                f"Compute release event is missing for workspace fence {self.key!r}"
+            )
+        else:
+            try:
+                compute_release_event.synchronize()
+            except BaseException as error:
+                compute_error = error
+
+        if source_error is not None:
+            raise source_error
+        if compute_error is not None:
+            raise compute_error
