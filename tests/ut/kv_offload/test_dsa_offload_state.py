@@ -6,7 +6,6 @@ import torch
 from vllm_ascend.attention.dsa_offload_state import (
     DsaLayerWorkspace,
     DsaResidentState,
-    ResidentOwner,
 )
 
 
@@ -19,20 +18,6 @@ def _workspace(layer_id=0):
         selection_k_rope=torch.empty((2, 2048, 1, 2)),
         selection_block_table=torch.full((2, 16), -1, dtype=torch.int32),
     )
-
-
-def test_resident_rows_are_invalid_until_bound_and_begin_step_applies_pending():
-    state = DsaResidentState([_workspace()])
-    owner = ResidentOwner("req-a", 0)
-    assert not state.row_state(0, 1).valid
-    state.bind_row(0, 1, owner)
-    assert state.row_state(0, 1).owner == owner
-    state.invalidate_rows({0: [1]})
-    # Invalidation is deferred until the next step starts.
-    assert state.row_state(0, 1).valid
-    state.begin_step()
-    assert not state.row_state(0, 1).valid
-    assert state.rows_for_owner(owner, 0) == ()
 
 
 def test_resident_state_waits_for_previous_step_event_once():

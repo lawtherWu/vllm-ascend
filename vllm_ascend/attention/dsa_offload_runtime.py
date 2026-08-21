@@ -5,15 +5,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Mapping, Sequence
 
 import torch
 
 from vllm_ascend.attention.dsa_offload_state import (
     DsaLayerWorkspace,
     DsaResidentState,
-    ResidentOwner,
 )
 from vllm_ascend.ops.dsa_offload import (
     DsaOffloadConfig,
@@ -86,7 +85,11 @@ def build_dsa_group_specs(
     indexer_types: Sequence[str] | None,
     num_hidden_layers: int,
 ) -> tuple[DsaGroupSpec, ...]:
-    """Build the same owner/shared groups used by the recipes GLM path."""
+    """Build owner/shared groups from normalized backend layer metadata.
+
+    ``full``/``shared`` remains accepted for compatibility with existing
+    model configs and is normalized by the attention backend.
+    """
 
     if num_hidden_layers <= 0:
         raise ValueError("num_hidden_layers must be positive")
@@ -95,6 +98,10 @@ def build_dsa_group_specs(
             DsaGroupSpec(layer, layer, (layer,))
             for layer in range(num_hidden_layers)
         )
+    if isinstance(indexer_types, (str, bytes)) or not isinstance(
+        indexer_types, Sequence
+    ):
+        raise TypeError("indexer_types must be a sequence of 'full'/'shared' values")
     if len(indexer_types) < num_hidden_layers:
         raise ValueError("indexer_types is shorter than num_hidden_layers")
 
@@ -115,7 +122,7 @@ def build_dsa_group_specs(
         )
 
     for layer_id, indexer_type in enumerate(indexer_types[:num_hidden_layers]):
-        normalized = indexer_type.lower()
+        normalized = str(indexer_type).lower()
         if normalized == "full":
             close_group()
             owner = layer_id
@@ -186,7 +193,6 @@ class DsaOffloadRuntime:
         self._completed_groups: set[int] = set()
         self._pending_row_moves: list[tuple[int, int]] = []
         self._pending_invalidated_rows: set[int] = set()
-        self._pending_row_owners: dict[int, ResidentOwner] = {}
         seen_storages: set[int] = set()
         self.workspace_bytes = 0
         for workspace in resident_state.workspaces.values():
@@ -209,64 +215,33 @@ class DsaOffloadRuntime:
         self,
         moves: Sequence[tuple[int, int]],
         invalidated: Sequence[int],
-        owners: Sequence[tuple[int, str, int]],
     ) -> None:
         """Queue InputBatch row changes until the next DSA Plan boundary."""
         self._pending_row_moves.extend(moves)
         self._pending_invalidated_rows.update(invalidated)
-        for row, request_id, generation in owners:
-            self._pending_row_owners[row] = ResidentOwner(request_id, generation)
 
     def _apply_pending_row_changes(self) -> None:
-        if not (
-            self._pending_row_moves
-            or self._pending_invalidated_rows
-            or self._pending_row_owners
-        ):
+        if not (self._pending_row_moves or self._pending_invalidated_rows):
             return
-        moves = list(self._pending_row_moves)
         invalidated = set(self._pending_invalidated_rows)
-        owners = dict(self._pending_row_owners)
-        # A removed row can also be a destination of a later condense move.  A
-        # destination must retain the copied source metadata; a replacement
-        # request without a move must still clear the old metadata before bind.
-        moved_destinations = {destination for _, destination in moves}
-        swap_pairs = {(source, destination) for source, destination in moves}
-        for source, destination in moves:
-            if (destination, source) not in swap_pairs:
-                invalidated.add(source)
-        invalidated.difference_update(moved_destinations)
+        # Resident payload is physically indexed by the InputBatch row in every
+        # layer workspace. Moving only the shared metadata would make the new
+        # row describe stale payload from its previous occupant. Moving all
+        # per-layer resident tensors is both expensive and unnecessary: cold
+        # invalidate every row touched by a condense/reorder and let DsaInstall
+        # repopulate it from Host Main KV in the next step. This also avoids
+        # ambiguous snapshot semantics when several row moves are queued before
+        # one Plan boundary.
+        for source, destination in self._pending_row_moves:
+            invalidated.add(source)
+            invalidated.add(destination)
         for metadata in self.group_metadata.values():
-            # Snapshot sources so SWAP and overlapping UNIDIRECTIONAL moves do
-            # not overwrite a source row before it is copied.
-            source_rows = {source for source, _ in moves}
-            snapshots = {
-                source: (
-                    metadata.pool_ids[source].clone(),
-                    metadata.id_to_slot[source].clone(),
-                    metadata.lru_counter[source].clone(),
-                )
-                for source in source_rows
-            }
-            for source, destination in moves:
-                pool_ids, id_to_slot, lru_counter = snapshots[source]
-                metadata.pool_ids[destination].copy_(pool_ids)
-                metadata.id_to_slot[destination].copy_(id_to_slot)
-                metadata.lru_counter[destination].copy_(lru_counter)
             for row in invalidated:
                 metadata.pool_ids[row].fill_(-1)
                 metadata.id_to_slot[row].fill_(-1)
                 metadata.lru_counter[row].zero_()
-        if invalidated:
-            self.resident_state.invalidate_rows(
-                {layer_id: tuple(invalidated) for layer_id in self.resident_state.workspaces}
-            )
-        for row, owner in owners.items():
-            for layer_id in self.resident_state.workspaces:
-                self.resident_state.bind_row(layer_id, row, owner)
         self._pending_row_moves.clear()
         self._pending_invalidated_rows.clear()
-        self._pending_row_owners.clear()
 
     def group_for_layer(self, layer_id: int) -> DsaGroupSpec:
         try:
@@ -283,16 +258,11 @@ class DsaOffloadRuntime:
 
         self.resident_state.wait_previous_install()
         self._apply_pending_row_changes()
-        self.resident_state.begin_step()
 
     def finish_step(self) -> None:
         """Record completion outside the eager/ACL Graph model wrapper."""
 
-        npu = getattr(torch, "npu", None)
-        event_cls = getattr(npu, "Event", None) if npu is not None else None
-        if event_cls is None:
-            return
-        event = event_cls()
+        event = torch.npu.Event()
         event.record()
         self.resident_state.record_final_install_event(event)
 
@@ -366,10 +336,8 @@ class DsaOffloadRuntime:
             raise RuntimeError("DSA Serve config differs from the active group plan")
         workspace = self.resident_state.workspace(layer_id)
         batch_size = active.state.batch_size
-        selection_rows = batch_size * config.raw_seq
-        selection_blocks = (
-            selection_rows * config.topk // config.selection_block_size
-        )
+        selection_rows = config.selection_rows(batch_size)
+        selection_blocks = config.selection_block_count(batch_size)
         dsa_serve(
             active.state.plan,
             full_kv_cache,
@@ -438,10 +406,8 @@ class DsaOffloadRuntime:
     ) -> None:
         workspace = self.resident_state.workspace(layer_id)
         batch_size = plan_state.batch_size
-        selection_rows = batch_size * config.raw_seq
-        selection_blocks = (
-            selection_rows * config.topk // config.selection_block_size
-        )
+        selection_rows = config.selection_rows(batch_size)
+        selection_blocks = config.selection_block_count(batch_size)
         dsa_install(
             plan_state.install_records,
             workspace.selection_kv_cache[:selection_blocks],

@@ -21,6 +21,8 @@ class FakeBackend:
     def __init__(self):
         self.calls = Counter()
         self.get_start_keys = []
+        self.get_end_keys = []
+        self.get_start_result = None
         self.put_start_result = None
         self.put_end_result = None
         self.put_range_result = None
@@ -46,6 +48,8 @@ class FakeBackend:
     def batch_get_session_start(self, keys):
         self.calls["get_start"] += 1
         self.get_start_keys.append(list(keys))
+        if self.get_start_result is not None:
+            return list(self.get_start_result)
         return [0] * len(keys)
 
     def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
@@ -54,8 +58,8 @@ class FakeBackend:
         return [sum(row) for row in sizes]
 
     def batch_get_session_end(self, keys):
-        del keys
         self.calls["get_end"] += 1
+        self.get_end_keys.append(list(keys))
         return 0
 
 
@@ -172,6 +176,57 @@ def test_request_lease_rejects_refresh_with_inflight_range():
         lease.refresh_history(["history"])
 
     registry.end_range(["history"])
+
+
+def test_get_start_partial_success_rolls_back_only_started_keys():
+    backend = FakeBackend()
+    backend.get_start_result = [0, -1]
+    registry = StoreReadLeaseRegistry(backend)
+
+    with pytest.raises(StoreCommitError, match="batch_get_session_start failed"):
+        registry.acquire(("request", 0), ["started", "failed"])
+
+    assert backend.get_end_keys == [["started"]]
+    assert registry._entries == {}
+
+    # A later retry must not inherit either half of the failed native batch.
+    backend.get_start_result = None
+    registry.acquire(("request", 0), ["started", "failed"])
+    assert set(registry._entries) == {"started", "failed"}
+
+
+def test_refresh_partial_success_preserves_existing_lease_and_rolls_back_new_key():
+    backend = FakeBackend()
+    registry = StoreReadLeaseRegistry(backend)
+    owner = ("request", 0)
+    registry.acquire(owner, ["existing"])
+    backend.get_start_result = [0, 0, -1]
+
+    with pytest.raises(StoreCommitError, match="batch_get_session_start failed"):
+        registry.refresh(owner, ["existing", "new-started", "new-failed"])
+
+    # Ending the refreshed existing key would invalidate its original owner.
+    # Roll back only newly opened, previously unreferenced keys.
+    assert backend.get_end_keys == [["new-started"]]
+    assert set(registry._entries) == {"existing"}
+    assert registry._entries["existing"].references == {owner}
+
+
+def test_chunk_start_can_revoke_put_when_history_initialization_fails():
+    backend = FakeBackend()
+    registry = StorePutRegistry(backend)
+    lease = RequestStoreLease(("request", 0), StoreReadLeaseRegistry(backend))
+    claim = registry.claim_execution(1, [PutBinding("new", 128)])
+    backend.get_start_result = [-1]
+    session = ChunkStoreSession(
+        RequestChunkKey("request", 0, 0), backend, lease, registry
+    )
+
+    with pytest.raises(StoreCommitError, match="batch_get_session_start failed"):
+        session.start(["history"], claim)
+    session.revoke_uncommitted()
+
+    assert backend.calls["put_revoke"] == 1
 
 
 def test_range_put_synchronizes_ready_event_before_reading_source():

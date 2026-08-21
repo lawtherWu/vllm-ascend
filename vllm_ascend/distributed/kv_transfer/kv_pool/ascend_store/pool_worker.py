@@ -291,8 +291,6 @@ class KVPoolWorker:
         )
         self._range_execution_id = -1
         self._range_save_started = False
-        self._range_sessions: dict[str, _LayerwiseRangeSessionState] = {}
-        self._range_leases: dict[tuple[str, int], RequestStoreLease] = {}
         self._range_read_plans: dict[
             str, tuple[ReqMeta, RequestStoreLease, list[_LayerwiseRangeBlock]]
         ] = {}
@@ -303,7 +301,6 @@ class KVPoolWorker:
         self._range_read_registry: StoreReadLeaseRegistry | None = None
         self._range_components: dict[tuple[int, str], list[_LayerwiseRangeComponent]] = {}
         self._range_object_sizes: dict[int, int] = {}
-        self._range_layer_ids: dict[tuple[int, str], int] = {}
         self._range_layout_fingerprint: str | None = None
         self._range_layout_version = 1
         self._range_request_leases: dict[tuple[str, int], RequestStoreLease] = {}
@@ -311,7 +308,7 @@ class KVPoolWorker:
         # Keep the generation at the worker boundary so a recycled request id
         # cannot reuse an old Store lease or an old in-flight object.
         self._range_request_generations: dict[str, int] = {}
-        self._range_generation_counters: dict[str, int] = {}
+        self._next_range_request_generation = 0
         self._range_sessions_by_request: dict[str, _LayerwiseRangeSessionState] = {}
         self._range_load_layers_seen: set[str] = set()
         if self.use_layerwise_range:
@@ -488,7 +485,6 @@ class KVPoolWorker:
                     payload.append({"group": group_id, "layer": layer_name, "layer_id": layer_id, "component": component_id, "block_len": block_len, "block_stride": block_stride, "offset": offset})
                     offset += block_len
                 self._range_components[(group_id, layer_name)] = components
-                self._range_layer_ids[(group_id, layer_name)] = layer_id
                 layer_id += 1
             if names:
                 self._range_object_sizes[group_id] = self._align_up(offset, 64)
@@ -569,12 +565,12 @@ class KVPoolWorker:
         if current is None:
             if supplied > 0:
                 generation = supplied
-                self._range_generation_counters[request_id] = max(
-                    generation, self._range_generation_counters.get(request_id, 0)
+                self._next_range_request_generation = max(
+                    generation, self._next_range_request_generation
                 )
             else:
-                generation = self._range_generation_counters.get(request_id, 0) + 1
-                self._range_generation_counters[request_id] = generation
+                self._next_range_request_generation += 1
+                generation = self._next_range_request_generation
             self._range_request_generations[request_id] = generation
         else:
             if supplied > 0 and supplied != current:
@@ -1302,58 +1298,125 @@ class KVPoolWorker:
     def _start_range_save(self, connector_metadata: AscendConnectorMetadata) -> None:
         if self._range_save_started:
             return
-        self._range_save_started = True
-        self._range_execution_id += 1
-        self._range_sessions_by_request.clear()
-        self._range_layer_futures.clear()
+
         assert self._range_put_registry is not None
-        for request in connector_metadata.requests:
-            self._normalize_range_request_identity(request)
-            request.skip_null_blocks_by_group = self.group_uses_align_state
-            records: list[_LayerwiseRangeBlock] = []
-            for group_id in request.kv_cache_group_ids or [0]:
-                group_records = self._range_records(
-                    request, request.token_len_chunk, group_id
-                )
-                records.extend(
-                    self._shard_range_save_records(
-                        request,
-                        group_id,
-                        group_records,
+        execution_id = self._range_execution_id + 1
+        sessions: dict[str, _LayerwiseRangeSessionState] = {}
+        execution_keys: set[str] = set()
+        try:
+            for request in connector_metadata.requests:
+                self._normalize_range_request_identity(request)
+                request.skip_null_blocks_by_group = self.group_uses_align_state
+                records: list[_LayerwiseRangeBlock] = []
+                for group_id in request.kv_cache_group_ids or [0]:
+                    group_records = self._range_records(
+                        request, request.token_len_chunk, group_id
                     )
-                )
-            lease = self._get_range_lease(request)
-            missing: list[_LayerwiseRangeBlock] = []
-            if records:
-                unique = list({record.key: record for record in records}.values())
-                known = set(lease.history_keys)
-                candidates = [record for record in unique if record.key not in known]
-                if candidates:
-                    exists = self.m_store.exists([record.key for record in candidates])
-                    if exists is None or len(exists) != len(candidates):
-                        raise RuntimeError(f"Layerwise range exists returned invalid result for {request.req_id}")
-                    complete_keys: list[str] = []
-                    for record, code in zip(candidates, exists, strict=True):
-                        if int(code) == 1:
-                            complete_keys.append(record.key)
-                        else:
-                            missing.append(record)
-                    if complete_keys:
-                        lease.refresh_history(
-                            list(lease.history_keys) + complete_keys
+                    records.extend(
+                        self._shard_range_save_records(
+                            request,
+                            group_id,
+                            group_records,
                         )
-            # A final partial chunk may have no new full blocks. It still
-            # needs a session so its existing read lease can be released and
-            # get_finished() can observe completion.
-            bindings = (
-                [PutBinding(record.key, self._range_object_sizes[record.group_id]) for record in missing]
-                if request.can_save
-                else []
-            )
-            claim = self._range_put_registry.claim_execution(self._range_execution_id, bindings)
-            session = ChunkStoreSession(RequestChunkKey(request.req_id, request.request_generation, request.chunk_id), self.m_store, lease, self._range_put_registry)
-            session.start(sorted(lease.history_keys), claim)
-            self._range_sessions_by_request[request.req_id] = _LayerwiseRangeSessionState(request, session, missing)
+                    )
+                lease = self._get_range_lease(request)
+                missing: list[_LayerwiseRangeBlock] = []
+                if records:
+                    unique = list(
+                        {record.key: record for record in records}.values()
+                    )
+                    known = set(lease.history_keys)
+                    candidates = [
+                        record for record in unique if record.key not in known
+                    ]
+                    if candidates:
+                        exists = self.m_store.exists(
+                            [record.key for record in candidates]
+                        )
+                        if exists is None or len(exists) != len(candidates):
+                            raise RuntimeError(
+                                "Layerwise range exists returned invalid result "
+                                f"for {request.req_id}"
+                            )
+                        complete_keys: list[str] = []
+                        for record, code in zip(
+                            candidates, exists, strict=True
+                        ):
+                            if int(code) == 1:
+                                complete_keys.append(record.key)
+                            else:
+                                missing.append(record)
+                        if complete_keys:
+                            lease.refresh_history(
+                                list(lease.history_keys) + complete_keys
+                            )
+                # A final partial chunk may have no new full blocks. It still
+                # needs a session so its existing read lease can be released and
+                # get_finished() can observe completion.
+                bindings = (
+                    [
+                        PutBinding(
+                            record.key,
+                            self._range_object_sizes[record.group_id],
+                        )
+                        for record in missing
+                    ]
+                    if request.can_save
+                    else []
+                )
+                claim = self._range_put_registry.claim_execution(
+                    execution_id, bindings
+                )
+                execution_keys.update(claim.commit_futures)
+                session = ChunkStoreSession(
+                    RequestChunkKey(
+                        request.req_id,
+                        request.request_generation,
+                        request.chunk_id,
+                    ),
+                    self.m_store,
+                    lease,
+                    self._range_put_registry,
+                )
+                try:
+                    session.start(sorted(lease.history_keys), claim)
+                except BaseException:
+                    try:
+                        session.revoke_uncommitted()
+                    except BaseException:
+                        logger.exception(
+                            "Failed to revoke partially initialized Store "
+                            "session %s",
+                            request.req_id,
+                        )
+                    raise
+                sessions[request.req_id] = _LayerwiseRangeSessionState(
+                    request, session, missing
+                )
+        except BaseException:
+            for state in sessions.values():
+                try:
+                    state.session.revoke_uncommitted()
+                except BaseException:
+                    logger.exception(
+                        "Failed to revoke Store session during initialization "
+                        "rollback: %s",
+                        state.request.req_id,
+                    )
+            # A synchronous save-initialization failure aborts the whole model
+            # execution. Drop every read plan and request lease as one unit so a
+            # retry cannot retain a plan that points at a closed lease.
+            self._abort_range_read_plans()
+            self._range_put_registry.forget(sorted(execution_keys))
+            self._range_sessions_by_request.clear()
+            self._range_layer_futures.clear()
+            self._range_save_started = False
+            raise
+
+        self._range_execution_id = execution_id
+        self._range_sessions_by_request = sessions
+        self._range_layer_futures.clear()
+        self._range_save_started = True
 
     def _save_range_layer(self, layer_name: str, connector_metadata: AscendConnectorMetadata, kv_ready_event=None) -> Future[None]:
         self._start_range_save(connector_metadata)
@@ -1432,8 +1495,9 @@ class KVPoolWorker:
                     except BaseException as error:
                         errors.append(error)
 
-                # Commit every owner even when another owner failed, so all
-                # follower futures are resolved and no execution can deadlock.
+                # Stop committing new owners after a source-range failure. The
+                # cleanup below revokes every still-open owner and resolves its
+                # followers with the same execution failure.
                 for _, state in states:
                     if errors:
                         break

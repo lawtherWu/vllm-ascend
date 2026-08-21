@@ -173,7 +173,7 @@ def test_group_plan_serve_install_order_and_active_batch_slicing(monkeypatch):
     assert [call[1] for call in calls if call[0] == "install"] == [0, 1, 1]
 
 
-def test_row_condense_copies_before_clearing_removed_destination():
+def test_row_condense_cold_invalidates_source_and_destination():
     metadata = _metadata(batch_capacity=2)
     metadata.pool_ids[1].fill_(7)
     metadata.id_to_slot[1].fill_(8)
@@ -189,19 +189,37 @@ def test_row_condense_copies_before_clearing_removed_destination():
     runtime.queue_row_changes(
         moves=[(1, 0)],
         invalidated=[0],
-        owners=[(0, "req-b", 1)],
     )
     runtime.begin_step()
 
-    assert torch.all(metadata.pool_ids[0] == 7)
-    assert torch.all(metadata.id_to_slot[0] == 8)
-    assert torch.all(metadata.lru_counter[0] == 9)
+    assert torch.all(metadata.pool_ids[0] == -1)
+    assert torch.all(metadata.id_to_slot[0] == -1)
+    assert torch.all(metadata.lru_counter[0] == 0)
     assert torch.all(metadata.pool_ids[1] == -1)
     assert torch.all(metadata.id_to_slot[1] == -1)
     assert torch.all(metadata.lru_counter[1] == 0)
-    assert state.row_state(0, 0).owner is not None
-    assert state.row_state(0, 0).owner.request_id == "req-b"
-    assert not state.row_state(0, 1).valid
+
+
+def test_chained_row_moves_cold_invalidate_every_touched_row():
+    metadata = _metadata(batch_capacity=3)
+    metadata.pool_ids.fill_(7)
+    metadata.id_to_slot.fill_(8)
+    metadata.lru_counter.fill_(9)
+    runtime = DsaOffloadRuntime(
+        (DsaGroupSpec(group_id=0, owner_layer=0, layers=(0,)),),
+        {0: metadata},
+        DsaResidentState([_workspace(0, batch_capacity=3)]),
+    )
+
+    runtime.queue_row_changes(
+        moves=[(2, 0), (0, 1)],
+        invalidated=[],
+    )
+    runtime.prepare_step()
+
+    assert torch.all(metadata.pool_ids == -1)
+    assert torch.all(metadata.id_to_slot == -1)
+    assert torch.all(metadata.lru_counter == 0)
 
 
 def test_row_replacement_without_move_clears_metadata():
@@ -216,7 +234,6 @@ def test_row_replacement_without_move_clears_metadata():
     runtime.queue_row_changes(
         moves=[],
         invalidated=[0],
-        owners=[(0, "req-new", 1)],
     )
     # This is also the full-graph replay path: row updates are submitted
     # outside the model graph without opening the Python Plan state machine.
@@ -224,8 +241,23 @@ def test_row_replacement_without_move_clears_metadata():
     runtime.prepare_step()
 
     assert torch.all(metadata.pool_ids[0] == -1)
-    assert state.row_state(0, 0).owner is not None
-    assert state.row_state(0, 0).owner.request_id == "req-new"
+
+
+def test_new_request_invalidates_empty_row_after_graph_warmup(monkeypatch):
+    notifications = []
+
+    def record_changes(moves, invalidated):
+        notifications.append((moves, invalidated))
+
+    batch = object.__new__(NPUInputBatch)
+    batch._req_ids = [None]
+    batch._dsa_row_change_callback = record_changes
+    monkeypatch.setattr(InputBatch, "add_request", lambda self, request: 0)
+
+    request = SimpleNamespace(req_id="req-a")
+    assert batch.add_request(request) == 0
+
+    assert notifications == [([], [0])]
 
 
 def test_new_request_invalidates_empty_row_after_graph_warmup(monkeypatch):
