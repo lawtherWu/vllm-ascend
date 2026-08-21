@@ -44,6 +44,40 @@ class TestNPUPlatform(TestBase):
         return mock_vllm_config
 
     @staticmethod
+    def mock_layerwise_host_offload_config(
+        *,
+        role="kv_consumer",
+        block_size=128,
+        num_speculative_tokens=3,
+        topk=2048,
+    ):
+        config = TestNPUPlatform.mock_vllm_config()
+        config.kv_transfer_config = MagicMock()
+        config.kv_transfer_config.kv_connector = "MultiConnector"
+        config.kv_transfer_config.kv_connector_extra_config = {
+            "layerwise_host_kv_offload": True,
+            "connectors": [
+                {
+                    "kv_connector": "AscendStoreConnector",
+                    "kv_connector_extra_config": {
+                        "use_layerwise": True,
+                        "use_layerwise_range": True,
+                    },
+                },
+                {"kv_connector": "MooncakeLayerwiseConnector"},
+            ],
+        }
+        config.kv_transfer_config.kv_role = role
+        config.cache_config.block_size = block_size
+        if num_speculative_tokens is None:
+            config.speculative_config = None
+        else:
+            config.speculative_config = MagicMock(num_speculative_tokens=num_speculative_tokens)
+        config.model_config.hf_text_config = MagicMock(index_topk=topk)
+        config.model_config.hf_text_config.index_topk = topk
+        return config
+
+    @staticmethod
     def mock_vllm_ascend_config():
         mock_ascend_config = MagicMock()
         mock_ascend_config.xlite_graph_config.enabled = False
@@ -100,6 +134,63 @@ class TestNPUPlatform(TestBase):
                 config = self.mock_layerwise_host_offload_config(**overrides)
                 with self.assertRaisesRegex(ValueError, match):
                     NPUPlatform._validate_layerwise_host_offload_config(config)
+
+    def test_validate_layerwise_host_offload_config_rejects_invalid_prefill_topology(self):
+        cases = [
+            ("MooncakeLayerwiseConnector", None, "MultiConnector"),
+            (
+                "MultiConnector",
+                [{"kv_connector": "MooncakeLayerwiseConnector"}],
+                "AscendStoreConnector",
+            ),
+            (
+                "MultiConnector",
+                [
+                    {
+                        "kv_connector": "AscendStoreConnector",
+                        "kv_connector_extra_config": {
+                            "use_layerwise": True,
+                            "use_layerwise_range": False,
+                        },
+                    },
+                    {"kv_connector": "MooncakeLayerwiseConnector"},
+                ],
+                "use_layerwise_range=true",
+            ),
+            (
+                "MultiConnector",
+                [
+                    {
+                        "kv_connector": "AscendStoreConnector",
+                        "kv_connector_extra_config": {
+                            "use_layerwise": True,
+                            "use_layerwise_range": True,
+                        },
+                    }
+                ],
+                "MooncakeLayerwiseConnector",
+            ),
+        ]
+        for connector_name, children, match in cases:
+            with self.subTest(connector_name=connector_name, children=children):
+                config = self.mock_layerwise_host_offload_config(
+                    role="kv_producer"
+                )
+                config.kv_transfer_config.kv_connector = connector_name
+                if children is not None:
+                    config.kv_transfer_config.kv_connector_extra_config[
+                        "connectors"
+                    ] = children
+                with self.assertRaisesRegex(ValueError, match):
+                    NPUPlatform._validate_layerwise_host_offload_config(config)
+
+    def test_validate_layerwise_host_offload_config_does_not_require_decode_store(self):
+        config = self.mock_layerwise_host_offload_config(role="kv_consumer")
+        config.kv_transfer_config.kv_connector_extra_config["connectors"] = [
+            {"kv_connector": "MooncakeLayerwiseConnector"}
+        ]
+
+        NPUPlatform._validate_layerwise_host_offload_config(config)
 
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
