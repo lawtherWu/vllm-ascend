@@ -113,7 +113,40 @@ class TestAscendStoreConnector(unittest.TestCase):
             kv_cache_config=None,
         )
         mock_worker_cls.assert_called_once()
-        mock_lookup_cls.assert_called_once()
+        mock_lookup_cls.assert_called_once_with(
+            mock_worker_cls.return_value,
+            config,
+            False,
+            False,
+        )
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.LookupKeyServer")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.KVPoolWorker")
+    def test_init_worker_passes_layerwise_range_to_lookup_server(
+        self,
+        mock_worker_cls,
+        mock_lookup_cls,
+    ):
+        config = self._make_vllm_config(
+            extra_config={
+                "use_layerwise": True,
+                "use_layerwise_range": True,
+            }
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        AscendStoreConnector(
+            vllm_config=config,
+            role=KVConnectorRole.WORKER,
+            kv_cache_config=None,
+        )
+
+        mock_lookup_cls.assert_called_once_with(
+            mock_worker_cls.return_value,
+            config,
+            True,
+            True,
+        )
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.KVPoolScheduler")
     def test_scheduler_methods_delegate(self, mock_scheduler_cls):
