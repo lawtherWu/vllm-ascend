@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -7,10 +8,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
+from vllm_ascend.distributed.kv_transfer.layer_workspace_fence import (
+    LayerWorkspaceFence,
+    WorkspaceKey,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import MooncakeLayerwiseConnector
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -29,16 +35,137 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             "HMA should not be enabled unless all sub-connectors support it"
         )
 
+        kv_transfer_config = vllm_config.kv_transfer_config
+        extra_config = {} if kv_transfer_config is None else (
+            kv_transfer_config.kv_connector_extra_config or {}
+        )
+        self._layerwise_workspace_fences_enabled = bool(
+            extra_config.get("layerwise_host_kv_offload", False)
+        ) and bool(kv_transfer_config and kv_transfer_config.is_kv_producer)
+        self._execution_id = -1
+        self._layer_id = 0
+        self._workspace_generation = 0
+        self._active_workspace_fence: LayerWorkspaceFence | None = None
+        self._workspace_arena_id = 0
+        if self._layerwise_workspace_fences_enabled:
+            store_children = [c for c in self._connectors if hasattr(c, "use_layerwise")]
+            if any(
+                getattr(c, "use_layerwise", False)
+                and not getattr(c, "use_layerwise_range", False)
+                for c in store_children
+            ):
+                raise ValueError(
+                    "Prefill layerwise host offload requires the Store child "
+                    "configuration use_layerwise_range=true"
+                )
+
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         chosen_connector = self._requests_to_connector.get(request.request_id, -1)
         empty_blocks = blocks.new_empty()
-        for i, c in enumerate(self._connectors):
-            if i == chosen_connector or isinstance(c, MooncakeLayerwiseConnector):
-                # Forward call to the chosen connector (if any).
-                c.update_state_after_alloc(request, blocks, num_external_tokens)
+        for i, connector in enumerate(self._connectors):
+            if i == chosen_connector or isinstance(connector, MooncakeLayerwiseConnector):
+                connector.update_state_after_alloc(request, blocks, num_external_tokens)
             else:
-                # Call with empty blocks for other connectors.
-                c.update_state_after_alloc(request, empty_blocks, 0)
+                connector.update_state_after_alloc(request, empty_blocks, 0)
+
+    def _wait_for_active_workspace(self) -> None:
+        fence = self._active_workspace_fence
+        if fence is None:
+            return
+        self._active_workspace_fence = None
+        fence.wait_source_safe()
+
+    @staticmethod
+    def _source_futures(result: Any) -> list[Future[Any]]:
+        if result is None:
+            return []
+        if isinstance(result, Future):
+            return [result]
+        if isinstance(result, (list, tuple)):
+            futures = list(result)
+            if not all(isinstance(future, Future) for future in futures):
+                raise TypeError("Connector save hook returned a non-Future source handle")
+            return futures
+        raise TypeError(
+            "Connector save hook must return None, Future, or a sequence of Futures"
+        )
+
+    def _abort_fence(self, fence: LayerWorkspaceFence) -> None:
+        # Registration must be closed before waiting.  Waiting here prevents a
+        # failed child connector from leaving an earlier child reading the
+        # shared workspace after the model has already unwound the forward.
+        fence.close_registration()
+        try:
+            fence.wait_source_safe()
+        except BaseException:
+            pass
+
+    # ==============================
+    # Layerwise workspace ordering
+    # ==============================
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        if self._layerwise_workspace_fences_enabled:
+            self._wait_for_active_workspace()
+            self._execution_id += 1
+            self._layer_id = 0
+            self._workspace_generation += 1
+        super().start_load_kv(forward_context, **kwargs)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if self._layerwise_workspace_fences_enabled:
+            self._wait_for_active_workspace()
+        super().wait_for_layer_load(layer_name)
+
+    def save_kv_layer(
+        self, layer_name: str, kv_layer: Any, attn_metadata: Any, **kwargs
+    ) -> Any:
+        if not self._layerwise_workspace_fences_enabled:
+            return super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+
+        key = WorkspaceKey(
+            execution_id=self._execution_id,
+            layer_id=self._layer_id,
+            arena_id=self._workspace_arena_id,
+            workspace_generation=self._workspace_generation,
+        )
+        fence = LayerWorkspaceFence(key)
+        self._active_workspace_fence = fence
+        source_futures: list[Future[Any]] = []
+        try:
+            for connector in self._connectors:
+                result = connector.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+                source_futures.extend(self._source_futures(result))
+            for future in source_futures:
+                fence.add_source_future(future, key)
+            fence.close_registration()
+        except BaseException:
+            self._abort_fence(fence)
+            self._active_workspace_fence = None
+            raise
+        self._layer_id += 1
+        return source_futures
+
+    def wait_for_save(self):
+        if not self._layerwise_workspace_fences_enabled:
+            return super().wait_for_save()
+        fence = self._active_workspace_fence
+        first_error: BaseException | None = None
+        if fence is not None:
+            try:
+                fence.wait_source_safe()
+            except BaseException as error:
+                first_error = error
+            self._active_workspace_fence = None
+        # Even when P2P source completion fails, drain Store child cleanup so
+        # a failed range session revokes open objects and releases leases.
+        for connector in self._connectors:
+            try:
+                connector.wait_for_save()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     def get_num_new_matched_tokens(
         self,
