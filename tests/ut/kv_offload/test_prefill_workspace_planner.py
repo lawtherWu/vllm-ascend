@@ -13,6 +13,9 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _ascend_get_kv_cache_config_from_groups,
+    _get_group_layer_kv_cache_specs,
+    _get_layerwise_decode_kv_cache_config,
+    _get_layerwise_prefill_max_memory_usage_bytes,
     _get_layerwise_prefill_kv_cache_config,
 )
 
@@ -81,6 +84,23 @@ def test_prefill_planner_shares_one_base_bundle_and_counts_mtp() -> None:
         "model.layers.2.self_attn.attn"
     ]
     assert sum(item.size for item in result.kv_cache_tensors) == available_memory
+
+
+def test_prefill_memory_check_counts_one_base_bundle_and_mtp() -> None:
+    config = _config()
+    config.model_config.max_model_len = 1024
+    config.parallel_config = SimpleNamespace(
+        decode_context_parallel_size=1,
+        prefill_context_parallel_size=1,
+    )
+    group = _group()
+    page_size = group.kv_cache_spec.kv_cache_specs[
+        "model.layers.0.self_attn.attn"
+    ].page_size_bytes
+
+    result = _get_layerwise_prefill_max_memory_usage_bytes(config, [group])
+
+    assert result == 8 * page_size * 2
 
 
 def test_prefill_planner_rejects_incompatible_workspace_layers() -> None:
