@@ -93,9 +93,6 @@ class LayerWorkspaceFence:
                 f"Compute release identity {identity!r} does not match "
                 f"fence {self.key!r}"
             )
-        synchronize = getattr(event, "synchronize", None)
-        if synchronize is None or not callable(synchronize):
-            raise TypeError("Compute release event must support synchronize()")
         with self._condition:
             if self._closed:
                 raise RuntimeError(

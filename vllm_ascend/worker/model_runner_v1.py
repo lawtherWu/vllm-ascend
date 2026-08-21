@@ -108,6 +108,10 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.attention.offload_capability import (
+    get_dsa_offload_backends,
+    is_dsa_offload_backend,
+)
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
 # yapf conflicts with isort for this block
@@ -119,6 +123,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.distributed.parallel_state import get_mlp_tp_group, get_otp_group
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -158,6 +163,7 @@ from vllm_ascend.utils import (
     is_hidden_state_cache_spec,
     kv_cache_spec_uses_sparse_c8,
     lmhead_tp_enable,
+    mlp_tp_enable,
     oproj_tp_enable,
     set_potential_max_tokens,
     set_weight_prefetch_method,
@@ -686,6 +692,30 @@ class NPUModelRunner(GPUModelRunner):
             return num_tokens, None, cudagraph_mode
 
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
+            # Fine-grained MLP TP collectives are formed across DP ranks.
+            # In graph mode, align the token bucket within each MLP TP group
+            # before the second cudagraph dispatch; otherwise ranks in one
+            # group can replay different buckets (for example 1 vs 2 tokens).
+            if self._use_aclgraph() and (mlp_tp_enable() or oproj_tp_enable()):
+                if mlp_tp_enable() and oproj_tp_enable():
+                    mlp_group = get_mlp_tp_group()
+                    oproj_group = get_otp_group()
+                    tp_group = (
+                        mlp_group.device_group
+                        if mlp_group.world_size >= oproj_group.world_size
+                        else oproj_group.device_group
+                    )
+                elif mlp_tp_enable():
+                    tp_group = get_mlp_tp_group().device_group
+                else:
+                    tp_group = get_otp_group().device_group
+                tp_tokens = torch.tensor([num_tokens], device="npu", dtype=torch.int32)
+                dist.all_reduce(tp_tokens, op=dist.ReduceOp.MAX, group=tp_group)
+                max_tp_tokens = int(tp_tokens.item())
+                num_tokens_after_padding = torch.tensor(
+                    [max_tp_tokens] * self.dp_size, device="cpu", dtype=torch.int32
+                )
+                return max_tp_tokens, num_tokens_after_padding, cudagraph_mode
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
@@ -3893,50 +3923,63 @@ class NPUModelRunner(GPUModelRunner):
         from vllm_ascend.attention.dsa_offload_runtime import (
             DsaGroupMetadata,
             DsaOffloadRuntime,
-            build_dsa_group_specs,
         )
         from vllm_ascend.attention.dsa_offload_state import (
             DsaLayerWorkspace,
             DsaResidentState,
         )
         from vllm_ascend.ops.dsa_offload import (
-            DSA_BLOCK_SIZE,
-            DSA_RAW_SEQ,
-            DSA_TOPK,
+            DsaOffloadConfig,
+            get_dsa_raw_seq,
         )
-
-        sfa_impls = {}
+        attention_impls = {}
+        backend_layer_names = []
         for layer_name, layer in self.compilation_config.static_forward_context.items():
             impl = getattr(layer, "impl", None)
-            if impl is None or not hasattr(impl, "indexer_select_post_process"):
+            if not self.attn_backend.is_dsa_offload_attention_impl(impl):
                 continue
-            layer_id = self._extract_model_layer_index(layer_name)
-            if layer_id is not None:
-                sfa_impls[layer_id] = impl
+            layer_id = self.attn_backend.get_dsa_offload_layer_id(layer_name)
+            if layer_id is None:
+                continue
+            attention_impls[layer_id] = impl
+            backend_layer_names.append(layer_name)
 
-        hf_config = self.model_config.hf_text_config
-        num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
-        if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
-            raise RuntimeError("DSA Host offload requires num_hidden_layers")
-        sfa_impls = {
-            layer_id: impl
-            for layer_id, impl in sfa_impls.items()
-            if layer_id < num_hidden_layers
-        }
-        if set(sfa_impls) != set(range(num_hidden_layers)):
+        if not attention_impls:
+            raise RuntimeError("DSA Host offload found no attention backend layers")
+        resolved_backends = get_dsa_offload_backends(
+            self.vllm_config, tuple(backend_layer_names)
+        )
+        backend_types = set(resolved_backends.values())
+        if len(backend_types) != 1:
+            raise NotImplementedError(
+                "Layerwise DSA Host offload requires one attention backend; "
+                f"found {sorted(backend_types, key=str)!r}"
+            )
+        attention_backend = next(iter(backend_types))
+        if attention_backend is not self.attn_backend:
             raise RuntimeError(
-                "DSA Host offload requires one SFA implementation for each "
-                f"base layer; found {sorted(sfa_impls)}"
+                "Layerwise DSA Host offload backend differs between the model "
+                "runner and attention layers"
             )
 
-        groups = build_dsa_group_specs(
-            getattr(hf_config, "indexer_types", None), num_hidden_layers
-        )
+        num_hidden_layers = attention_backend.get_dsa_offload_layer_count()
+        attention_impls = {
+            layer_id: impl
+            for layer_id, impl in attention_impls.items()
+            if layer_id < num_hidden_layers
+        }
+        if set(attention_impls) != set(range(num_hidden_layers)):
+            raise RuntimeError(
+                "DSA Host offload requires one attention implementation for "
+                f"each base layer; found {sorted(attention_impls)}"
+            )
+
+        groups = attention_backend.get_dsa_offload_group_specs(num_hidden_layers)
         extra_config = (
             getattr(self.vllm_config.kv_transfer_config, "kv_connector_extra_config", None)
             or {}
         )
-        default_pool_size = 16384 if bool(getattr(hf_config, "enlarge_pool_size", False)) else 8192
+        default_pool_size = attention_backend.get_dsa_offload_default_pool_size()
         pool_size = int(extra_config.get("dsa_pool_size", default_pool_size))
         if pool_size <= 0 or pool_size > 16384 or pool_size % 16 != 0:
             raise ValueError("dsa_pool_size must be in (0, 16384] and divisible by 16")
@@ -3945,34 +3988,30 @@ class NPUModelRunner(GPUModelRunner):
             int(extra_config.get("dsa_id_range", 131072)),
         )
         batch_capacity = self.max_num_reqs
-        num_speculative_tokens = getattr(self.vllm_config.speculative_config, "num_speculative_tokens", None)
-        topk = getattr(hf_config, "index_topk", None)
-        block_size = int(self.cache_config.block_size)
-        max_raw_seq = (
-            num_speculative_tokens + 1
-            if isinstance(num_speculative_tokens, int)
-            else 1
-        )
-        if max_raw_seq not in DSA_RAW_SEQ:
+        topk = attention_backend.get_dsa_offload_topk()
+        if topk is None:
             raise RuntimeError(
-                "DSA Host offload supports disabled MTP or MTP3; "
-                f"got num_speculative_tokens={num_speculative_tokens}"
+                "DSA Host offload requires attention backend index_topk metadata"
             )
-        if topk != DSA_TOPK:
-            raise RuntimeError(f"DSA Host offload requires index_topk={DSA_TOPK}; got {topk}")
-        if block_size != DSA_BLOCK_SIZE:
-            raise RuntimeError(f"DSA Host offload requires block_size={DSA_BLOCK_SIZE}; got {block_size}")
-        selection_blocks = (topk + block_size - 1) // block_size
-        selection_rows = batch_capacity * max_raw_seq
+        block_size = int(self.cache_config.block_size)
+        max_raw_seq = get_dsa_raw_seq(self.vllm_config.speculative_config)
+        topk = int(topk)
+        # The currently installed recipes kernels require complete selection
+        # blocks. Validate at runtime initialization so an unsupported model
+        # configuration fails before serving the first request.
+        dsa_config = DsaOffloadConfig(
+            raw_seq=max_raw_seq,
+            topk=topk,
+            selection_block_size=block_size,
+        )
+        selection_blocks = dsa_config.selection_blocks_per_row
+        selection_rows = dsa_config.selection_rows(batch_capacity)
         workspaces = []
         for layer_id in range(num_hidden_layers):
-            impl = sfa_impls[layer_id]
-            kv_dim = int(getattr(impl, "kv_lora_rank", 0))
-            rope_dim = int(getattr(impl, "qk_rope_head_dim", 0))
-            if kv_dim <= 0 or rope_dim <= 0:
-                raise RuntimeError(
-                    f"Invalid DSA cache dimensions at layer {layer_id}: {kv_dim}, {rope_dim}"
-                )
+            impl = attention_impls[layer_id]
+            kv_dim, rope_dim = attention_backend.get_dsa_offload_cache_dimensions(
+                impl
+            )
             resident_kv = torch.empty(
                 (batch_capacity, pool_size, kv_dim), dtype=self.dtype, device=self.device
             )
@@ -4023,26 +4062,15 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             )
         runtime = DsaOffloadRuntime(groups, metadata, DsaResidentState(workspaces))
-        for layer_id, impl in sfa_impls.items():
-            impl.dsa_offload_runtime = runtime
-            impl.dsa_layer_id = layer_id
+        for layer_id, impl in attention_impls.items():
+            attention_backend.bind_dsa_offload_runtime(impl, runtime, layer_id)
         self.dsa_offload_runtime = runtime
-        if hasattr(self.input_batch, "set_dsa_row_change_callback"):
-            self.input_batch.set_dsa_row_change_callback(runtime.queue_row_changes)
+        self.input_batch.set_dsa_row_change_callback(runtime.queue_row_changes)
         logger.info(
             "Initialized DSA Host offload runtime: layers=%d groups=%d batch=%d pool=%d bytes=%d",
             num_hidden_layers, len(groups), batch_capacity, pool_size, runtime.workspace_bytes
         )
 
-
-    @staticmethod
-    def _extract_model_layer_index(layer_name: str) -> int | None:
-        try:
-            from vllm.model_executor.models.utils import extract_layer_index
-
-            return int(extract_layer_index(layer_name))
-        except (AssertionError, IndexError, ValueError, TypeError):
-            return None
 
     def _start_dump_data(self) -> None:
         if self.debugger is None or self._debugger_started:
@@ -4406,21 +4434,26 @@ class NPUModelRunner(GPUModelRunner):
     def _use_decode_host_kv_offload(self) -> bool:
         from vllm_ascend.patch.platform.patch_kv_cache_utils import is_layerwise_host_offload_decode
 
-        return self.use_sparse and is_layerwise_host_offload_decode(self.vllm_config)
-
-    @staticmethod
-    def _is_mtp_cache_layer_name(layer_name: str, num_hidden_layers: int | None) -> bool:
-        lowered = layer_name.lower()
-        if "mtp" in lowered or "draft" in lowered:
-            return True
-        if num_hidden_layers is None:
+        if not is_layerwise_host_offload_decode(self.vllm_config):
             return False
-        try:
-            from vllm.v1.worker.utils import extract_layer_index
+        if not is_dsa_offload_backend(self.attn_backend):
+            raise NotImplementedError(
+                "Layerwise DSA Host offload requires the selected attention "
+                "backend to support_dsa_offload"
+            )
+        return True
 
-            return extract_layer_index(layer_name) >= num_hidden_layers
-        except (AssertionError, IndexError, ValueError):
-            return False
+    def _is_dsa_offload_speculative_layer(self, layer_name: str, kv_cache_spec) -> bool:
+        """Ask the selected attention backend for the cache-layer role."""
+
+        for attn_group in self._kv_cache_spec_attn_group_iterator():
+            if layer_name not in attn_group.layer_names:
+                continue
+            return attn_group.backend.is_dsa_offload_speculative_layer(
+                layer_name=layer_name,
+                kv_cache_spec=kv_cache_spec,
+            )
+        raise RuntimeError(f"No attention backend found for {layer_name}")
 
     def _allocate_swapped_raw_tensor(self, size: int) -> torch.Tensor:
         import torch_npu
@@ -4440,14 +4473,13 @@ class NPUModelRunner(GPUModelRunner):
 
         descriptors = []
         layer_specs = self._get_layer_kv_cache_specs(kv_cache_config)
-        num_hidden_layers = getattr(self.model_config.hf_text_config, "num_hidden_layers", None)
         layer_ids: dict[int, int] = defaultdict(int)
         # Layout interpretation belongs to the model's attention backend.  Keep
         # the pool generic and ask the backend selected for each attention group
         # to describe its tuple instead of duplicating GLM/DSV4 layout rules here.
         backend_by_layer = {}
         for attn_group in self._kv_cache_spec_attn_group_iterator():
-            backend = getattr(attn_group, "backend", None)
+            backend = attn_group.backend
             for layer_name in attn_group.layer_names:
                 backend_by_layer[layer_name] = backend
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
@@ -4465,13 +4497,16 @@ class NPUModelRunner(GPUModelRunner):
                         f"for {layer_name}"
                     )
                 backend = backend_by_layer.get(layer_name)
-                build_descriptor = getattr(backend, "build_layer_cache_descriptor", None)
-                if not callable(build_descriptor):
+                if backend is None:
                     raise RuntimeError(
                         f"Layerwise host KV offload requires an attention backend "
-                        f"layout descriptor for {layer_name}, got {backend!r}"
+                        f"layout descriptor for {layer_name}"
                     )
-                is_mtp = self._is_mtp_cache_layer_name(layer_name, num_hidden_layers)
+                build_descriptor = backend.build_layer_cache_descriptor
+                is_mtp = backend.is_dsa_offload_speculative_layer(
+                    layer_name=layer_name,
+                    kv_cache_spec=spec,
+                )
                 ratio = getattr(spec, "compress_ratio", 1)
                 cache_family_id = f"c{ratio}" if isinstance(ratio, int) and ratio > 1 else "default"
                 descriptor = build_descriptor(
@@ -4484,13 +4519,12 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 descriptors.append(descriptor)
                 layer = self.compilation_config.static_forward_context.get(layer_name)
-                impl = getattr(layer, "impl", None)
-                if impl is None or not hasattr(impl, "dsa_cache_layout_descriptor"):
+                if layer is None:
                     raise RuntimeError(
                         "Layerwise host KV offload cannot bind the cache layout "
                         f"to the attention implementation for {layer_name}"
                     )
-                impl.dsa_cache_layout_descriptor = descriptor
+                backend.bind_dsa_cache_layout_descriptor(layer.impl, descriptor)
                 if not is_mtp:
                     layer_ids[group_id] += 1
         num_blocks_by_group = {
@@ -4629,7 +4663,9 @@ class NPUModelRunner(GPUModelRunner):
                     dsa_k_scale_tensor = None
                     v_tensor = None
                     use_swapped_main = self._use_decode_host_kv_offload() and all(
-                        not self._is_mtp_cache_layer_name(name, getattr(self.model_config.hf_text_config, "num_hidden_layers", None))
+                        not self._is_dsa_offload_speculative_layer(
+                            name, layer_kv_cache_spec[name]
+                        )
                         for name in kv_cache_tensor.shared_by
                     )
                     k_tensor = (

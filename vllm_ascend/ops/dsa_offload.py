@@ -4,8 +4,8 @@
 """Thin facade for recipes DSA offload operators.
 
 The DSA kernels are compiled and installed from ``cann-recipes-infer``. This
-module owns only the stable Python call contract and PA validation; it does
-not implement a fallback gather kernel.
+module owns only the stable Python call contract; it does not implement a
+fallback gather kernel or duplicate operator input validation.
 """
 
 from __future__ import annotations
@@ -18,9 +18,43 @@ import torch
 
 DSA_BLOCK_SIZE = 128
 DSA_TOPK = 2048
-DSA_SPECULATIVE_TOKENS = 3
-DSA_SPECULATIVE_RAW_SEQ = DSA_SPECULATIVE_TOKENS + 1
-DSA_RAW_SEQ = frozenset({1, DSA_SPECULATIVE_RAW_SEQ})
+
+
+def get_dsa_config_value(
+    model_config: Any, attribute: str, default: Any = None
+) -> Any:
+    """Read a DSA model attribute from the model's config variants.
+
+    Hugging Face configurations are exposed through either ``hf_config`` or
+    ``hf_text_config`` depending on the model adapter.  Keeping this lookup in
+    one place prevents the runner, attention backend, and cache planner from
+    silently using different variants.
+    """
+
+    for config in (
+        getattr(model_config, "hf_config", None),
+        getattr(model_config, "hf_text_config", None),
+        model_config,
+    ):
+        if config is None:
+            continue
+        value = getattr(config, attribute, None)
+        if value is not None:
+            return value
+    return default
+
+
+def get_dsa_raw_seq(speculative_config: Any) -> int:
+    """Return the number of query rows represented by one scheduler row."""
+
+    num_speculative_tokens = getattr(
+        speculative_config, "num_speculative_tokens", None
+    )
+    return (
+        num_speculative_tokens + 1
+        if isinstance(num_speculative_tokens, int)
+        else 1
+    )
 
 
 @dataclass(frozen=True)
@@ -33,17 +67,40 @@ class DsaOffloadConfig:
     compact_layout: int = 1
 
     def __post_init__(self) -> None:
-        if self.raw_seq not in DSA_RAW_SEQ:
-            raise ValueError(f"raw_seq must be one of {sorted(DSA_RAW_SEQ)}, got {self.raw_seq}")
-        if self.topk != DSA_TOPK:
-            raise ValueError(f"The first release supports topk={DSA_TOPK}, got {self.topk}")
-        if self.selection_block_size != DSA_BLOCK_SIZE:
+        """Validate the currently supported recipes block contract.
+
+        The installed DSA recipes kernels currently operate on complete
+        selection blocks.  Keep this restriction at the offload operator
+        boundary so every plan/serve/install call applies the same contract.
+        This is intentionally local to DSA offload and does not constrain
+        regular SFA attention.
+        """
+
+        if self.raw_seq <= 0:
+            raise ValueError("DSA raw_seq must be positive")
+        if self.topk <= 0:
+            raise ValueError("DSA topk must be positive")
+        if self.selection_block_size <= 0:
+            raise ValueError("DSA selection_block_size must be positive")
+        if self.topk % self.selection_block_size != 0:
             raise ValueError(
-                f"The first release supports selection_block_size={DSA_BLOCK_SIZE}, "
-                f"got {self.selection_block_size}"
+                "DSA topk must be an integer multiple of selection_block_size "
+                "for the installed recipes kernels"
             )
-        if self.compact_layout not in (0, 1):
-            raise ValueError("compact_layout must be 0 or 1")
+
+    @property
+    def selection_blocks_per_row(self) -> int:
+        return (
+            self.topk + self.selection_block_size - 1
+        ) // self.selection_block_size
+
+    def selection_rows(self, batch_size: int) -> int:
+        if batch_size < 0:
+            raise ValueError("DSA batch_size must be non-negative")
+        return batch_size * self.raw_seq
+
+    def selection_block_count(self, batch_size: int) -> int:
+        return self.selection_rows(batch_size) * self.selection_blocks_per_row
 
 
 def _load_custom_ops_package() -> None:
@@ -75,121 +132,6 @@ def _custom_op(name: str) -> Any:
     return op
 
 
-def _require_tensor(name: str, value: torch.Tensor, *, dtype: torch.dtype | None = None) -> None:
-    if not isinstance(value, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor, got {type(value).__name__}")
-    if dtype is not None and value.dtype != dtype:
-        raise TypeError(f"{name} must have dtype {dtype}, got {value.dtype}")
-
-
-def _normalize_dsa_full_cache(
-    name: str,
-    value: torch.Tensor,
-    *,
-    block_size: int,
-) -> torch.Tensor:
-    """Return the normal DsaServe PA layout: [physical_blocks, block_size, dim]."""
-
-    _require_tensor(name, value)
-    if value.ndim == 3:
-        normalized = value
-    elif value.ndim == 4 and value.shape[2] == 1:
-        # vLLM MLA's physical cache is [blocks, block_size, kv_heads, dim].
-        normalized = value.squeeze(2)
-    else:
-        raise ValueError(
-            f"{name} must be [blocks, {block_size}, dim] or "
-            f"[blocks, {block_size}, 1, dim], "
-            f"got {tuple(value.shape)}"
-        )
-    if (
-        normalized.shape[0] <= 0
-        or normalized.shape[1] != block_size
-        or normalized.shape[2] <= 0
-    ):
-        raise ValueError(
-            f"{name} must use [physical_blocks, {block_size}, dim] layout, "
-            f"got {tuple(normalized.shape)}"
-        )
-    return normalized
-
-
-def validate_full_kv_block_table(
-    full_kv_block_table: torch.Tensor,
-    *,
-    full_kv_cache: torch.Tensor,
-    full_kv_actual_seq: torch.Tensor | None = None,
-    block_size: int = DSA_BLOCK_SIZE,
-) -> None:
-    """Validate scheduler PA table without synchronising device tensors."""
-
-    _require_tensor("full_kv_block_table", full_kv_block_table, dtype=torch.int32)
-    if full_kv_block_table.ndim != 2:
-        raise ValueError("full_kv_block_table must be [batch, max_blocks_per_seq]")
-    if full_kv_cache.ndim != 3 or full_kv_cache.shape[1] != block_size:
-        raise ValueError(
-            f"full_kv_cache must use [physical_blocks, {block_size}, dim] layout, "
-            f"got {tuple(full_kv_cache.shape)}"
-        )
-    if full_kv_block_table.shape[0] == 0:
-        raise ValueError("full_kv_block_table batch must be non-empty")
-    if full_kv_actual_seq is not None:
-        _require_tensor("full_kv_actual_seq", full_kv_actual_seq)
-        if full_kv_actual_seq.ndim != 1 or full_kv_actual_seq.shape[0] != full_kv_block_table.shape[0]:
-            raise ValueError("full_kv_actual_seq must have one entry per block-table row")
-    # ``-1`` is the only invalid sentinel accepted by recipes. Avoid a
-    # device-side min/max check here because it would synchronize the hot path.
-    if full_kv_block_table.device.type == "cpu":
-        values = full_kv_block_table
-        if bool((values < -1).any()):
-            raise ValueError("full_kv_block_table contains an invalid sentinel below -1")
-        if bool((values >= full_kv_cache.shape[0]).any()):
-            raise ValueError("full_kv_block_table contains a physical block outside full_kv_cache")
-
-
-def validate_selection_inputs(
-    selection_topk_indices: torch.Tensor,
-    full_kv_actual_seq: torch.Tensor,
-    *,
-    config: DsaOffloadConfig,
-) -> None:
-    _require_tensor(
-        "selection_topk_indices", selection_topk_indices, dtype=torch.int32
-    )
-    _require_tensor("full_kv_actual_seq", full_kv_actual_seq, dtype=torch.int32)
-    expected_ndim = 3 if config.raw_seq == 1 else 4
-    if selection_topk_indices.ndim != expected_ndim:
-        raise ValueError(
-            "selection_topk_indices must use the recipes DsaPlan layout: "
-            "[batch, 1, topk] for raw_seq=1 or "
-            "[batch, raw_seq, 1, topk] for raw_seq=4; "
-            f"got ndim={selection_topk_indices.ndim} for raw_seq={config.raw_seq}"
-        )
-    if selection_topk_indices.shape[-1] != config.topk:
-        raise ValueError(
-            f"selection_topk_indices last dimension must be {config.topk}, "
-            f"got {selection_topk_indices.shape[-1]}"
-        )
-    if config.raw_seq == 1:
-        if selection_topk_indices.shape[1] != 1:
-            raise ValueError(
-                "raw_seq=1 requires selection_topk_indices shape "
-                "[batch, 1, topk]"
-            )
-    elif selection_topk_indices.shape[1:3] != (config.raw_seq, 1):
-        raise ValueError(
-            "raw_seq=4 requires selection_topk_indices shape "
-            "[batch, raw_seq, 1, topk]"
-        )
-    batch = selection_topk_indices.shape[0]
-    if full_kv_actual_seq.shape != (batch,):
-        raise ValueError(
-            "full_kv_actual_seq must be [batch] and match "
-            f"selection_topk_indices; got {tuple(full_kv_actual_seq.shape)} "
-            f"for batch={batch}"
-        )
-
-
 def dsa_plan(
     selection_topk_indices: torch.Tensor,
     full_kv_actual_seq: torch.Tensor,
@@ -203,13 +145,6 @@ def dsa_plan(
     group_kind: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     config = config or DsaOffloadConfig()
-    validate_selection_inputs(selection_topk_indices, full_kv_actual_seq, config=config)
-    for name, value in (
-        ("pool_ids", pool_ids),
-        ("id_to_slot", id_to_slot),
-        ("lru_counter", lru_counter),
-    ):
-        _require_tensor(name, value)
     result = _custom_op("dsa_plan")(
         selection_topk_indices,
         full_kv_actual_seq,
@@ -242,18 +177,10 @@ def dsa_serve(
     config = config or DsaOffloadConfig()
     if full_kv_block_table is None:
         raise ValueError("full_kv_block_table is required for layerwise Host KV offload")
-    full_kv_cache = _normalize_dsa_full_cache(
-        "full_kv_cache", full_kv_cache, block_size=config.selection_block_size
-    )
-    full_k_rope = _normalize_dsa_full_cache(
-        "full_k_rope", full_k_rope, block_size=config.selection_block_size
-    )
-    validate_full_kv_block_table(
-        full_kv_block_table,
-        full_kv_cache=full_kv_cache,
-        full_kv_actual_seq=full_kv_actual_seq,
-        block_size=config.selection_block_size,
-    )
+    if full_kv_cache.ndim == 4:
+        full_kv_cache = full_kv_cache.squeeze(2)
+    if full_k_rope.ndim == 4:
+        full_k_rope = full_k_rope.squeeze(2)
     op = _custom_op("dsa_serve")
     # Recipes' PA form appends the physical block table after the selection
     # outputs. Keep it keyworded so future optional inputs cannot shift it.
@@ -289,11 +216,6 @@ def dsa_install(
     metadata_update: int = 1,
 ) -> None:
     config = config or DsaOffloadConfig()
-    _require_tensor("selection_kv_block_table", selection_kv_block_table, dtype=torch.int32)
-    if selection_kv_block_table.ndim != 2:
-        raise ValueError("selection_kv_block_table must be [batch, max_selection_blocks]")
-    if metadata_update not in (0, 1):
-        raise ValueError("metadata_update must be 0 or 1")
     _custom_op("dsa_install")(
         install_records,
         selection_kv_cache,

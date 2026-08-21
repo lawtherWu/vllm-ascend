@@ -546,15 +546,12 @@ class ChunkStoreSession:
         if self.closed or self.put_end_attempted:
             raise RuntimeError("Cannot save a closed Store chunk")
         if ready_event is not None:
-            synchronize = getattr(ready_event, "synchronize", None)
-            if synchronize is None:
-                raise TypeError("Store range ready_event must support synchronize()")
             # This method runs in a background CPU thread and invokes the
             # Mooncake range API directly with raw buffer addresses. A
             # stream-local Event.wait() would not order that CPU API call
             # after the producer stream. Synchronize the event here so the
             # source KV is complete before Mooncake starts reading it.
-            synchronize()
+            ready_event.synchronize()
         result = self.backend.batch_put_from_multi_buffer_ranges(
             keys,
             all_buffer_ptrs,
