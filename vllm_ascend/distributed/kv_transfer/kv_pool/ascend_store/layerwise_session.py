@@ -13,7 +13,7 @@ from vllm_ascend.distributed.kv_transfer.layer_workspace_fence import RequestChu
 
 
 class LayerwiseStoreBackend(Protocol):
-    def batch_put_start(self, keys: list[str], sizes: list[int], config=None) -> list[int]: ...
+    def batch_put_session_start(self, keys: list[str], sizes: list[int], config=None) -> list[int]: ...
 
     def batch_put_from_multi_buffer_ranges(
         self,
@@ -23,11 +23,11 @@ class LayerwiseStoreBackend(Protocol):
         all_dst_offsets: list[list[int]],
     ) -> list[int]: ...
 
-    def batch_put_end(self, keys: list[str]) -> list[int]: ...
+    def batch_put_session_end(self, keys: list[str]) -> list[int]: ...
 
-    def batch_put_revoke(self, keys: list[str]) -> list[int]: ...
+    def batch_put_session_revoke(self, keys: list[str]) -> list[int]: ...
 
-    def batch_get_start(self, keys: list[str]) -> list[int]: ...
+    def batch_get_session_start(self, keys: list[str]) -> list[int]: ...
 
     def batch_get_into_multi_buffer_ranges(
         self,
@@ -37,7 +37,7 @@ class LayerwiseStoreBackend(Protocol):
         all_src_offsets: list[list[int]],
     ) -> list[int]: ...
 
-    def batch_get_end(self, keys: list[str]) -> int: ...
+    def batch_get_session_end(self, keys: list[str]) -> int: ...
 
 
 class PutState(str, Enum):
@@ -121,7 +121,7 @@ class StorePutRegistry:
             if unique:
                 keys = [binding.key for binding in unique]
                 try:
-                    result = self.backend.batch_put_start(
+                    result = self.backend.batch_put_session_start(
                         keys,
                         [binding.object_size for binding in unique],
                         self.replicate_config,
@@ -228,12 +228,46 @@ class StoreReadLeaseRegistry:
                 if not entry.references:
                     to_start.append(key)
             if to_start:
-                result = self.backend.batch_get_start(to_start)
+                result = self.backend.batch_get_session_start(to_start)
                 if len(result) != len(to_start) or any(code != 0 for code in result):
                     for key in to_start:
                         if not self._entries[key].references:
                             self._entries.pop(key, None)
-                    raise StoreCommitError(f"batch_get_start failed: {to_start!r}, {result!r}")
+                    raise StoreCommitError(f"batch_get_session_start failed: {to_start!r}, {result!r}")
+            for key in unique:
+                self._entries[key].references.add(owner)
+
+    def refresh(self, owner: tuple[str, int], keys: list[str]) -> None:
+        """Refresh the native get sessions for an owner's complete history."""
+        unique = list(dict.fromkeys(keys))
+        if not unique:
+            return
+        with self._lock:
+            created: list[str] = []
+            for key in unique:
+                entry = self._entries.get(key)
+                if entry is None:
+                    entry = _ReadEntry()
+                    self._entries[key] = entry
+                    created.append(key)
+                elif entry.inflight_ranges:
+                    raise RuntimeError(
+                        f"Cannot refresh Store key {key!r} with an in-flight range"
+                    )
+            try:
+                result = self.backend.batch_get_session_start(unique)
+            except BaseException:
+                for key in created:
+                    if not self._entries[key].references:
+                        self._entries.pop(key, None)
+                raise
+            if len(result) != len(unique) or any(code != 0 for code in result):
+                for key in created:
+                    if not self._entries[key].references:
+                        self._entries.pop(key, None)
+                raise StoreCommitError(
+                    f"batch_get_session_start failed: {unique!r}, {result!r}"
+                )
             for key in unique:
                 self._entries[key].references.add(owner)
 
@@ -267,7 +301,7 @@ class StoreReadLeaseRegistry:
                     to_end.append(key)
             if to_end:
                 try:
-                    code = self.backend.batch_get_end(to_end)
+                    code = self.backend.batch_get_session_end(to_end)
                 except BaseException as error:
                     # The native read session is no longer safe to reuse.
                     # Drop local entries even when the backend reports an end
@@ -275,12 +309,12 @@ class StoreReadLeaseRegistry:
                     for key in to_end:
                         self._entries.pop(key, None)
                     raise StoreCommitError(
-                        f"batch_get_end failed: {to_end!r}"
+                        f"batch_get_session_end failed: {to_end!r}"
                     ) from error
                 for key in to_end:
                     self._entries.pop(key, None)
                 if code != 0:
-                    raise StoreCommitError(f"batch_get_end failed: {to_end!r}, {code}")
+                    raise StoreCommitError(f"batch_get_session_end failed: {to_end!r}, {code}")
 
 
 class RequestStoreLease:
@@ -297,6 +331,14 @@ class RequestStoreLease:
         if missing:
             self.registry.acquire(self.owner, missing)
             self.history_keys.update(missing)
+
+    def refresh_history(self, keys: list[str]) -> None:
+        if self.closed:
+            raise RuntimeError("Request Store lease is closed")
+        history = sorted(set(keys))
+        if history:
+            self.registry.refresh(self.owner, history)
+            self.history_keys.update(history)
 
     def load_layer(
         self,
@@ -322,7 +364,7 @@ class RequestStoreLease:
         try:
             self.registry.release(self.owner, sorted(self.history_keys))
         finally:
-            # A failed batch_get_end is terminal for this lease; retaining the
+            # A failed batch_get_session_end is terminal for this lease; retaining the
             # owner keys would make a retry call the native end operation twice.
             self.history_keys.clear()
             self.closed = True
@@ -358,7 +400,12 @@ class ChunkStoreSession:
         self.followed_put_keys = list(dict.fromkeys(claim.followed_keys))
         self.put_state = {key: PutState.OPEN for key in self.put_keys}
         if claim.failed_keys:
-            raise StoreCommitError(f"put_start failed: {claim.failed_keys!r}")
+            details: dict[str, str] = {}
+            for key in claim.failed_keys:
+                future = claim.commit_futures.get(key)
+                error = future.exception() if future is not None and future.done() else None
+                details[key] = repr(error) if error is not None else "unknown error"
+            raise StoreCommitError(f"put_start failed: {details!r}")
 
     def save_layer(
         self,
@@ -371,9 +418,15 @@ class ChunkStoreSession:
         if self.closed or self.put_end_attempted:
             raise RuntimeError("Cannot save a closed Store chunk")
         if ready_event is not None:
-            wait = getattr(ready_event, "wait", None)
-            if wait is not None:
-                wait()
+            synchronize = getattr(ready_event, "synchronize", None)
+            if synchronize is None:
+                raise TypeError("Store range ready_event must support synchronize()")
+            # This method runs in a background CPU thread and invokes the
+            # Mooncake range API directly with raw buffer addresses. A
+            # stream-local Event.wait() would not order that CPU API call
+            # after the producer stream. Synchronize the event here so the
+            # source KV is complete before Mooncake starts reading it.
+            synchronize()
         result = self.backend.batch_put_from_multi_buffer_ranges(
             keys,
             all_buffer_ptrs,
@@ -399,7 +452,7 @@ class ChunkStoreSession:
             self.closed = True
             return []
         try:
-            result = self.backend.batch_put_end(self.put_keys)
+            result = self.backend.batch_put_session_end(self.put_keys)
         except BaseException as error:
             self.put_registry.publish_commit_result(self.put_keys, error)
             self.closed = True
@@ -416,7 +469,9 @@ class ChunkStoreSession:
         self.put_registry.wait_followed(self.followed_put_keys)
         all_keys = list(dict.fromkeys(self.put_keys + self.followed_put_keys))
         if has_more_prefill_chunks:
-            self.request_lease.ensure_history(all_keys)
+            self.request_lease.refresh_history(
+                list(self.request_lease.history_keys) + all_keys
+            )
 
     def revoke_uncommitted(self) -> None:
         if self.put_end_attempted or not self.put_keys:
@@ -425,7 +480,7 @@ class ChunkStoreSession:
         if not keys:
             return
         try:
-            result = self.backend.batch_put_revoke(keys)
+            result = self.backend.batch_put_session_revoke(keys)
         except BaseException as error:
             self.put_registry.publish_commit_result(keys, error)
             raise

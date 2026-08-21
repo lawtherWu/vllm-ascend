@@ -113,7 +113,12 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
             assert self.connector_worker is not None
             if vllm_config.parallel_config.rank == 0:
-                self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config, self.use_layerwise)
+                self.lookup_server = LookupKeyServer(
+                    self.connector_worker,
+                    vllm_config,
+                    self.use_layerwise,
+                    self.use_layerwise_range,
+                )
 
     ############################################################
     # Scheduler Side Methods
@@ -293,6 +298,7 @@ class LookupKeyServer:
         pool_worker: KVPoolWorker,
         vllm_config: "VllmConfig",
         use_layerwise: bool,
+        use_layerwise_range: bool = False,
     ):
         self.decoder = MsgpackDecoder()
         self.decoder_tensor = MsgpackDecoder(torch.Tensor)
@@ -308,6 +314,7 @@ class LookupKeyServer:
         self.pool_worker = pool_worker
         self.running = True
         self.use_layerwise = use_layerwise
+        self.use_layerwise_range = use_layerwise_range
 
         def process_request():
             while self.running:
@@ -321,6 +328,7 @@ class LookupKeyServer:
                     hashes_str,
                     kv_group_ids,
                     self.use_layerwise,
+                    self.use_layerwise_range,
                 )
                 logger.debug(
                     "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
