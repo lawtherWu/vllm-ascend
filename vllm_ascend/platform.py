@@ -688,6 +688,56 @@ class NPUPlatform(Platform):
             recompute_scheduler_config = RecomputeSchedulerConfig.initialize_from_config(vllm_config)
             vllm_config.scheduler_config = recompute_scheduler_config
 
+        # Prefill layerwise offload must align every non-final prompt chunk
+        # before KVCacheManager allocates blocks. The scheduler adaptation is
+        # intentionally limited to the producer side; Decode keeps its
+        # AsyncRecomputeScheduler and does not apply Store granularity.
+        kv_transfer_config = vllm_config.kv_transfer_config
+        kv_role = getattr(kv_transfer_config, "kv_role", None)
+        kv_extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+        layerwise_host_offload = bool(kv_extra.get("layerwise_host_kv_offload", False))
+        if layerwise_host_offload:
+            if kv_role not in {"kv_producer", "kv_consumer"}:
+                raise ValueError(
+                    "layerwise_host_kv_offload requires a PD-disaggregated "
+                    "kv_role ('kv_producer' or 'kv_consumer')"
+                )
+            if cache_config.block_size != 128:
+                raise ValueError(
+                    "layerwise_host_kv_offload currently requires block-size=128 "
+                    f"(got {cache_config.block_size})"
+                )
+            if kv_role == "kv_producer":
+                if ascend_config.enable_balance_scheduling:
+                    raise ValueError(
+                        "layerwise Host KV offload Prefill is incompatible with "
+                        "balance scheduling"
+                    )
+                if cache_config.enable_prefix_caching:
+                    raise ValueError(
+                        "layerwise Host KV offload Prefill requires local prefix "
+                        "caching to be disabled; Store owns prefix reuse"
+                    )
+                if ascend_config.SLO_limits_for_dynamic_batch != -1:
+                    raise ValueError(
+                        "layerwise Host KV offload Prefill is incompatible with "
+                        "dynamic-batch scheduling in the first implementation"
+                    )
+                if ascend_config.profiling_chunk_config.enabled:
+                    raise ValueError(
+                        "layerwise Host KV offload Prefill is incompatible with "
+                        "profiling chunk scheduling in the first implementation"
+                    )
+                from vllm_ascend.patch.platform.patch_layerwise_offload_scheduler import (
+                    apply_layerwise_offload_scheduler_patch,
+                )
+
+                apply_layerwise_offload_scheduler_patch()
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.patch.platform.patch_layerwise_offload_scheduler."
+                    "LayerwiseOffloadAsyncScheduler"
+                )
+
         # Extend original scheduler_config to use SchedulerDynamicBatch.
         if ascend_config.SLO_limits_for_dynamic_batch != -1:
             vllm_config.scheduler_config.scheduler_cls = (

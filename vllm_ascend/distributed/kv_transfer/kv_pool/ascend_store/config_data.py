@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 import torch
@@ -92,12 +92,10 @@ class KeyMetadata:
     cache_role: str = "kv"
     """ Family name for compress-aware hybrid cache layouts """
     cache_family: str = "default"
-    """ Versioned namespace for an opt-in external transfer layout """
-    transfer_namespace: str | None = None
-    """ First authoritative cache slot in a full-page value """
-    slot_start: int | None = None
-    """ Exclusive end of the authoritative cache-slot range """
-    slot_end: int | None = None
+    """Stable model identity suffix used by layerwise cross-layer objects."""
+    model_fingerprint: str | None = None
+    """Version of the physical cache object layout."""
+    cache_layout_version: int | None = None
 
 
 @dataclass(order=True)
@@ -106,29 +104,35 @@ class PoolKey:
     chunk_hash: str
 
     def __hash__(self):
-        return hash(
-            (
-                self.key_metadata.model_name,
-                self.key_metadata.head_or_tp_rank,
-                self.key_metadata.pcp_rank,
-                self.key_metadata.dcp_rank,
-                self.key_metadata.pp_rank,
-                self.key_metadata.kv_cache_group_id,
-                self.key_metadata.cache_role,
-                self.key_metadata.cache_family,
-                self.key_metadata.transfer_namespace,
-                self.key_metadata.slot_start,
-                self.key_metadata.slot_end,
-                self.chunk_hash,
-            )
+        base = (
+            self.key_metadata.model_name,
+            self.key_metadata.head_or_tp_rank,
+            self.key_metadata.pcp_rank,
+            self.key_metadata.dcp_rank,
+            self.key_metadata.pp_rank,
+            self.key_metadata.kv_cache_group_id,
+            self.key_metadata.cache_role,
+            self.key_metadata.cache_family,
+            self.chunk_hash,
         )
+        fingerprint = self.key_metadata.model_fingerprint
+        layout_version = self.key_metadata.cache_layout_version
+        if (fingerprint is None) != (layout_version is None):
+            raise ValueError(
+                "model_fingerprint and cache_layout_version must be supplied together"
+            )
+        if fingerprint is None:
+            return hash(base)
+        return hash((*base, fingerprint, layout_version))
 
     def to_string(self):
-        transfer_suffix = ""
-        if self.key_metadata.transfer_namespace is not None:
-            transfer_suffix += f"@transfer:{self.key_metadata.transfer_namespace}"
-        if self.key_metadata.slot_start is not None and self.key_metadata.slot_end is not None:
-            transfer_suffix += f"@range:{self.key_metadata.slot_start}_{self.key_metadata.slot_end}"
+        fingerprint = self.key_metadata.model_fingerprint
+        layout_version = self.key_metadata.cache_layout_version
+        if (fingerprint is None) != (layout_version is None):
+            raise ValueError(
+                "model_fingerprint and cache_layout_version must be supplied together"
+            )
+        suffix = "" if fingerprint is None else f"@model:{fingerprint}@layout:{layout_version}"
         return (
             f"{self.key_metadata.model_name}"
             f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
@@ -137,7 +141,7 @@ class PoolKey:
             f"@group:{self.key_metadata.kv_cache_group_id}"
             f"@cache_role:{self.key_metadata.cache_role}"
             f"@cache_family:{self.key_metadata.cache_family}"
-            f"{transfer_suffix}"
+            f"{suffix}"
             f"@{self.chunk_hash}"
         )
 
@@ -162,29 +166,35 @@ class LayerPoolKey(PoolKey):
     layer_id: int
 
     def __hash__(self):
-        return hash(
-            (
-                self.key_metadata.model_name,
-                self.key_metadata.head_or_tp_rank,
-                self.key_metadata.pcp_rank,
-                self.key_metadata.dcp_rank,
-                self.key_metadata.kv_cache_group_id,
-                self.key_metadata.cache_role,
-                self.key_metadata.cache_family,
-                self.key_metadata.transfer_namespace,
-                self.key_metadata.slot_start,
-                self.key_metadata.slot_end,
-                self.chunk_hash,
-                self.layer_id,
-            )
+        base = (
+            self.key_metadata.model_name,
+            self.key_metadata.head_or_tp_rank,
+            self.key_metadata.pcp_rank,
+            self.key_metadata.dcp_rank,
+            self.key_metadata.kv_cache_group_id,
+            self.key_metadata.cache_role,
+            self.key_metadata.cache_family,
+            self.chunk_hash,
+            self.layer_id,
         )
+        fingerprint = self.key_metadata.model_fingerprint
+        layout_version = self.key_metadata.cache_layout_version
+        if (fingerprint is None) != (layout_version is None):
+            raise ValueError(
+                "model_fingerprint and cache_layout_version must be supplied together"
+            )
+        if fingerprint is None:
+            return hash(base)
+        return hash((*base, fingerprint, layout_version))
 
     def to_string(self):
-        transfer_suffix = ""
-        if self.key_metadata.transfer_namespace is not None:
-            transfer_suffix += f"@transfer:{self.key_metadata.transfer_namespace}"
-        if self.key_metadata.slot_start is not None and self.key_metadata.slot_end is not None:
-            transfer_suffix += f"@range:{self.key_metadata.slot_start}_{self.key_metadata.slot_end}"
+        fingerprint = self.key_metadata.model_fingerprint
+        layout_version = self.key_metadata.cache_layout_version
+        if (fingerprint is None) != (layout_version is None):
+            raise ValueError(
+                "model_fingerprint and cache_layout_version must be supplied together"
+            )
+        suffix = "" if fingerprint is None else f"@model:{fingerprint}@layout:{layout_version}"
         return (
             f"{self.key_metadata.model_name}"
             f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
@@ -194,6 +204,7 @@ class LayerPoolKey(PoolKey):
             f"@cache_family:{self.key_metadata.cache_family}"
             f"{transfer_suffix}"
             f"@layer_id:{self.layer_id}"
+            f"{suffix}"
             f"@{self.chunk_hash}"
         )
 
@@ -204,6 +215,35 @@ def infer_cache_family_from_ratio(compress_ratio: int | None) -> str:
     if compress_ratio <= 1:
         return "c1"
     return f"c{compress_ratio}"
+
+
+def build_layerwise_store_key(
+    base_metadata: KeyMetadata,
+    chunk_hash: str,
+    *,
+    model_fingerprint: str,
+    cache_layout_version: int,
+    group_id: int | None = None,
+    cache_family: str | None = None,
+) -> PoolKey:
+    """Build one canonical cross-layer block key.
+
+    The existing TP/PCP/DCP/PP and cache-group sharding fields remain the
+    source of truth.  Request identity, layer and component are represented by
+    the object lease/range metadata and therefore never enter this key.
+    """
+
+    if not model_fingerprint or cache_layout_version <= 0:
+        raise ValueError("Layerwise keys require a model fingerprint and layout version")
+    metadata = replace(
+        base_metadata,
+        kv_cache_group_id=base_metadata.kv_cache_group_id if group_id is None else group_id,
+        cache_family=base_metadata.cache_family if cache_family is None else cache_family,
+        cache_role="layerwise_kv",
+        model_fingerprint=model_fingerprint,
+        cache_layout_version=cache_layout_version,
+    )
+    return PoolKey(metadata, chunk_hash)
 
 
 def infer_cache_family_ratio(cache_family: str | None) -> int:
@@ -450,9 +490,8 @@ class ChunkedTokenDatabase:
                 kv_cache_group_id=kv_cache_group_id,
                 cache_role=cache_role,
                 cache_family=cache_family,
-                transfer_namespace=transfer_namespace,
-                slot_start=slot_start,
-                slot_end=slot_end,
+                model_fingerprint=group_metadata.model_fingerprint,
+                cache_layout_version=group_metadata.cache_layout_version,
             ),
             chunk_hash,
         )
@@ -1120,6 +1159,9 @@ class ReqMeta:
     skip_null_blocks_by_group: list[bool] | None = None
     disable_tp_key_sharding: bool = False
     num_prompt_tokens: int | None = None
+    # Stable request/chunk identity used by the layerwise Store lease.
+    request_generation: int = 0
+    chunk_id: int = 0
 
     # The following parameters are only used for kv event generation
     # TODO: add lora_request which used for gen lora_id/lora_name in kv event
@@ -1147,6 +1189,8 @@ class ReqMeta:
         original_block_size: list[int] | int | None = None,
         block_ids: list[int] | list[list[int]] | None = None,
         event_id: int | None = None,
+        request_generation: int = 0,
+        chunk_id: int = 0,
     ) -> None:
         self.req_id = req_id
         self.token_len_chunk = token_len_chunk
@@ -1167,6 +1211,8 @@ class ReqMeta:
         self.original_block_size = original_block_size
         self.event_id = event_id
 
+        self.request_generation = request_generation
+        self.chunk_id = chunk_id
     @property
     def block_ids(self) -> list[int]:
         return self.block_ids_by_group[0] if self.block_ids_by_group else []
@@ -1234,6 +1280,8 @@ class ReqMeta:
             load_spec=load_spec,
             block_hashes=block_hashes,
             is_last_chunk=is_last_chunk,
+            request_generation=0,
+            chunk_id=num_tokens_to_save // max(cache_transfer_granularity, 1),
             token_ids=token_ids,
             num_prompt_tokens=tracker.num_prompt_tokens or input_token_len,
             original_block_size=original_block_size,
