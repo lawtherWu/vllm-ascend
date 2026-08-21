@@ -269,6 +269,136 @@ class MooncakeBackend(Backend):
             )
             return None
 
+    # The following methods are intentionally thin wrappers around Mooncake's
+    # PR #2881 Python ABI.  They are separate from put()/get() so the existing
+    # connector keeps its historical error-swallowing behavior while the
+    # layerwise session can propagate per-key failures and own a native
+    # put/get session on one client instance.
+    @staticmethod
+    def _validate_key_major(
+        keys: list[str],
+        *key_major_arguments: list[list[int]],
+    ) -> None:
+        if any(len(argument) != len(keys) for argument in key_major_arguments):
+            raise ValueError("Mooncake layerwise arguments must be key-major")
+        for rows in zip(*key_major_arguments, strict=True):
+            row_lengths = {len(row) for row in rows}
+            if len(row_lengths) != 1:
+                raise ValueError("buffers, sizes and offsets must align per key")
+
+    @staticmethod
+    def _validate_key_results(
+        operation: str,
+        keys: list[str],
+        result,
+    ) -> list[int]:
+        if result is None:
+            raise RuntimeError(f"Mooncake {operation} returned None")
+        normalized = [int(value) for value in result]
+        if len(normalized) != len(keys):
+            raise RuntimeError(
+                f"Mooncake {operation} returned {len(normalized)} results for "
+                f"{len(keys)} keys"
+            )
+        return normalized
+
+    def _layerwise_replicate_config(self) -> ReplicateConfig:
+        config = ReplicateConfig()
+        if self.config.preferred_segment:
+            config.preferred_segment = self.local_seg
+        config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
+        return config
+
+    def batch_put_start(
+        self,
+        keys: list[str],
+        sizes: list[int],
+        config: ReplicateConfig | None = None,
+    ) -> list[int]:
+        self._ensure_initialized()
+        if len(keys) != len(sizes):
+            raise ValueError("Mooncake put_start keys and sizes must align")
+        assert self.store is not None
+        result = self.store.batch_put_start(
+            keys,
+            [int(size) for size in sizes],
+            config if config is not None else self._layerwise_replicate_config(),
+        )
+        return self._validate_key_results("batch_put_start", keys, result)
+
+    def batch_put_from_multi_buffer_ranges(
+        self,
+        keys: list[str],
+        all_buffer_ptrs: list[list[int]],
+        all_sizes: list[list[int]],
+        all_dst_offsets: list[list[int]],
+    ) -> list[int]:
+        self._ensure_initialized()
+        self._validate_key_major(keys, all_buffer_ptrs, all_sizes, all_dst_offsets)
+        assert self.store is not None
+        result = self.store.batch_put_from_multi_buffer_ranges(
+            keys,
+            all_buffer_ptrs,
+            all_sizes,
+            all_dst_offsets,
+        )
+        normalized = self._validate_key_results("batch_put_from_multi_buffer_ranges", keys, result)
+        expected = [sum(int(size) for size in sizes) for sizes in all_sizes]
+        if normalized != expected:
+            raise RuntimeError(
+                "Mooncake layerwise put range transferred unexpected byte counts: "
+                f"expected={expected}, actual={normalized}"
+            )
+        return normalized
+
+    def batch_put_end(self, keys: list[str]) -> list[int]:
+        self._ensure_initialized()
+        assert self.store is not None
+        return self._validate_key_results("batch_put_end", keys, self.store.batch_put_end(keys))
+
+    def batch_put_revoke(self, keys: list[str]) -> list[int]:
+        self._ensure_initialized()
+        assert self.store is not None
+        return self._validate_key_results("batch_put_revoke", keys, self.store.batch_put_revoke(keys))
+
+    def batch_get_start(self, keys: list[str]) -> list[int]:
+        self._ensure_initialized()
+        assert self.store is not None
+        return self._validate_key_results("batch_get_start", keys, self.store.batch_get_start(keys))
+
+    def batch_get_into_multi_buffer_ranges(
+        self,
+        keys: list[str],
+        all_buffer_ptrs: list[list[int]],
+        all_sizes: list[list[int]],
+        all_src_offsets: list[list[int]],
+    ) -> list[int]:
+        self._ensure_initialized()
+        self._validate_key_major(keys, all_buffer_ptrs, all_sizes, all_src_offsets)
+        assert self.store is not None
+        result = self.store.batch_get_into_multi_buffer_ranges(
+            keys,
+            all_buffer_ptrs,
+            all_sizes,
+            all_src_offsets,
+        )
+        normalized = self._validate_key_results("batch_get_into_multi_buffer_ranges", keys, result)
+        expected = [sum(int(size) for size in sizes) for sizes in all_sizes]
+        if normalized != expected:
+            raise RuntimeError(
+                "Mooncake layerwise get range transferred unexpected byte counts: "
+                f"expected={expected}, actual={normalized}"
+            )
+        return normalized
+
+    def batch_get_end(self, keys: list[str]) -> int:
+        self._ensure_initialized()
+        assert self.store is not None
+        result = self.store.batch_get_end(keys)
+        if isinstance(result, (list, tuple)):
+            raise RuntimeError("Mooncake batch_get_end must return one status code")
+        return int(result)
+
 
 @dataclass
 class MooncakeStoreConfig:

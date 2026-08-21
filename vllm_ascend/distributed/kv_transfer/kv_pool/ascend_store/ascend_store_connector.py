@@ -83,7 +83,9 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
         self.kv_role = vllm_config.kv_transfer_config.kv_role
 
-        self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.use_layerwise = extra_config.get("use_layerwise", False)
+        self.use_layerwise_range = self.use_layerwise and extra_config.get("use_layerwise_range", False)
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_put", False
         )
@@ -212,25 +214,41 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
             return
-        self.connector_worker.wait_for_layer_load()
+        self.connector_worker.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
-    ) -> None:
+    ) -> Any:
         if not self.use_layerwise:
-            return
+            return None
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
-        self.connector_worker.save_kv_layer(self._get_connector_metadata())
+        kv_ready_event = kwargs.get("kv_ready_event")
+        if kv_ready_event is None:
+            layer_metadata = (
+                attn_metadata.get(layer_name)
+                if isinstance(attn_metadata, dict)
+                else attn_metadata
+            )
+            kv_ready_event = getattr(layer_metadata, "reshape_cache_event", None)
+        if kv_ready_event is None:
+            kv_ready_event = torch.npu.Event()
+            kv_ready_event.record()
+        return self.connector_worker.save_kv_layer(
+            layer_name,
+            kv_layer,
+            self._get_connector_metadata(),
+            kv_ready_event=kv_ready_event,
+        )
 
     def wait_for_save(self):
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
             # Don't do save if the role is kv_consumer
             return
 
-        if self.use_layerwise:
+        if self.use_layerwise and not self.use_layerwise_range:
             return
 
         self.connector_worker.wait_for_save(self._get_connector_metadata())
