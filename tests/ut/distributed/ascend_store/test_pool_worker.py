@@ -243,13 +243,18 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
                 require_all=True,
             )
 
-    def test_range_load_rotates_keys_and_destinations_by_tp_rank(self):
+    def test_range_group_load_rotates_keys_and_destinations_by_tp_rank(self):
         cls = self._make_worker_class()
         worker = object.__new__(cls)
         worker.tp_rank = 2
         worker._range_load_layers_seen = set()
-        worker._range_components = {(0, "layer.0"): MagicMock()}
-        worker._range_destination = MagicMock(
+        worker._range_components = {
+            (0, "layer.0"): MagicMock(),
+            (0, "layer.1"): MagicMock(),
+            (0, "layer.2"): MagicMock(),
+            (0, "layer.3"): MagicMock(),
+        }
+        worker._range_destination_for_layers = MagicMock(
             return_value=(
                 ["key-0", "key-1", "key-2"],
                 [[100], [200], [300]],
@@ -260,12 +265,18 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         request = MagicMock()
         lease = MagicMock()
         lease.load_layer.return_value = [30, 10, 20]
+        records = [MagicMock()]
         worker._range_read_plans = {
-            "request": (request, lease, [MagicMock()])
+            "request": (request, lease, records)
         }
 
-        worker._wait_for_layer_load_range("layer.0")
+        worker._wait_for_layer_load_ranges(
+            ("layer.0", "layer.1", "layer.2", "layer.3")
+        )
 
+        worker._range_destination_for_layers.assert_called_once_with(
+            ("layer.0", "layer.1", "layer.2", "layer.3"), records
+        )
         lease.load_layer.assert_called_once_with(
             ["key-2", "key-0", "key-1"],
             [[300], [100], [200]],
@@ -273,6 +284,47 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
             [[3], [1], [2]],
         )
         self.assertEqual(worker._range_read_plans, {})
+
+    def test_range_destination_flattens_layers_per_store_key(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+
+        def component(
+            base_addr: int,
+            block_len: int,
+            block_stride: int,
+            object_offset: int,
+        ):
+            value = MagicMock()
+            value.base_addr = base_addr
+            value.block_len = block_len
+            value.block_stride = block_stride
+            value.object_offset = object_offset
+            return value
+
+        record = MagicMock()
+        record.key = "key"
+        record.group_id = 0
+        record.block_id = 2
+        worker._range_components = {
+            (0, "layer.0"): [component(100, 4, 10, 0)],
+            (0, "layer.1"): [
+                component(200, 5, 20, 64),
+                component(300, 6, 30, 128),
+            ],
+            (0, "layer.2"): [component(400, 7, 40, 192)],
+            (0, "layer.3"): [component(500, 8, 50, 256)],
+        }
+
+        keys, ptrs, sizes, offsets = worker._range_destination_for_layers(
+            ("layer.0", "layer.1", "layer.2", "layer.3"),
+            [record],
+        )
+
+        self.assertEqual(keys, ["key"])
+        self.assertEqual(ptrs, [[120, 240, 360, 480, 600]])
+        self.assertEqual(sizes, [[4, 5, 6, 7, 8]])
+        self.assertEqual(offsets, [[0, 64, 128, 192, 256]])
 
     def test_range_request_generation_uses_bounded_global_counter(self):
         cls = self._make_worker_class()
