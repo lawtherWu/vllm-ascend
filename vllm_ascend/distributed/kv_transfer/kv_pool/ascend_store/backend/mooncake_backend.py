@@ -23,6 +23,16 @@ from vllm_ascend.distributed.parallel_state import get_global_rank
 DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
+_LAYERWISE_SESSION_APIS = (
+    "batch_get_session_start",
+    "batch_get_into_multi_buffer_ranges",
+    "batch_get_session_end",
+    "batch_put_session_start",
+    "batch_put_from_multi_buffer_ranges",
+    "batch_put_session_end",
+    "batch_put_session_revoke",
+)
+
 
 @functools.lru_cache(maxsize=1)
 def _mooncake_setup_supports_ssd_offload() -> bool:
@@ -72,6 +82,7 @@ class MooncakeBackend(Backend):
         self._lazy_init = lazy_init and self._use_fabric_mem
         self._store_initialized = False
         self._store_init_lock = threading.Lock()
+        self._layerwise_session_api_validated = False
 
         if not self._lazy_init:
             self.store = self._setup_store()
@@ -302,6 +313,24 @@ class MooncakeBackend(Backend):
             )
         return normalized
 
+    def _require_layerwise_session_api(self) -> None:
+        if getattr(self, "_layerwise_session_api_validated", False):
+            return
+        assert self.store is not None
+        missing = [
+            name
+            for name in _LAYERWISE_SESSION_APIS
+            if not callable(getattr(self.store, name, None))
+        ]
+        if missing:
+            raise RuntimeError(
+                "The installed Mooncake package does not provide the "
+                "session-based ranged transfer APIs required by layerwise "
+                f"KV offload. Missing methods: {missing!r}. Build and install "
+                "Mooncake with https://github.com/kvcache-ai/Mooncake/pull/2881."
+            )
+        self._layerwise_session_api_validated = True
+
     def _layerwise_replicate_config(self) -> ReplicateConfig:
         config = ReplicateConfig()
         if self.config.preferred_segment:
@@ -309,22 +338,23 @@ class MooncakeBackend(Backend):
         config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
         return config
 
-    def batch_put_start(
+    def batch_put_session_start(
         self,
         keys: list[str],
         sizes: list[int],
         config: ReplicateConfig | None = None,
     ) -> list[int]:
         self._ensure_initialized()
+        self._require_layerwise_session_api()
         if len(keys) != len(sizes):
-            raise ValueError("Mooncake put_start keys and sizes must align")
+            raise ValueError("Mooncake batch_put_session_start keys and sizes must align")
         assert self.store is not None
-        result = self.store.batch_put_start(
+        result = self.store.batch_put_session_start(
             keys,
             [int(size) for size in sizes],
             config if config is not None else self._layerwise_replicate_config(),
         )
-        return self._validate_key_results("batch_put_start", keys, result)
+        return self._validate_key_results("batch_put_session_start", keys, result)
 
     def batch_put_from_multi_buffer_ranges(
         self,
@@ -351,20 +381,21 @@ class MooncakeBackend(Backend):
             )
         return normalized
 
-    def batch_put_end(self, keys: list[str]) -> list[int]:
+    def batch_put_session_end(self, keys: list[str]) -> list[int]:
         self._ensure_initialized()
         assert self.store is not None
-        return self._validate_key_results("batch_put_end", keys, self.store.batch_put_end(keys))
+        return self._validate_key_results("batch_put_session_end", keys, self.store.batch_put_session_end(keys))
 
-    def batch_put_revoke(self, keys: list[str]) -> list[int]:
+    def batch_put_session_revoke(self, keys: list[str]) -> list[int]:
         self._ensure_initialized()
         assert self.store is not None
-        return self._validate_key_results("batch_put_revoke", keys, self.store.batch_put_revoke(keys))
+        return self._validate_key_results("batch_put_session_revoke", keys, self.store.batch_put_session_revoke(keys))
 
-    def batch_get_start(self, keys: list[str]) -> list[int]:
+    def batch_get_session_start(self, keys: list[str]) -> list[int]:
         self._ensure_initialized()
+        self._require_layerwise_session_api()
         assert self.store is not None
-        return self._validate_key_results("batch_get_start", keys, self.store.batch_get_start(keys))
+        return self._validate_key_results("batch_get_session_start", keys, self.store.batch_get_session_start(keys))
 
     def batch_get_into_multi_buffer_ranges(
         self,
@@ -391,12 +422,12 @@ class MooncakeBackend(Backend):
             )
         return normalized
 
-    def batch_get_end(self, keys: list[str]) -> int:
+    def batch_get_session_end(self, keys: list[str]) -> int:
         self._ensure_initialized()
         assert self.store is not None
-        result = self.store.batch_get_end(keys)
+        result = self.store.batch_get_session_end(keys)
         if isinstance(result, (list, tuple)):
-            raise RuntimeError("Mooncake batch_get_end must return one status code")
+            raise RuntimeError("Mooncake batch_get_session_end must return one status code")
         return int(result)
 
 
