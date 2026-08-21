@@ -3891,6 +3891,11 @@ class NPUModelRunner(GPUModelRunner):
             DsaLayerWorkspace,
             DsaResidentState,
         )
+        from vllm_ascend.ops.dsa_offload import (
+            DSA_BLOCK_SIZE,
+            DSA_SPECULATIVE_TOKENS,
+            DSA_TOPK,
+        )
 
         sfa_impls = {}
         for layer_name, layer in self.compilation_config.static_forward_context.items():
@@ -3932,8 +3937,20 @@ class NPUModelRunner(GPUModelRunner):
             int(extra_config.get("dsa_id_range", 131072)),
         )
         batch_capacity = self.max_num_reqs
-        max_raw_seq = 4
-        selection_blocks = (2048 + 128 - 1) // 128
+        num_speculative_tokens = getattr(self.vllm_config.speculative_config, "num_speculative_tokens", None)
+        topk = getattr(hf_config, "index_topk", None)
+        block_size = int(self.cache_config.block_size)
+        if num_speculative_tokens != DSA_SPECULATIVE_TOKENS:
+            raise RuntimeError(
+                "DSA Host offload requires MTP3; "
+                f"got num_speculative_tokens={num_speculative_tokens}"
+            )
+        if topk != DSA_TOPK:
+            raise RuntimeError(f"DSA Host offload requires index_topk={DSA_TOPK}; got {topk}")
+        if block_size != DSA_BLOCK_SIZE:
+            raise RuntimeError(f"DSA Host offload requires block_size={DSA_BLOCK_SIZE}; got {block_size}")
+        max_raw_seq = num_speculative_tokens + 1
+        selection_blocks = (topk + block_size - 1) // block_size
         selection_rows = batch_capacity * max_raw_seq
         workspaces = []
         for layer_id in range(num_hidden_layers):
@@ -3951,11 +3968,11 @@ class NPUModelRunner(GPUModelRunner):
                 (batch_capacity, pool_size, rope_dim), dtype=self.dtype, device=self.device
             )
             selection_kv = torch.empty(
-                (selection_rows * selection_blocks, 128, kv_dim),
+                (selection_rows * selection_blocks, block_size, kv_dim),
                 dtype=self.dtype, device=self.device
             )
             selection_rope = torch.empty(
-                (selection_rows * selection_blocks, 128, rope_dim),
+                (selection_rows * selection_blocks, block_size, rope_dim),
                 dtype=self.dtype, device=self.device
             )
             selection_block_table = torch.arange(
@@ -3965,8 +3982,8 @@ class NPUModelRunner(GPUModelRunner):
                 1, selection_rows + 1, dtype=torch.int32, device=self.device
             )
             selection_default_indices = torch.arange(
-                2048, dtype=torch.int32, device=self.device
-            ).view(1, 1, 2048).expand(selection_rows, 1, 2048)
+                topk, dtype=torch.int32, device=self.device
+            ).view(1, 1, topk).expand(selection_rows, 1, topk)
             workspaces.append(
                 DsaLayerWorkspace(
                     layer_id=layer_id,
