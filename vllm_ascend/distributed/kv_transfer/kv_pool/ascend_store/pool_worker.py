@@ -2078,6 +2078,7 @@ class KVPoolWorker:
                     block_hashes,
                     kv_cache_group_id=group_id,
                 ):
+                    start, end, key = chunk.raw_start, chunk.raw_end, chunk.key
                     if use_layerwise_range:
                         # Range mode stores one object per block containing
                         # every layer/component. Query the exact canonical key
