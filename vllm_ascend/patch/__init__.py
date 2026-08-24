@@ -1017,3 +1017,18 @@
 #       runner and can rely on upstream's default enablement heuristics
 #       (model architecture, Triton, feature checks) without crashes or
 #       degraded functionality.
+
+# ** 31. File: worker/patch_glm_moe_chunk.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.model_executor.models.deepseek_v2.DeepseekV2MoE.forward`
+#    Why:
+#       GLM5.2 is registered by vLLM as `model_type=glm_moe_dsa` and reuses
+#       DeepseekV2MoE. Long prefills can otherwise create a large routing/GMM
+#       peak on Ascend.
+#    How:
+#       For GLM5.2 prefills, split the token dimension into an EP-aligned
+#       number of chunks controlled by `additional_config.moe_chunk_max_len`.
+#       Leave other DeepSeek models, decode, and short prefills unchanged.
+#    Future Plan:
+#       Remove this patch when vLLM exposes a model/plugin MoE prefill chunking
+#       hook that can be implemented without monkey-patching the model class.
