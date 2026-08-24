@@ -61,6 +61,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertEqual(ascend_config.moe_chunk_max_len, 65536)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -83,10 +84,12 @@ class TestAscendConfig(TestBase):
             "eplb_config": {"num_redundant_experts": 2},
             "refresh": True,
             "enable_kv_nz": False,
+            "moe_chunk_max_len": 1024,
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
         self.assertTrue(ascend_config.multistream_overlap_shared_expert)
+        self.assertEqual(ascend_config.moe_chunk_max_len, 1024)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertFalse(ascend_compilation_config.fuse_norm_quant)

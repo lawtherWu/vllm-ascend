@@ -289,6 +289,19 @@ class AscendConfig:
         # Enable dispatch/combine op inter-node communication by ROCE
         self.enable_mc2_hierarchy_comm = additional_config.get("enable_mc2_hierarchy_comm", False)
 
+        # Maximum number of tokens processed by one prefill MoE invocation.
+        # GLM5.2 uses this value to split prefill routing/GMM work into
+        # EP-aligned chunks.  Keep the recipes default so existing GLM5.2
+        # deployments get the same behavior when the option is omitted.
+        self.moe_chunk_max_len = additional_config.get("moe_chunk_max_len", 65536)
+        if not isinstance(self.moe_chunk_max_len, int) or isinstance(self.moe_chunk_max_len, bool):
+            raise ValueError(
+                "moe_chunk_max_len must be a positive integer, "
+                f"got {type(self.moe_chunk_max_len).__name__}: {self.moe_chunk_max_len}"
+            )
+        if self.moe_chunk_max_len <= 0:
+            raise ValueError(f"moe_chunk_max_len must be a positive integer, got {self.moe_chunk_max_len}")
+
         # Per-rank token capacity after dispatch in the mega moe (dispatch_ffn_combine) fused operator.
         # When load imbalance causes a rank to receive more tokens than this limit, the excess tokens
         # are dropped and skipped from computation, degrading accuracy.
