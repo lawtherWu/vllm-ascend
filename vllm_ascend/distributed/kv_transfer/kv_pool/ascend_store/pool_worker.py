@@ -4,7 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import importlib
 import math
 import threading
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -534,20 +534,46 @@ class KVPoolWorker:
             return records
         return records[self.tp_rank % self.put_step :: self.put_step]
 
-    def _range_destination(self, layer_name: str, records: list[_LayerwiseRangeBlock]):
+    def _range_destination_for_layers(
+        self,
+        layer_names: Sequence[str],
+        records: list[_LayerwiseRangeBlock],
+    ):
         keys: list[str] = []
         ptrs: list[list[int]] = []
         sizes: list[list[int]] = []
         offsets: list[list[int]] = []
         for record in records:
-            components = self._range_components.get((record.group_id, layer_name))
-            if not components:
+            component_groups = [
+                self._range_components.get((record.group_id, layer_name))
+                for layer_name in layer_names
+            ]
+            if not any(component_groups):
                 continue
+            if not all(component_groups):
+                raise RuntimeError(
+                    "Layerwise range GET group crosses incompatible cache "
+                    f"groups: layers={tuple(layer_names)!r}, "
+                    f"group_id={record.group_id}"
+                )
+            components = [
+                component
+                for group in component_groups
+                if group is not None
+                for component in group
+            ]
             keys.append(record.key)
             ptrs.append([c.base_addr + record.block_id * c.block_stride for c in components])
             sizes.append([c.block_len for c in components])
             offsets.append([c.object_offset for c in components])
         return keys, ptrs, sizes, offsets
+
+    def _range_destination(
+        self,
+        layer_name: str,
+        records: list[_LayerwiseRangeBlock],
+    ):
+        return self._range_destination_for_layers((layer_name,), records)
 
     def _normalize_range_request_identity(self, request: ReqMeta) -> None:
         """Attach a worker-local generation to vLLM 0.23 request metadata.
@@ -1226,12 +1252,18 @@ class KVPoolWorker:
                     len(key_list) + c128_page_count,
                 )
 
-    def _wait_for_layer_load_range(self, layer_name: str | None) -> None:
-        if layer_name is None:
+    def _wait_for_layer_load_ranges(
+        self,
+        layer_names: Sequence[str],
+    ) -> None:
+        layer_names = tuple(layer_names)
+        if not layer_names:
             return
-        self._range_load_layers_seen.add(layer_name)
         for req_id, (request, lease, records) in list(self._range_read_plans.items()):
-            keys, ptrs, sizes, offsets = self._range_destination(layer_name, records)
+            keys, ptrs, sizes, offsets = self._range_destination_for_layers(
+                layer_names,
+                records,
+            )
             if not keys:
                 continue
             rank_offset = self.tp_rank % len(keys)
@@ -1241,9 +1273,9 @@ class KVPoolWorker:
             offsets = offsets[rank_offset:] + offsets[:rank_offset]
             try:
                 logger.debug(
-                    "KV pool worker range get req=%s layer=%s keys=%d",
+                    "KV pool worker range get req=%s layers=%s keys=%d",
                     req_id,
-                    layer_name,
+                    layer_names,
                     len(keys),
                 )
                 result = lease.load_layer(keys, ptrs, sizes, offsets)
@@ -1257,15 +1289,26 @@ class KVPoolWorker:
                         f"result={result!r}, expected={expected_bytes!r}"
                     )
             except BaseException as error:
-                logger.error("Layerwise range load failed req=%s layer=%s error=%s", req_id, layer_name, error)
+                logger.error(
+                    "Layerwise range load failed req=%s layers=%s error=%s",
+                    req_id,
+                    layer_names,
+                    error,
+                )
                 with self._invalid_block_ids_lock:
-                    self._invalid_block_ids.update(record.block_id for record in records if record.key in set(keys))
+                    self._invalid_block_ids.update(
+                        record.block_id
+                        for record in records
+                        if record.key in set(keys)
+                    )
                 # A range miss is not a prefix-cache miss: the workspace may be
                 # partially written. Abort before Attention can consume it.
                 self._abort_range_read_plans()
                 raise StoreCommitError(
-                    f"Layerwise Store load failed for request {req_id}, layer {layer_name}"
+                    f"Layerwise Store load failed for request {req_id}, "
+                    f"layers {layer_names}"
                 ) from error
+        self._range_load_layers_seen.update(layer_names)
         all_layers = {name for group_id, name in self._range_components}
         if all_layers and all_layers.issubset(self._range_load_layers_seen):
             for req_id in list(self._range_read_plans):
@@ -1276,6 +1319,11 @@ class KVPoolWorker:
                 # wait_for_save() on the final chunk, or by the cancellation
                 # and failure paths after all range operations quiesce.
                 self._range_read_plans.pop(req_id, None)
+
+    def _wait_for_layer_load_range(self, layer_name: str | None) -> None:
+        if layer_name is None:
+            return
+        self._wait_for_layer_load_ranges((layer_name,))
 
     def wait_for_layer_load(self, layer_name: str | None = None) -> None:
         if self.use_layerwise_range:
@@ -1288,6 +1336,13 @@ class KVPoolWorker:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.debug("Retrieved %s tokens", num_retrieved_tokens)
+
+    def wait_for_layer_loads(self, layer_names: Sequence[str]) -> None:
+        if self.use_layerwise_range:
+            self._wait_for_layer_load_ranges(layer_names)
+            return
+        for layer_name in layer_names:
+            self.wait_for_layer_load(layer_name)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         with self._invalid_block_ids_lock:

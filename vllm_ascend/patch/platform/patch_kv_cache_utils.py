@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.attention.cache_layout import (
     CacheComponentRole,
+    LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT,
     build_mla_layer_cache_descriptor,
 )
 from vllm_ascend.ops.dsa_offload import (
@@ -173,7 +174,10 @@ def _get_layerwise_prefill_max_memory_usage_bytes(
         )
         for spec in per_layer_specs.values()
     )
-    bytes_per_block = workspace_page_size + sum(mtp_page_sizes.values())
+    bytes_per_block = (
+        LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT * workspace_page_size
+        + sum(mtp_page_sizes.values())
+    )
     return num_blocks * bytes_per_block
 
 
@@ -199,12 +203,12 @@ def _get_layerwise_prefill_kv_cache_config(
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> KVCacheConfig:
-    """Plan one shared Main/Indexer bundle plus ordinary MTP caches.
+    """Plan two grouped-prefetch Main/Indexer banks plus ordinary MTP caches.
 
     The scheduler still owns the full logical block table.  ``shared_by`` only
-    aliases the physical tensor used by compatible base-model layers, so HBM
-    capacity is independent of their count.  Draft layers remain ordinary
-    per-layer PA caches and are included in the per-block denominator.
+    aliases base-model layers to a bounded set of physical tensors, so
+    every arena has the complete logical block capacity.  Draft layers remain
+    ordinary per-layer PA caches and are included in the per-block denominator.
     """
 
     (
@@ -213,7 +217,15 @@ def _get_layerwise_prefill_kv_cache_config(
         mtp_page_sizes,
         _per_layer_specs,
     ) = _get_layerwise_prefill_cache_layout(vllm_config, kv_cache_groups)
-    bytes_per_block = workspace_page_size + sum(mtp_page_sizes.values())
+    if len(workspace_layers) < LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT:
+        raise ValueError(
+            "Layerwise Host Offload Prefill grouped prefetch requires at least "
+            f"{LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT} base layers"
+        )
+    bytes_per_block = (
+        LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT * workspace_page_size
+        + sum(mtp_page_sizes.values())
+    )
     if bytes_per_block <= 0:
         raise ValueError("Layerwise Host Offload Prefill has an invalid page budget")
 
@@ -227,8 +239,11 @@ def _get_layerwise_prefill_kv_cache_config(
     kv_cache_tensors = [
         KVCacheTensor(
             size=workspace_page_size * num_blocks,
-            shared_by=workspace_layers,
+            shared_by=workspace_layers[
+                arena_id::LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
+            ],
         )
+        for arena_id in range(LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT)
     ]
     kv_cache_tensors.extend(
         KVCacheTensor(
