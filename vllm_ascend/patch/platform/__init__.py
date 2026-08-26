@@ -41,8 +41,8 @@ import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
 import vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa
 import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
 
-# Exposes the producer-only scheduler and its narrow pre-allocation hook patch.
-# The patch is applied lazily after layerwise Host KV offload is selected.
+# Must run before patch_balance_schedule replaces the module-level Scheduler
+# symbol. AsyncScheduler keeps the original Scheduler object as its base.
 import vllm_ascend.patch.platform.patch_layerwise_offload_scheduler  # noqa
 
 if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":

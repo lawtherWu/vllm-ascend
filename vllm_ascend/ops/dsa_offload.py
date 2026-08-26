@@ -80,6 +80,38 @@ def _require_tensor(name: str, value: torch.Tensor, *, dtype: torch.dtype | None
         raise TypeError(f"{name} must have dtype {dtype}, got {value.dtype}")
 
 
+def _normalize_dsa_full_cache(
+    name: str,
+    value: torch.Tensor,
+    *,
+    block_size: int,
+) -> torch.Tensor:
+    """Return the normal DsaServe PA layout: [physical_blocks, block_size, dim]."""
+
+    _require_tensor(name, value)
+    if value.ndim == 3:
+        normalized = value
+    elif value.ndim == 4 and value.shape[2] == 1:
+        # vLLM MLA's physical cache is [blocks, block_size, kv_heads, dim].
+        normalized = value.squeeze(2)
+    else:
+        raise ValueError(
+            f"{name} must be [blocks, {block_size}, dim] or "
+            f"[blocks, {block_size}, 1, dim], "
+            f"got {tuple(value.shape)}"
+        )
+    if (
+        normalized.shape[0] <= 0
+        or normalized.shape[1] != block_size
+        or normalized.shape[2] <= 0
+    ):
+        raise ValueError(
+            f"{name} must use [physical_blocks, {block_size}, dim] layout, "
+            f"got {tuple(normalized.shape)}"
+        )
+    return normalized
+
+
 def validate_full_kv_block_table(
     full_kv_block_table: torch.Tensor,
     *,
@@ -92,9 +124,9 @@ def validate_full_kv_block_table(
     _require_tensor("full_kv_block_table", full_kv_block_table, dtype=torch.int32)
     if full_kv_block_table.ndim != 2:
         raise ValueError("full_kv_block_table must be [batch, max_blocks_per_seq]")
-    if full_kv_cache.ndim < 2 or full_kv_cache.shape[1] != block_size:
+    if full_kv_cache.ndim != 3 or full_kv_cache.shape[1] != block_size:
         raise ValueError(
-            f"full_kv_cache must use [physical_blocks, {block_size}, ...] layout, "
+            f"full_kv_cache must use [physical_blocks, {block_size}, dim] layout, "
             f"got {tuple(full_kv_cache.shape)}"
         )
     if full_kv_block_table.shape[0] == 0:
@@ -170,7 +202,11 @@ def dsa_plan(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     config = config or DsaOffloadConfig()
     validate_selection_inputs(selection_topk_indices, full_kv_actual_seq, config=config)
-    for name, value in (("pool_ids", pool_ids), ("id_to_slot", id_to_slot), ("lru_counter", lru_counter)):
+    for name, value in (
+        ("pool_ids", pool_ids),
+        ("id_to_slot", id_to_slot),
+        ("lru_counter", lru_counter),
+    ):
         _require_tensor(name, value)
     result = _custom_op("dsa_plan")(
         selection_topk_indices,
@@ -200,10 +236,16 @@ def dsa_serve(
     full_kv_block_table: torch.Tensor | None = None,
     full_kv_actual_seq: torch.Tensor | None = None,
     config: DsaOffloadConfig | None = None,
-) -> object | None:
+) -> None:
     config = config or DsaOffloadConfig()
     if full_kv_block_table is None:
         raise ValueError("full_kv_block_table is required for layerwise Host KV offload")
+    full_kv_cache = _normalize_dsa_full_cache(
+        "full_kv_cache", full_kv_cache, block_size=config.selection_block_size
+    )
+    full_k_rope = _normalize_dsa_full_cache(
+        "full_k_rope", full_k_rope, block_size=config.selection_block_size
+    )
     validate_full_kv_block_table(
         full_kv_block_table,
         full_kv_cache=full_kv_cache,
@@ -211,28 +253,22 @@ def dsa_serve(
         block_size=config.selection_block_size,
     )
     op = _custom_op("dsa_serve")
-    try:
-        # PA-aware recipes schema: the table is carried with the full cache,
-        # before resident pool and selection output tensors.
-        op(
-            plan,
-            full_kv_cache,
-            full_k_rope,
-            full_kv_block_table,
-            pool_kv_cache,
-            pool_k_rope,
-            selection_kv_cache,
-            selection_k_rope,
-            raw_seq=config.raw_seq,
-            topk=config.topk,
-            selection_block_size=config.selection_block_size,
-            compact_layout=config.compact_layout,
-        )
-    except TypeError as error:
-        raise RuntimeError(
-            "Installed dsa_serve does not expose the PA full_kv_block_table input; "
-            "rebuild recipes DSA ops with the PA schema before enabling Host KV offload"
-        ) from error
+    # Recipes' PA form appends the physical block table after the selection
+    # outputs. Keep it keyworded so future optional inputs cannot shift it.
+    op(
+        plan,
+        full_kv_cache,
+        full_k_rope,
+        pool_kv_cache,
+        pool_k_rope,
+        selection_kv_cache,
+        selection_k_rope,
+        full_kv_block_table=full_kv_block_table,
+        raw_seq=config.raw_seq,
+        topk=config.topk,
+        selection_block_size=config.selection_block_size,
+        compact_layout=config.compact_layout,
+    )
     npu = getattr(torch, "npu", None)
     event_cls = getattr(npu, "Event", None) if npu is not None else None
     if event_cls is None:
@@ -255,7 +291,7 @@ def dsa_install(
     *,
     config: DsaOffloadConfig | None = None,
     metadata_update: int = 1,
-) -> object | None:
+) -> None:
     config = config or DsaOffloadConfig()
     _require_tensor("selection_kv_block_table", selection_kv_block_table, dtype=torch.int32)
     if selection_kv_block_table.ndim != 2:
@@ -277,10 +313,4 @@ def dsa_install(
         selection_block_size=config.selection_block_size,
         metadata_update=metadata_update,
     )
-    npu = getattr(torch, "npu", None)
-    event_cls = getattr(npu, "Event", None) if npu is not None else None
-    if event_cls is None:
-        return None
-    event = event_cls()
-    event.record()
-    return event
+    return None

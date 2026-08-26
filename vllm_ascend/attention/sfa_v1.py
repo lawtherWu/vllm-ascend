@@ -1437,7 +1437,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             cache_layout,
             kv_cache,
         )
-        workspace, plan_state, _ = runtime.serve_layer(
+        workspace, plan_state = runtime.serve_layer(
             layer_id,
             full_kv_cache,
             full_k_rope,

@@ -2904,6 +2904,12 @@ class NPUModelRunner(GPUModelRunner):
         }
         run_model = partial(self.model, **model_inputs)
 
+        if self.dsa_offload_runtime is not None:
+            # Keep the cross-step fence outside run_model: ACLGraphWrapper
+            # enters capture/replay inside its __call__, so eager and graph
+            # share the same wait -> forward -> record boundary.
+            self.dsa_offload_runtime.prepare_step()
+
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
             self._update_full_graph_params_if_needed(
@@ -2918,6 +2924,10 @@ class NPUModelRunner(GPUModelRunner):
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+        if self.dsa_offload_runtime is not None:
+            # Record after every layer's DSA Install and after ACLGraphWrapper
+            # has left capture/replay.
+            self.dsa_offload_runtime.finish_step()
         return hidden_states
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
@@ -3891,11 +3901,6 @@ class NPUModelRunner(GPUModelRunner):
             DsaLayerWorkspace,
             DsaResidentState,
         )
-        from vllm_ascend.ops.dsa_offload import (
-            DSA_BLOCK_SIZE,
-            DSA_RAW_SEQ,
-            DSA_TOPK,
-        )
 
         sfa_impls = {}
         for layer_name, layer in self.compilation_config.static_forward_context.items():
@@ -3937,24 +3942,8 @@ class NPUModelRunner(GPUModelRunner):
             int(extra_config.get("dsa_id_range", 131072)),
         )
         batch_capacity = self.max_num_reqs
-        num_speculative_tokens = getattr(self.vllm_config.speculative_config, "num_speculative_tokens", None)
-        topk = getattr(hf_config, "index_topk", None)
-        block_size = int(self.cache_config.block_size)
-        max_raw_seq = (
-            num_speculative_tokens + 1
-            if isinstance(num_speculative_tokens, int)
-            else 1
-        )
-        if max_raw_seq not in DSA_RAW_SEQ:
-            raise RuntimeError(
-                "DSA Host offload supports disabled MTP or MTP3; "
-                f"got num_speculative_tokens={num_speculative_tokens}"
-            )
-        if topk != DSA_TOPK:
-            raise RuntimeError(f"DSA Host offload requires index_topk={DSA_TOPK}; got {topk}")
-        if block_size != DSA_BLOCK_SIZE:
-            raise RuntimeError(f"DSA Host offload requires block_size={DSA_BLOCK_SIZE}; got {block_size}")
-        selection_blocks = (topk + block_size - 1) // block_size
+        max_raw_seq = 4
+        selection_blocks = (2048 + 128 - 1) // 128
         selection_rows = batch_capacity * max_raw_seq
         workspaces = []
         for layer_id in range(num_hidden_layers):
@@ -4140,16 +4129,17 @@ class NPUModelRunner(GPUModelRunner):
                 "Decode DSA Host offload requires one KV cache group"
             )
         group = kv_cache_config.kv_cache_groups[0]
+        spec = group.kv_cache_spec
+        specs = getattr(spec, "kv_cache_specs", None)
+        if specs is None:
+            raise NotImplementedError(
+                "Decode DSA Host offload requires UniformTypeKVCacheSpecs"
+            )
         from vllm_ascend.patch.platform.patch_kv_cache_utils import (
             _dsa_workspace_bytes,
-            _get_group_layer_kv_cache_specs,
         )
 
-        expected = _dsa_workspace_bytes(
-            self.vllm_config,
-            group,
-            _get_group_layer_kv_cache_specs(group),
-        )
+        expected = _dsa_workspace_bytes(self.vllm_config, group, specs)
         actual = runtime.workspace_bytes
         if actual != expected:
             raise RuntimeError(

@@ -22,16 +22,13 @@ from vllm_ascend.attention.cache_layout import (
     CacheComponentRole,
     build_mla_layer_cache_descriptor,
 )
-from vllm_ascend.ops.dsa_offload import (
-    DSA_BLOCK_SIZE,
-    DSA_RAW_SEQ,
-    DSA_TOPK,
-)
-from vllm_ascend.utils import vllm_version_is
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_config_from_groups = (
     vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+)
+_orig_max_memory_usage_bytes_from_groups = (
+    vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
 )
 
 
@@ -101,18 +98,11 @@ def _get_group_layer_kv_cache_specs(
     )
 
 
-def _get_layerwise_prefill_kv_cache_config(
+def _get_layerwise_prefill_cache_layout(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
-    available_memory: int,
-) -> KVCacheConfig:
-    """Plan one shared Main/Indexer bundle plus ordinary MTP caches.
-
-    The scheduler still owns the full logical block table.  ``shared_by`` only
-    aliases the physical tensor used by compatible base-model layers, so HBM
-    capacity is independent of their count.  Draft layers remain ordinary
-    per-layer PA caches and are included in the per-block denominator.
-    """
+) -> tuple[list[str], int, dict[str, int], dict[str, KVCacheSpec]]:
+    """Resolve the physical Prefill cache layout shared by all planners."""
 
     if len(kv_cache_groups) != 1:
         raise NotImplementedError(
@@ -120,7 +110,12 @@ def _get_layerwise_prefill_kv_cache_config(
             "GLM cache group"
         )
     group = kv_cache_groups[0]
-    per_layer_specs = _get_group_layer_kv_cache_specs(group)
+    if not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+        raise NotImplementedError(
+            "Layerwise Host Offload Prefill requires UniformTypeKVCacheSpecs"
+        )
+
+    per_layer_specs = group.kv_cache_spec.kv_cache_specs
     workspace_layers: list[str] = []
     mtp_layers: list[str] = []
     for layer_name in group.layer_names:
@@ -145,6 +140,73 @@ def _get_layerwise_prefill_kv_cache_config(
         layer_name: per_layer_specs[layer_name].page_size_bytes
         for layer_name in mtp_layers
     }
+    return (
+        workspace_layers,
+        workspace_page_size,
+        mtp_page_sizes,
+        per_layer_specs,
+    )
+
+
+def _get_layerwise_prefill_max_memory_usage_bytes(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    """Return HBM needed for one maximum-length layerwise request."""
+
+    (
+        _workspace_layers,
+        workspace_page_size,
+        mtp_page_sizes,
+        per_layer_specs,
+    ) = _get_layerwise_prefill_cache_layout(vllm_config, kv_cache_groups)
+    num_blocks = max(
+        cdiv(
+            spec.max_memory_usage_bytes(vllm_config),
+            spec.page_size_bytes,
+        )
+        for spec in per_layer_specs.values()
+    )
+    bytes_per_block = workspace_page_size + sum(mtp_page_sizes.values())
+    return num_blocks * bytes_per_block
+
+
+def _ascend_max_memory_usage_bytes_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    # Keep the role precedence aligned with the config builder below: kv_both
+    # currently selects the Decode planner, so it must not use Prefill's HBM
+    # admission formula.
+    if (
+        not is_layerwise_host_offload_decode(vllm_config)
+        and is_layerwise_host_offload_prefill(vllm_config)
+    ):
+        return _get_layerwise_prefill_max_memory_usage_bytes(
+            vllm_config, kv_cache_groups
+        )
+    return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
+
+
+def _get_layerwise_prefill_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    """Plan one shared Main/Indexer bundle plus ordinary MTP caches.
+
+    The scheduler still owns the full logical block table.  ``shared_by`` only
+    aliases the physical tensor used by compatible base-model layers, so HBM
+    capacity is independent of their count.  Draft layers remain ordinary
+    per-layer PA caches and are included in the per-block denominator.
+    """
+
+    (
+        workspace_layers,
+        workspace_page_size,
+        mtp_page_sizes,
+        _per_layer_specs,
+    ) = _get_layerwise_prefill_cache_layout(vllm_config, kv_cache_groups)
     bytes_per_block = workspace_page_size + sum(mtp_page_sizes.values())
     if bytes_per_block <= 0:
         raise ValueError("Layerwise Host Offload Prefill has an invalid page budget")
@@ -167,7 +229,7 @@ def _get_layerwise_prefill_kv_cache_config(
             size=mtp_page_sizes[layer_name] * num_blocks,
             shared_by=[layer_name],
         )
-        for layer_name in mtp_layers
+        for layer_name in mtp_page_sizes
     )
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -214,7 +276,7 @@ def _dsa_group_count(vllm_config: VllmConfig, num_hidden_layers: int) -> int:
 def _dsa_workspace_bytes(
     vllm_config: VllmConfig,
     group: KVCacheGroupSpec,
-    specs: dict[str, KVCacheSpec],
+    specs: dict[str, MLAAttentionSpec],
 ) -> int:
     """Return the fixed Decode DSA workspace reservation."""
     extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
@@ -232,22 +294,7 @@ def _dsa_workspace_bytes(
     if num_hidden_layers <= 0:
         raise ValueError("DSA workspace accounting requires num_hidden_layers")
     metadata_groups = _dsa_group_count(vllm_config, num_hidden_layers)
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
-    raw_seq = num_speculative_tokens + 1 if isinstance(num_speculative_tokens, int) else 1
-    if raw_seq not in DSA_RAW_SEQ:
-        raise ValueError(
-            "DSA workspace accounting supports disabled MTP or the "
-            "first-release MTP3 shape; "
-            f"got raw_seq={raw_seq}"
-        )
-    topk = getattr(hf_config, "index_topk", None)
-    if topk != DSA_TOPK:
-        raise ValueError(f"DSA workspace accounting requires index_topk={DSA_TOPK}; got {topk}")
-    topk = int(topk)
-    block_size = int(group.kv_cache_spec.block_size)
-    if block_size != DSA_BLOCK_SIZE:
-        raise ValueError(f"DSA workspace accounting requires block_size={DSA_BLOCK_SIZE}; got {block_size}")
+    raw_seq, topk, block_size = 4, 2048, 128
     if pool_size <= 0 or pool_size > 16384 or pool_size % 16 != 0:
         raise ValueError("dsa_pool_size must be in (0, 16384] and divisible by 16")
     selection_rows = batch_capacity * raw_seq
@@ -316,13 +363,15 @@ def _get_layerwise_decode_kv_cache_config(
             "Decode Layerwise Host offload requires exactly one KV cache group; "
             "hybrid groups are not supported in the first release"
         )
+    if not isinstance(kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs):
+        raise NotImplementedError("Decode Layerwise Host offload requires UniformTypeKVCacheSpecs")
     group = kv_cache_groups[0]
     if group.kv_cache_spec.block_size != 128:
         raise NotImplementedError(
             "Decode Layerwise Host offload requires block_size=128 for the "
             "recipes DsaServe PA block table"
         )
-    specs = _get_group_layer_kv_cache_specs(group)
+    specs = group.kv_cache_spec.kv_cache_specs
     hbm_bytes_per_block = 0
     for layer_name in group.layer_names:
         spec = specs[layer_name]
@@ -361,36 +410,16 @@ def _get_layerwise_decode_kv_cache_config(
     if hbm_bytes_per_block <= 0:
         raise ValueError("Decode Layerwise Host offload has no device Indexer cache")
     dsa_bytes = _dsa_workspace_bytes(vllm_config, group, specs)
-    # vLLM deliberately passes available_memory=0 while creating the minimal
-    # KV cache used by CUDA/ACL graph profiling. In that call path
-    # num_gpu_blocks_override is temporarily set to min_blocks, so zero is a
-    # profiling sentinel rather than the real HBM budget. Do not subtract the
-    # fixed DSA reservation from it or reject the request as an actual OOM.
-    is_minimal_profile = (
-        available_memory == 0
-        and vllm_config.cache_config.num_gpu_blocks_override is not None
-    )
-    if is_minimal_profile:
-        effective_memory = 0
-        num_blocks = may_override_num_blocks(vllm_config, 0)
-        if num_blocks <= 0:
-            raise ValueError(
-                "Minimal KV cache profiling requires a positive "
-                "num_gpu_blocks_override"
-            )
-    else:
-        effective_memory = available_memory - dsa_bytes
-        if effective_memory <= 0:
-            raise MemoryError(
-                "Decode Layerwise Host offload cannot reserve fixed DSA workspace "
-                f"({dsa_bytes} bytes) from {available_memory} bytes"
-            )
-        num_blocks = may_override_num_blocks(
-            vllm_config, effective_memory // hbm_bytes_per_block
+    effective_memory = available_memory - dsa_bytes
+    if effective_memory <= 0:
+        raise MemoryError(
+            "Decode Layerwise Host offload cannot reserve fixed DSA workspace "
+            f"({dsa_bytes} bytes) from {available_memory} bytes"
         )
+    num_blocks = may_override_num_blocks(vllm_config, effective_memory // hbm_bytes_per_block)
     if num_blocks <= 0:
         raise ValueError("No KV cache block fits Decode Indexer-only HBM budget")
-    if not is_minimal_profile and num_blocks * hbm_bytes_per_block > effective_memory:
+    if num_blocks * hbm_bytes_per_block > effective_memory:
         raise MemoryError(
             "Configured KV cache block override exceeds Decode HBM budget after "
             f"DSA workspace reservation ({dsa_bytes} bytes)"
@@ -672,6 +701,9 @@ def _get_kv_cache_config_deepseek_v4(
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = (
     _ascend_get_kv_cache_config_from_groups
+)
+vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = (
+    _ascend_max_memory_usage_bytes_from_groups
 )
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
