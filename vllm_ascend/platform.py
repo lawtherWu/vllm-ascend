@@ -44,11 +44,9 @@ from vllm_ascend.utils import (
     AscendDeviceType,
     bootstrap_custom_op_env,
     check_kv_extra_config,
-    enable_sfa_dcp_replicated_indexer,
     flashcomm2_enable,
     get_ascend_device_type,
     is_moe_model,
-    model_uses_sfa_sparse,
     refresh_block_size,
     update_cudagraph_capture_sizes,
     is_310p,
@@ -548,7 +546,6 @@ class NPUPlatform(Platform):
         # is supported by vllm-ascend.
         if (
             vllm_config.parallel_config.tensor_parallel_size > 1
-            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and not vllm_config.model_config.enforce_eager
             and enable_sp(vllm_config)
         ):
@@ -680,24 +677,66 @@ class NPUPlatform(Platform):
         if ascend_config.recompute_scheduler_enable:
             kv_transfer_config = vllm_config.kv_transfer_config
             kv_role = getattr(kv_transfer_config, "kv_role", None)
-            if kv_role == "kv_producer":
-                logger.warning(
-                    "recompute_scheduler_enable is ignored on PD-disaggregated P nodes "
-                    "(kv_role='kv_producer') and will be deprecated on P nodes in a future release. "
-                    "Please remove it from P-node configs and keep it only on PD-disaggregated D nodes "
-                    "(kv_role='kv_consumer')."
-                )
-                ascend_config.recompute_scheduler_enable = False
-            elif kv_transfer_config is None or kv_role != "kv_consumer":
+            if kv_transfer_config is None or kv_role != "kv_consumer":
                 raise ValueError(
                     "recompute_scheduler_enable can only be enabled on PD-disaggregated D nodes "
                     f"(kv_role='kv_consumer', but got kv_role={kv_role!r}), and is not supported in PD-mixed mode."
                 )
-            else:
-                from vllm_ascend.core.recompute_scheduler import RecomputeSchedulerConfig
 
-                recompute_scheduler_config = RecomputeSchedulerConfig.initialize_from_config(vllm_config)
-                vllm_config.scheduler_config = recompute_scheduler_config
+            from vllm_ascend.core.recompute_scheduler import RecomputeSchedulerConfig
+
+            recompute_scheduler_config = RecomputeSchedulerConfig.initialize_from_config(vllm_config)
+            vllm_config.scheduler_config = recompute_scheduler_config
+
+        # Prefill layerwise offload must align every non-final prompt chunk
+        # before KVCacheManager allocates blocks. The scheduler adaptation is
+        # intentionally limited to the producer side; Decode keeps its
+        # AsyncRecomputeScheduler and does not apply Store granularity.
+        kv_transfer_config = vllm_config.kv_transfer_config
+        kv_role = getattr(kv_transfer_config, "kv_role", None)
+        kv_extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+        layerwise_host_offload = bool(kv_extra.get("layerwise_host_kv_offload", False))
+        if layerwise_host_offload:
+            if kv_role not in {"kv_producer", "kv_consumer"}:
+                raise ValueError(
+                    "layerwise_host_kv_offload requires a PD-disaggregated "
+                    "kv_role ('kv_producer' or 'kv_consumer')"
+                )
+            if cache_config.block_size != 128:
+                raise ValueError(
+                    "layerwise_host_kv_offload currently requires block-size=128 "
+                    f"(got {cache_config.block_size})"
+                )
+            if kv_role == "kv_producer":
+                if ascend_config.enable_balance_scheduling:
+                    raise ValueError(
+                        "layerwise Host KV offload Prefill is incompatible with "
+                        "balance scheduling"
+                    )
+                if cache_config.enable_prefix_caching:
+                    raise ValueError(
+                        "layerwise Host KV offload Prefill requires local prefix "
+                        "caching to be disabled; Store owns prefix reuse"
+                    )
+                if ascend_config.SLO_limits_for_dynamic_batch != -1:
+                    raise ValueError(
+                        "layerwise Host KV offload Prefill is incompatible with "
+                        "dynamic-batch scheduling in the first implementation"
+                    )
+                if ascend_config.profiling_chunk_config.enabled:
+                    raise ValueError(
+                        "layerwise Host KV offload Prefill is incompatible with "
+                        "profiling chunk scheduling in the first implementation"
+                    )
+                from vllm_ascend.patch.platform.patch_layerwise_offload_scheduler import (
+                    apply_layerwise_offload_scheduler_patch,
+                )
+
+                apply_layerwise_offload_scheduler_patch()
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.patch.platform.patch_layerwise_offload_scheduler."
+                    "LayerwiseOffloadAsyncScheduler"
+                )
 
         # Extend original scheduler_config to use SchedulerDynamicBatch.
         if ascend_config.SLO_limits_for_dynamic_batch != -1:
@@ -715,21 +754,6 @@ class NPUPlatform(Platform):
             import vllm_ascend.patch.platform.patch_profiling_chunk  # noqa
 
         cp_size = parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
-        use_sparse = model_uses_sfa_sparse(model_config)
-        sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)
-        if sfa_dcp_replicated_indexer:
-            if parallel_config.decode_context_parallel_size != parallel_config.tensor_parallel_size:
-                raise AssertionError(
-                    f"DCP for SFA is only supported when dcp_size({parallel_config.decode_context_parallel_size}) "
-                    f"== tp_size({parallel_config.tensor_parallel_size})."
-                )
-            enable_sparse_c8 = (ascend_config.enable_sparse_sfa_c8 or ascend_config.enable_sparse_li_c8) and use_sparse
-            if enable_sparse_c8 and get_ascend_device_type() == AscendDeviceType.A5:
-                raise NotImplementedError(
-                    "SFA DCP with sparse C8 cache is not supported on A5 yet. "
-                    "A5 uses the fused CKV quant sparse attention path, which needs a separate DCP LSE merge."
-                )
-
         if (
             vllm_config.kv_transfer_config is not None
             and cache_config.block_size != parallel_config.cp_kv_cache_interleave_size
@@ -741,9 +765,14 @@ class NPUPlatform(Platform):
                 "needs to be equal if use pcp or dcp > 1 in P/D disaggregate and kv pool scenario."
             )
 
+        use_sparse = (
+            model_config is not None
+            and model_config.hf_text_config is not None
+            and hasattr(model_config.hf_text_config, "index_topk")
+        )
         if use_sparse and cp_size > 1 and parallel_config.cp_kv_cache_interleave_size != cache_config.block_size:
             logger.warning_once(
-                "The current SFA CP implementation requires "
+                "The current SFA's PCP&DCP implementation requires"
                 f"cp_kv_cache_interleave_size({parallel_config.cp_kv_cache_interleave_size})"
                 f" == block_size({cache_config.block_size}). "
                 f"Override cp_kv_cache_interleave_size to {cache_config.block_size}."
