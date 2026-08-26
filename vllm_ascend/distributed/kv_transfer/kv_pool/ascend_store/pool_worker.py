@@ -28,6 +28,8 @@ from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.attention.cache_layout import stable_model_fingerprint
 
+from vllm_ascend.attention.cache_layout import stable_model_fingerprint
+
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     AscendStoreKVConnectorWorkerMetadata,
@@ -41,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     get_cache_family_granularity,
     infer_group_cache_families,
     build_layerwise_store_key,
+    resolve_hybrid_cache_c128_config,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_session import (
     ChunkStoreSession,
@@ -121,7 +124,6 @@ class KVPoolWorker:
         parallel_config = vllm_config.parallel_config
         self.kv_cache_config = kv_cache_config
         self.model_config = model_config
-        self.num_hidden_layers = getattr(model_config.hf_text_config, "num_hidden_layers", None)
         hf_text_config = getattr(model_config, "hf_text_config", None)
         hf_config = getattr(model_config, "hf_config", hf_text_config)
         self.hf_config = hf_text_config or hf_config
@@ -451,15 +453,15 @@ class KVPoolWorker:
         return (value + alignment - 1) // alignment * alignment
 
     def _is_mtp_layer_name(self, layer_name: str) -> bool:
-        lowered = layer_name.lower()
-        if "mtp" in lowered or "draft" in lowered:
-            return True
-        if self.num_hidden_layers is None:
-            return False
-        try:
-            return extract_layer_index(layer_name) >= self.num_hidden_layers
-        except (IndexError, ValueError):
-            return False
+        from vllm_ascend.attention.offload_capability import is_speculative_cache_layer
+        from vllm_ascend.ops.dsa_offload import get_dsa_config_value
+
+        return is_speculative_cache_layer(
+            layer_name,
+            num_hidden_layers=get_dsa_config_value(
+                self.model_config, "num_hidden_layers"
+            ),
+        )
 
     def _range_group_layer_names(self, group_id: int) -> list[str]:
         if self.kv_cache_config is None or group_id >= len(self.kv_cache_config.kv_cache_groups):

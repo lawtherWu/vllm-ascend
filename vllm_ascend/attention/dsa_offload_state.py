@@ -66,15 +66,7 @@ class DsaResidentState:
 
         events = tuple(self._last_install_events)
         for event in events:
-            wait = getattr(event, "wait", None)
-            if callable(wait):
-                wait()
-                continue
-            synchronize = getattr(event, "synchronize", None)
-            if callable(synchronize):
-                synchronize()
-                continue
-            raise TypeError("DSA install event must provide wait() or synchronize()")
+            event.wait()
         # A successful wait consumes the events. prepare_step can be called
         # again by the eager Plan path without emitting a duplicate wait.
         with self._lock:

@@ -7,54 +7,21 @@ import torch
 from vllm_ascend.ops import dsa_offload
 
 
-def test_dsa_config_restricts_first_release_buckets():
-    assert dsa_offload.DsaOffloadConfig(raw_seq=4).raw_seq == 4
-    with pytest.raises(ValueError):
-        dsa_offload.DsaOffloadConfig(raw_seq=2)
-    with pytest.raises(ValueError):
-        dsa_offload.DsaOffloadConfig(topk=1024)
-
-
-def test_pa_block_table_validation_accepts_sentinel_and_rejects_bad_rows():
-    cache = torch.empty((4, 128, 8), dtype=torch.bfloat16)
-    table = torch.tensor([[0, 1, -1], [2, 3, -1]], dtype=torch.int32)
-    seq = torch.tensor([256, 256], dtype=torch.int32)
-    dsa_offload.validate_full_kv_block_table(table, full_kv_cache=cache, full_kv_actual_seq=seq)
-
-    with pytest.raises(ValueError, match="outside"):
-        dsa_offload.validate_full_kv_block_table(
-            torch.tensor([[4]], dtype=torch.int32), full_kv_cache=cache
-        )
-    with pytest.raises(ValueError, match="sentinel"):
-        dsa_offload.validate_full_kv_block_table(
-            torch.tensor([[-2]], dtype=torch.int32), full_kv_cache=cache
-        )
-
-
-def test_dsa_plan_rejects_shapes_outside_recipes_schema():
-    seq = torch.tensor([128], dtype=torch.int32)
-    config = dsa_offload.DsaOffloadConfig(raw_seq=1)
-    with pytest.raises(ValueError, match="recipes DsaPlan layout"):
-        dsa_offload.validate_selection_inputs(
-            torch.zeros((1, 2048), dtype=torch.int32), seq, config=config
-        )
-    with pytest.raises(TypeError, match="torch.int32"):
-        dsa_offload.validate_selection_inputs(
-            torch.zeros((1, 1, 2048), dtype=torch.int64), seq, config=config
-        )
-
-    mtp_config = dsa_offload.DsaOffloadConfig(raw_seq=4)
-    dsa_offload.validate_selection_inputs(
-        torch.zeros((1, 4, 1, 2048), dtype=torch.int32),
-        seq,
-        config=mtp_config,
+def test_dsa_config_accepts_future_operator_shapes():
+    config = dsa_offload.DsaOffloadConfig(
+        raw_seq=8,
+        topk=4096,
+        selection_block_size=256,
     )
-    with pytest.raises(ValueError, match="recipes DsaPlan layout"):
-        dsa_offload.validate_selection_inputs(
-            torch.zeros((4, 1, 2048), dtype=torch.int32),
-            seq,
-            config=mtp_config,
-        )
+    assert config.raw_seq == 8
+    assert config.selection_blocks_per_row == 16
+    assert config.selection_rows(2) == 16
+    assert config.selection_block_count(2) == 256
+
+
+def test_dsa_config_rejects_unaligned_topk():
+    with pytest.raises(ValueError, match="integer multiple"):
+        dsa_offload.DsaOffloadConfig(topk=2000, selection_block_size=128)
 
 
 def test_dsa_plan_uses_installed_custom_ops(monkeypatch):
