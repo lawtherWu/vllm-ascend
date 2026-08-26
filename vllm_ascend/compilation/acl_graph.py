@@ -300,6 +300,14 @@ class GraphParams:
 _graph_params: GraphParams | None = None
 
 
+def reset_graph_params():
+    """Clear graph parameter state after ACL graph profiling."""
+    global _graph_params, _draft_graph_params, _draft_graph_prefill_params
+    _graph_params = None
+    _draft_graph_params = None
+    _draft_graph_prefill_params = None
+
+
 def set_graph_params(aclgraph_capture_sizes: list[int]):
     global _graph_params
     if _graph_params is not None:
