@@ -134,6 +134,18 @@ def get_dsv4_compress_ratio(config: Any, layer_idx: int) -> int:
     return compress_ratios[layer_idx]
 
 
+def model_uses_sfa_sparse(model_config: Any | None) -> bool:
+    """Return whether a model config uses the traditional SFA sparse path."""
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    return (
+        hf_text_config is not None
+        and hasattr(hf_text_config, "index_topk")
+        and not hasattr(hf_text_config, "compress_ratios")
+        and not hasattr(hf_config, "compress_ratios")
+    )
+
+
 def clear_enable_sp():
     global _ENABLE_SP
     _ENABLE_SP = None
