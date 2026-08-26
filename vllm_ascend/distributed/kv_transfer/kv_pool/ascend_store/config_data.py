@@ -1159,6 +1159,10 @@ class ReqMeta:
     skip_null_blocks_by_group: list[bool] | None = None
     disable_tp_key_sharding: bool = False
     num_prompt_tokens: int | None = None
+    # Complete Store-backed prefix produced by earlier Prefill scheduler
+    # steps. Unlike ``load_spec``, this is local Chunk Prefill history rather
+    # than an external prefix-cache hit.
+    history_token_len: int = 0
     # Stable request/chunk identity used by the layerwise Store lease.
     request_generation: int = 0
     chunk_id: int = 0
@@ -1189,6 +1193,7 @@ class ReqMeta:
         original_block_size: list[int] | int | None = None,
         block_ids: list[int] | list[list[int]] | None = None,
         event_id: int | None = None,
+        history_token_len: int = 0,
         request_generation: int = 0,
         chunk_id: int = 0,
     ) -> None:
@@ -1210,6 +1215,10 @@ class ReqMeta:
         self.token_ids = token_ids
         self.original_block_size = original_block_size
         self.event_id = event_id
+        self.history_token_len = history_token_len
+
+        self.request_generation = request_generation
+        self.chunk_id = chunk_id
 
         self.request_generation = request_generation
         self.chunk_id = chunk_id
@@ -1232,11 +1241,13 @@ class ReqMeta:
         discard_partial_chunks: bool = True,
         original_block_size: list[int] | int | None = None,
         kv_cache_group_families: list[str] | None = None,
+        retain_history_metadata: bool = False,
     ) -> ReqMeta | None:
         """Create the request metadata from a request tracker."""
         if block_hashes is None:
             block_hashes = []
         input_token_len = tracker.token_len
+        history_token_len = tracker.num_saved_tokens
 
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
@@ -1253,7 +1264,11 @@ class ReqMeta:
         )
 
         skip_save = skip_save or num_tokens_to_save < chunk_boundary
-        if skip_save and load_spec is None:
+        if (
+            skip_save
+            and load_spec is None
+            and not (retain_history_metadata and history_token_len > 0)
+        ):
             return None
 
         if not skip_save:
@@ -1280,8 +1295,9 @@ class ReqMeta:
             load_spec=load_spec,
             block_hashes=block_hashes,
             is_last_chunk=is_last_chunk,
+            history_token_len=history_token_len,
             request_generation=0,
-            chunk_id=num_tokens_to_save // max(cache_transfer_granularity, 1),
+            chunk_id=cdiv(input_token_len, max(cache_transfer_granularity, 1)),
             token_ids=token_ids,
             num_prompt_tokens=tracker.num_prompt_tokens or input_token_len,
             original_block_size=original_block_size,

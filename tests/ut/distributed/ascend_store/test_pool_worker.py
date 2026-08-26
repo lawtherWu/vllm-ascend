@@ -185,6 +185,64 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.cache_coordinator.find_longest_cache_hit.assert_called_once()
         self.assertFalse(worker.cache_coordinator.find_longest_cache_hit.call_args.kwargs["apply_eagle"])
 
+    def test_range_save_shards_replicated_kv_heads_across_tp(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.dcp_size = 1
+        worker.tp_rank = 2
+        worker.put_step = 8
+        worker.group_uses_align_state = [False]
+        request = ReqMeta("request", 128)
+        records = list(range(16))
+
+        selected = worker._shard_range_save_records(request, 0, records)
+
+        self.assertEqual(selected, [2, 10])
+
+    def test_range_save_respects_disable_tp_key_sharding(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.dcp_size = 1
+        worker.tp_rank = 2
+        worker.put_step = 8
+        worker.group_uses_align_state = [False]
+        request = ReqMeta("request", 128, disable_tp_key_sharding=True)
+        records = list(range(4))
+
+        selected = worker._shard_range_save_records(request, 0, records)
+
+        self.assertEqual(selected, records)
+
+    def test_range_chunk_history_requires_all_store_objects(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker._normalize_range_request_identity = MagicMock()
+        worker.group_uses_align_state = [False]
+        record = MagicMock()
+        record.key = "missing-key"
+        worker._range_records = MagicMock(return_value=[record])
+        worker._get_range_lease = MagicMock()
+        worker.m_store = MagicMock()
+        worker.m_store.exists.return_value = [0]
+        worker._range_read_plans = {}
+        request = ReqMeta(
+            "request",
+            128,
+            block_ids=[0],
+            kv_cache_group_ids=[0],
+        )
+
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_session import (
+            StoreCommitError,
+        )
+
+        with self.assertRaises(StoreCommitError):
+            worker._start_load_range_request(
+                request,
+                128,
+                require_all=True,
+            )
+
 
 class TestKVPoolWorkerInit(unittest.TestCase):
     """Test KVPoolWorker initialization with mocked dependencies."""
@@ -806,8 +864,38 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.start_load_kv(meta)
         # No get called since no load_spec
 
-    @patch.object(torch, "npu", create=True)
-    def test_wait_for_save(self, mock_npu):
+    def test_start_load_kv_prepares_layerwise_chunk_history(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            KVPoolWorker,
+        )
+
+        worker = object.__new__(KVPoolWorker)
+        worker.use_layerwise_range = True
+        worker.current_layer = 0
+        worker.layerwise_retrievers = []
+        worker._range_load_layers_seen = set()
+        worker._start_load_range_request = MagicMock()
+
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=8192,
+            history_token_len=4096,
+            block_ids=[0],
+            block_hashes=["h0"],
+            load_spec=None,
+        )
+        meta = AscendConnectorMetadata(set(), set())
+        meta.add_request(req)
+
+        worker.start_load_kv(meta)
+
+        worker._start_load_range_request.assert_called_once_with(
+            req,
+            4096,
+            require_all=True,
+        )
+
+    def test_wait_for_save(self):
         worker = self._make_worker()
         worker.kv_send_thread = MagicMock()
 
@@ -891,6 +979,32 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.m_store.exists.return_value = [1, 1, 1, 1]
         result = worker.lookup_scheduler(32, ["h0", "h1"], use_layerwise=True)
         self.assertEqual(result, 32)
+
+    def test_lookup_scheduler_layerwise_range_uses_cross_layer_keys(self):
+        worker = self._make_worker()
+        worker.use_layerwise_range = True
+        worker._range_layout_fingerprint = "test-fingerprint"
+        expected_keys = [
+            worker._range_key(key, 0)
+            for _, _, key in worker.token_database.process_tokens(
+                32,
+                ["h0", "h1"],
+                kv_cache_group_id=0,
+            )
+        ]
+        worker.m_store.exists.return_value = [1, 1]
+
+        result = worker.lookup_scheduler(
+            32,
+            ["h0", "h1"],
+            use_layerwise=True,
+            use_layerwise_range=True,
+        )
+
+        self.assertEqual(result, 32)
+        queried_keys = worker.m_store.exists.call_args.args[0]
+        self.assertEqual(queried_keys, expected_keys)
+        self.assertTrue(all("@layer_id:" not in key for key in queried_keys))
 
     def test_lookup_scheduler_multi_tp(self):
         self._stop_all()

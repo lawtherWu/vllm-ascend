@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
-
 import torch
-from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_ascend.attention import dsa_offload_runtime
 from vllm_ascend.attention.dsa_offload_runtime import (
@@ -17,7 +14,6 @@ from vllm_ascend.attention.dsa_offload_state import (
     DsaResidentState,
 )
 from vllm_ascend.ops.dsa_offload import DsaOffloadConfig
-from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 
 def _workspace(layer_id: int, batch_capacity: int = 2) -> DsaLayerWorkspace:
@@ -138,7 +134,7 @@ def test_group_plan_serve_install_order_and_active_batch_slicing(monkeypatch):
     runtime.serve_layer(
         0, full_cache, full_rope, block_table, seq, config=config
     )
-    runtime.install_after_layer(0, config=config)
+    assert runtime.install_after_layer(0, config=config) == ()
     runtime.serve_layer(
         1, full_cache, full_rope, block_table, seq, config=config
     )
@@ -218,32 +214,11 @@ def test_row_replacement_without_move_clears_metadata():
         invalidated=[0],
         owners=[(0, "req-new", 1)],
     )
-    # This is also the full-graph replay path: row updates are submitted
-    # outside the model graph without opening the Python Plan state machine.
-    runtime.prepare_step()
-    runtime.prepare_step()
+    runtime.begin_step()
 
     assert torch.all(metadata.pool_ids[0] == -1)
     assert state.row_state(0, 0).owner is not None
     assert state.row_state(0, 0).owner.request_id == "req-new"
-
-
-def test_new_request_invalidates_empty_row_after_graph_warmup(monkeypatch):
-    notifications = []
-
-    def record_changes(moves, invalidated, owners):
-        notifications.append((moves, invalidated, owners))
-
-    batch = object.__new__(NPUInputBatch)
-    batch._req_ids = [None]
-    batch._dsa_request_generations = {}
-    batch._dsa_row_change_callback = record_changes
-    monkeypatch.setattr(InputBatch, "add_request", lambda self, request: 0)
-
-    request = SimpleNamespace(req_id="req-a")
-    assert batch.add_request(request) == 0
-
-    assert notifications == [([], [0], [(0, "req-a", 1)])]
 
 
 def test_group_builder_preserves_full_shared_ownership():

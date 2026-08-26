@@ -264,18 +264,15 @@ class NPUInputBatch(InputBatch):
             self._dsa_row_change_callback(moves or [], invalidated or [], owners or [])
 
     def add_request(self, request):
+        old_req_ids = list(self._req_ids)
         req_index = super().add_request(request)
         req_id = request.req_id
         generation = self._dsa_request_generations.get(req_id, 0) + 1
         self._dsa_request_generations[req_id] = generation
-        # Graph warmup/capture runs DSA Install with dummy inputs and can leave
-        # resident metadata in an otherwise empty InputBatch row. A new request
-        # generation must never inherit that state (or an earlier owner state),
-        # even when the scheduler sees the row as empty.
-        self._notify_dsa_row_change(
-            invalidated=[req_index],
-            owners=[(req_index, req_id, generation)],
-        )
+        invalidated = []
+        if req_index < len(old_req_ids) and old_req_ids[req_index] not in (None, req_id):
+            invalidated.append(req_index)
+        self._notify_dsa_row_change(invalidated=invalidated, owners=[(req_index, req_id, generation)])
         return req_index
 
     def remove_request(self, req_id: str) -> int | None:
