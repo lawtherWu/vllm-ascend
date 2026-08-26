@@ -137,6 +137,51 @@ def set_encoder_forward_context(
         _reset_encoder_forward_context()
 
 
+def maybe_compute_actual_seq_lengths(
+    cu_seqlens: torch.Tensor,
+    num_query_tokens: int,
+    num_kv_tokens: int,
+    *,
+    cudagraph_mm_encoder: bool = False,
+) -> tuple[list[int], list[int]]:
+    """Convert cumulative sequence lengths to FIA host sequence endpoints.
+
+    This compatibility helper is used by the eager and capture paths in
+    ``AscendMMEncoderAttention``. The replay-time encoder graph updater uses
+    the context-based private helper below because it may select different
+    sequence-length buffers per ViT layer.
+    """
+    flat = cu_seqlens.detach().cpu().view(-1).tolist()
+    actual = flat[1:] if flat else flat
+
+    if cudagraph_mm_encoder:
+        if num_query_tokens <= 0:
+            actual = [0]
+        else:
+            filtered: list[int] = []
+            for end in actual:
+                if end <= 0:
+                    continue
+                if end > num_query_tokens:
+                    break
+                if not filtered or end > filtered[-1]:
+                    filtered.append(end)
+            if not filtered or filtered[-1] != num_query_tokens:
+                filtered.append(num_query_tokens)
+            actual = filtered
+
+    if num_kv_tokens == num_query_tokens:
+        return actual, actual
+
+    if num_query_tokens <= 0 or num_kv_tokens % num_query_tokens != 0:
+        raise ValueError(
+            "num_kv_tokens must be an integer multiple of positive num_query_tokens "
+            f"(got num_kv_tokens={num_kv_tokens}, num_query_tokens={num_query_tokens})"
+        )
+    ratio = num_kv_tokens // num_query_tokens
+    return actual, [end * ratio for end in actual]
+
+
 # ---------------------------------------------------------------------------
 # Replay-time FIA task updates
 # ---------------------------------------------------------------------------
