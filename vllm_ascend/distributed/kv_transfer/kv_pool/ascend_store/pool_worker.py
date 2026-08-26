@@ -2081,6 +2081,12 @@ class KVPoolWorker:
                     block_hashes,
                     kv_cache_group_id=group_id,
                 ):
+                    # Unpack the transfer chunk before constructing the
+                    # canonical lookup key.  In range mode the key is rebuilt
+                    # from the chunk metadata; without this assignment the
+                    # NameError is swallowed below and every lookup appears
+                    # as a zero-token hit.
+                    start, end, key = chunk.raw_start, chunk.raw_end, chunk.key
                     if use_layerwise_range:
                         # Range mode stores one object per block containing
                         # every layer/component. Query the exact canonical key

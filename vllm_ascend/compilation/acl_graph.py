@@ -6,7 +6,7 @@ import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import torch
@@ -87,6 +87,11 @@ class ACLGraphWrapper:
     guaranteed when VLLM_LOGGING_LEVEL == "DEBUG".
     """
 
+    # vLLM's profiling and GPU ubatch wrapper code treats this as a drop-in
+    # CUDAGraphWrapper replacement and uses the registry to swap graph pools
+    # and clear captured graphs.
+    _all_instances: ClassVar[weakref.WeakSet["ACLGraphWrapper"]] = _acl_graph_wrappers
+
     def __init__(
         self,
         runnable: Callable,
@@ -114,12 +119,27 @@ class ACLGraphWrapper:
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
         self.aclgraph_options = cudagraph_options
+        self.cudagraph_options = cudagraph_options
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        self.concrete_cudagraph_entries = self.concrete_aclgraph_entries
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
         _acl_graph_wrappers.add(self)
+
+    @classmethod
+    def clear_all_graphs(cls) -> None:
+        """Clear captured graphs from all live Ascend graph wrappers."""
+        for instance in list(cls._all_instances):
+            instance.clear_graphs()
+
+    def clear_graphs(self) -> None:
+        self.concrete_aclgraph_entries.clear()
+
+    @property
+    def cudagraph_wrapper(self) -> "ACLGraphWrapper":
+        return self
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.

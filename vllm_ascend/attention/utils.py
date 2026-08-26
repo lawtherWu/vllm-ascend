@@ -262,6 +262,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # E.g., tensor([128, 256, 64]) for 3 requests with different seq lengths.
     seq_lens_cpu: torch.Tensor = None
 
+    # CPU copy of the per-token KV-cache slot mapping.  Ascend attention
+    # backends (notably SFA) use this copy for host-side cache bookkeeping;
+    # the upstream CommonAttentionMetadata only carries the device tensor.
+    slot_mapping_cpu: torch.Tensor = None
+
     # CPU tensor of already computed tokens count per request.
     # E.g., tensor([100, 200, 50]) means req0 has 100 tokens already computed.
     num_computed_tokens_cpu: torch.Tensor = None
@@ -314,6 +319,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
             slot_mapping=self.slot_mapping,
+            slot_mapping_cpu=self.slot_mapping_cpu,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,

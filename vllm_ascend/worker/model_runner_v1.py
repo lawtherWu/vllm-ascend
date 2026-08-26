@@ -373,7 +373,7 @@ class NPUModelRunner(GPUModelRunner):
             vllm_config.model_config.hf_text_config, "compress_ratios"
         )
         if self.use_sparse:
-            if get_ascend_device_type() == AscendDeviceType.A5 and self.ascend_config.enable_sparse_c8:
+            if get_ascend_device_type() == AscendDeviceType.A5 and self.ascend_config.enable_sparse_sfa_c8:
                 # A5 sparse C8: kv_lora and k_rope are merged into a single CKV FP8 tensor.
                 # qk_rope_head_dim = 0 signals the merged layout.
                 # ckv_dim = kv_lora_rank                    (fp8, 1 byte/elem)
@@ -397,7 +397,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.model_config.hf_text_config.index_head_dim,
                 )
         # dsa c8
-        self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
+        self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_li_c8
         if self.use_sparse_c8_indexer:
             if get_ascend_device_type() == AscendDeviceType.A5:
                 self.c8_k_cache_dtype = torch.float8_e4m3fn
@@ -5354,7 +5354,7 @@ class NPUModelRunner(GPUModelRunner):
                         sparse_head_dim=self.sparse_head_dim,
                         dtype=self.kv_cache_dtype,
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
-                        cache_sparse_c8=self.ascend_config.is_sparse_c8_layer(layer_name),
+                        cache_sparse_c8=self.ascend_config.is_sparse_li_c8_layer(layer_name),
                     )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if getattr(attn_module.impl, "fa_quant_layer", False):

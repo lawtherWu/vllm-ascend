@@ -790,7 +790,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.is_rope_neox_style = False
             self.use_torch_npu_lightning_indexer = True
 
-        self.use_sparse_c8_indexer = self.has_indexer and ascend_config.is_sparse_c8_layer(self.layer_name)
+        self.use_sparse_c8_indexer = self.has_indexer and ascend_config.is_sparse_li_c8_layer(self.layer_name)
         self.use_a5_sparse_c8_indexer = self.use_sparse_c8_indexer and (get_ascend_device_type() == AscendDeviceType.A5)
         if self.use_sparse_c8_indexer:
             if get_ascend_device_type() == AscendDeviceType.A5:
