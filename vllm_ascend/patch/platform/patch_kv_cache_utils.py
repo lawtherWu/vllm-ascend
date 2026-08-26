@@ -17,6 +17,15 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.attention.cache_layout import (
+    CacheComponentRole,
+    build_mla_layer_cache_descriptor,
+)
+from vllm_ascend.ops.dsa_offload import (
+    DSA_BLOCK_SIZE,
+    DSA_SPECULATIVE_RAW_SEQ,
+    DSA_TOPK,
+)
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.attention.cache_layout import (
     CacheComponentRole,
@@ -202,11 +211,25 @@ def _dsa_workspace_bytes(
     if num_hidden_layers <= 0:
         raise ValueError("DSA workspace accounting requires num_hidden_layers")
     metadata_groups = _dsa_group_count(vllm_config, num_hidden_layers)
-    raw_seq, topk, block_size = 4, 2048, 128
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
+    raw_seq = num_speculative_tokens + 1 if isinstance(num_speculative_tokens, int) else 0
+    if raw_seq != DSA_SPECULATIVE_RAW_SEQ:
+        raise ValueError(
+            "DSA workspace accounting requires the first-release MTP3 shape; "
+            f"got raw_seq={raw_seq}"
+        )
+    topk = getattr(hf_config, "index_topk", None)
+    if topk != DSA_TOPK:
+        raise ValueError(f"DSA workspace accounting requires index_topk={DSA_TOPK}; got {topk}")
+    topk = int(topk)
+    block_size = int(group.kv_cache_spec.block_size)
+    if block_size != DSA_BLOCK_SIZE:
+        raise ValueError(f"DSA workspace accounting requires block_size={DSA_BLOCK_SIZE}; got {block_size}")
     if pool_size <= 0 or pool_size > 16384 or pool_size % 16 != 0:
         raise ValueError("dsa_pool_size must be in (0, 16384] and divisible by 16")
     selection_rows = batch_capacity * raw_seq
-    selection_blocks = selection_rows * (topk // block_size)
+    selection_blocks = selection_rows * cdiv(topk, block_size)
     total = 0
     dsa_layers = [
         name
@@ -274,9 +297,9 @@ def _get_layerwise_decode_kv_cache_config(
     if not isinstance(kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs):
         raise NotImplementedError("Decode Layerwise Host offload requires UniformTypeKVCacheSpecs")
     group = kv_cache_groups[0]
-    if group.kv_cache_spec.block_size != 128:
+    if group.kv_cache_spec.block_size != DSA_BLOCK_SIZE:
         raise NotImplementedError(
-            "Decode Layerwise Host offload requires block_size=128 for the "
+            f"Decode Layerwise Host offload requires block_size={DSA_BLOCK_SIZE} for the "
             "recipes DsaServe PA block table"
         )
     specs = group.kv_cache_spec.kv_cache_specs

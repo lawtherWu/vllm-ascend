@@ -475,9 +475,9 @@ class NPUPlatform(Platform):
 
         speculative_config = getattr(vllm_config, "speculative_config", None)
         num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
-        if num_speculative_tokens not in (None, DSA_SPECULATIVE_TOKENS):
+        if num_speculative_tokens != DSA_SPECULATIVE_TOKENS:
             raise ValueError(
-                "layerwise_host_kv_offload supports disabled MTP or MTP3 "
+                "layerwise_host_kv_offload requires MTP3 "
                 f"(num_speculative_tokens={DSA_SPECULATIVE_TOKENS}); "
                 f"got {num_speculative_tokens}"
             )
@@ -743,16 +743,7 @@ class NPUPlatform(Platform):
         kv_extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
         layerwise_host_offload = bool(kv_extra.get("layerwise_host_kv_offload", False))
         if layerwise_host_offload:
-            if kv_role not in {"kv_producer", "kv_consumer"}:
-                raise ValueError(
-                    "layerwise_host_kv_offload requires a PD-disaggregated "
-                    "kv_role ('kv_producer' or 'kv_consumer')"
-                )
-            if cache_config.block_size != 128:
-                raise ValueError(
-                    "layerwise_host_kv_offload currently requires block-size=128 "
-                    f"(got {cache_config.block_size})"
-                )
+            cls._validate_layerwise_host_offload_config(vllm_config)
             if kv_role == "kv_producer":
                 if ascend_config.enable_balance_scheduling:
                     raise ValueError(

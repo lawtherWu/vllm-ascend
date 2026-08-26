@@ -1267,10 +1267,13 @@ class KVPoolWorker:
                 ) from error
         all_layers = {name for group_id, name in self._range_components}
         if all_layers and all_layers.issubset(self._range_load_layers_seen):
-            for req_id, (request, lease, _) in list(self._range_read_plans.items()):
-                owner = (request.req_id, request.request_generation)
-                lease.release()
-                self._range_request_leases.pop(owner, None)
+            for req_id in list(self._range_read_plans):
+                # The read plan is scoped to this forward/chunk, but the
+                # request-level lease is not. A non-final prefill chunk must
+                # retain its history lease so the following chunk can reuse
+                # the same get session. The lease is released by
+                # wait_for_save() on the final chunk, or by the cancellation
+                # and failure paths after all range operations quiesce.
                 self._range_read_plans.pop(req_id, None)
 
     def wait_for_layer_load(self, layer_name: str | None = None) -> None:
@@ -1952,7 +1955,6 @@ class KVPoolWorker:
                     block_hashes,
                     kv_cache_group_id=group_id,
                 ):
-                    start, end, key = chunk.raw_start, chunk.raw_end, chunk.key
                     if use_layerwise_range:
                         # Range mode stores one object per block containing
                         # every layer/component. Query the exact canonical key
