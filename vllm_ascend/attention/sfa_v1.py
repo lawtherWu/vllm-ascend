@@ -1440,7 +1440,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             cache_layout,
             kv_cache,
         )
-        workspace, plan_state, _ = runtime.serve_layer(
+        workspace, plan_state = runtime.serve_layer(
             layer_id,
             full_kv_cache,
             full_k_rope,
@@ -1739,11 +1739,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_li is not None
                 k_li = self._get_full_kv(k_li, attn_metadata)
 
-        # Decode Host offload also needs a producer-side fence: the decode
-        # worker writes the current-step Main KV into the Host-backed PA
-        # tensor before DsaServe reads it, even though it is not a KV-transfer
-        # producer for the prefill request.
-        if kv_cache is not None and (self.is_kv_producer or self.dsa_offload_runtime is not None):
+        # Only a Prefill producer has an asynchronous Connector consumer for
+        # the cache written below. Decode Host Main update, DsaServe and FA are
+        # submitted on the model's current stream and need no Connector event.
+        if kv_cache is not None and self.is_kv_producer:
             attn_metadata.reshape_cache_event = torch.npu.Event()
 
         if kv_cache is not None and self.has_indexer:
@@ -1795,7 +1794,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # The event denotes completion of every cache component that this
         # layer actually wrote.  Shared-indexer layers have no independent
         # Indexer write, so their Main write above is the event boundary too.
-        if kv_cache is not None and (self.is_kv_producer or self.dsa_offload_runtime is not None):
+        if kv_cache is not None and self.is_kv_producer:
             assert attn_metadata.reshape_cache_event is not None
             attn_metadata.reshape_cache_event.record()
 

@@ -7,7 +7,7 @@ import threading
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol
+from typing import Protocol
 
 from vllm_ascend.distributed.kv_transfer.layer_workspace_fence import RequestChunkKey
 
@@ -56,7 +56,6 @@ class StoreCommitError(RuntimeError):
 class PutBinding:
     key: str
     object_size: int
-    source: Any = None
 
     def __post_init__(self) -> None:
         if not self.key or self.object_size <= 0:
@@ -219,6 +218,30 @@ class StoreReadLeaseRegistry:
         self._entries: dict[str, _ReadEntry] = {}
         self._lock = threading.RLock()
 
+    def _rollback_unreferenced_starts(
+        self,
+        keys: list[str],
+        result: list[int],
+        candidates: set[str],
+    ) -> None:
+        started = [
+            key
+            for key, code in zip(keys, result, strict=False)
+            if code == 0 and key in candidates
+        ]
+        if not started:
+            return
+        try:
+            code = self.backend.batch_get_session_end(started)
+        except BaseException as error:
+            raise StoreCommitError(
+                f"Failed to roll back Store get sessions: {started!r}"
+            ) from error
+        if code != 0:
+            raise StoreCommitError(
+                f"Failed to roll back Store get sessions: {started!r}, {code}"
+            )
+
     def acquire(self, owner: tuple[str, int], keys: list[str]) -> None:
         unique = list(dict.fromkeys(keys))
         to_start: list[str] = []
@@ -228,12 +251,36 @@ class StoreReadLeaseRegistry:
                 if not entry.references:
                     to_start.append(key)
             if to_start:
-                result = self.backend.batch_get_session_start(to_start)
-                if len(result) != len(to_start) or any(code != 0 for code in result):
+                try:
+                    result = self.backend.batch_get_session_start(to_start)
+                except BaseException:
                     for key in to_start:
                         if not self._entries[key].references:
                             self._entries.pop(key, None)
-                    raise StoreCommitError(f"batch_get_session_start failed: {to_start!r}, {result!r}")
+                    raise
+                if len(result) != len(to_start) or any(
+                    code != 0 for code in result
+                ):
+                    cleanup_error: BaseException | None = None
+                    try:
+                        self._rollback_unreferenced_starts(
+                            to_start, result, set(to_start)
+                        )
+                    except BaseException as error:
+                        cleanup_error = error
+                    finally:
+                        for key in to_start:
+                            if not self._entries[key].references:
+                                self._entries.pop(key, None)
+                    if cleanup_error is not None:
+                        raise StoreCommitError(
+                            "batch_get_session_start failed and rollback "
+                            f"also failed: {to_start!r}, {result!r}"
+                        ) from cleanup_error
+                    raise StoreCommitError(
+                        "batch_get_session_start failed: "
+                        f"{to_start!r}, {result!r}"
+                    )
             for key in unique:
                 self._entries[key].references.add(owner)
 
@@ -261,10 +308,25 @@ class StoreReadLeaseRegistry:
                     if not self._entries[key].references:
                         self._entries.pop(key, None)
                 raise
-            if len(result) != len(unique) or any(code != 0 for code in result):
-                for key in created:
-                    if not self._entries[key].references:
-                        self._entries.pop(key, None)
+            if len(result) != len(unique) or any(
+                code != 0 for code in result
+            ):
+                cleanup_error: BaseException | None = None
+                try:
+                    self._rollback_unreferenced_starts(
+                        unique, result, set(created)
+                    )
+                except BaseException as error:
+                    cleanup_error = error
+                finally:
+                    for key in created:
+                        if not self._entries[key].references:
+                            self._entries.pop(key, None)
+                if cleanup_error is not None:
+                    raise StoreCommitError(
+                        "batch_get_session_start refresh failed and rollback "
+                        f"also failed: {unique!r}, {result!r}"
+                    ) from cleanup_error
                 raise StoreCommitError(
                     f"batch_get_session_start failed: {unique!r}, {result!r}"
                 )
@@ -395,10 +457,13 @@ class ChunkStoreSession:
         history_keys: list[str],
         claim: PutClaim,
     ) -> None:
-        self.request_lease.ensure_history(history_keys)
+        # Bind the native put ownership before acquiring history. If history
+        # setup fails, the caller can still revoke every successfully opened
+        # put session through revoke_uncommitted().
         self.put_keys = list(dict.fromkeys(claim.owned_keys))
         self.followed_put_keys = list(dict.fromkeys(claim.followed_keys))
         self.put_state = {key: PutState.OPEN for key in self.put_keys}
+        self.request_lease.ensure_history(history_keys)
         if claim.failed_keys:
             details: dict[str, str] = {}
             for key in claim.failed_keys:

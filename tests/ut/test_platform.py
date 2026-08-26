@@ -53,7 +53,20 @@ class TestNPUPlatform(TestBase):
     ):
         config = TestNPUPlatform.mock_vllm_config()
         config.kv_transfer_config = MagicMock()
-        config.kv_transfer_config.kv_connector_extra_config = {"layerwise_host_kv_offload": True}
+        config.kv_transfer_config.kv_connector = "MultiConnector"
+        config.kv_transfer_config.kv_connector_extra_config = {
+            "layerwise_host_kv_offload": True,
+            "connectors": [
+                {
+                    "kv_connector": "AscendStoreConnector",
+                    "kv_connector_extra_config": {
+                        "use_layerwise": True,
+                        "use_layerwise_range": True,
+                    },
+                },
+                {"kv_connector": "MooncakeLayerwiseConnector"},
+            ],
+        }
         config.kv_transfer_config.kv_role = role
         config.cache_config.block_size = block_size
         if num_speculative_tokens is None:
@@ -102,15 +115,18 @@ class TestNPUPlatform(TestBase):
 
     def test_validate_layerwise_host_offload_config_accepts_frozen_shape(self):
         for role in ("kv_producer", "kv_consumer"):
-            config = self.mock_layerwise_host_offload_config(role=role)
-            NPUPlatform._validate_layerwise_host_offload_config(config)
+            for num_speculative_tokens in (None, 3):
+                config = self.mock_layerwise_host_offload_config(
+                    role=role,
+                    num_speculative_tokens=num_speculative_tokens,
+                )
+                NPUPlatform._validate_layerwise_host_offload_config(config)
 
     def test_validate_layerwise_host_offload_config_rejects_unsupported_shape(self):
         cases = [
             ({"role": "kv_both"}, "PD-disaggregated"),
             ({"block_size": 64}, "block_size=128"),
-            ({"num_speculative_tokens": None}, "MTP3"),
-            ({"num_speculative_tokens": 2}, "MTP3"),
+            ({"num_speculative_tokens": 2}, "disabled MTP or MTP3"),
             ({"topk": 1024}, "index_topk=2048"),
         ]
         for overrides, match in cases:
@@ -118,6 +134,63 @@ class TestNPUPlatform(TestBase):
                 config = self.mock_layerwise_host_offload_config(**overrides)
                 with self.assertRaisesRegex(ValueError, match):
                     NPUPlatform._validate_layerwise_host_offload_config(config)
+
+    def test_validate_layerwise_host_offload_config_rejects_invalid_prefill_topology(self):
+        cases = [
+            ("MooncakeLayerwiseConnector", None, "MultiConnector"),
+            (
+                "MultiConnector",
+                [{"kv_connector": "MooncakeLayerwiseConnector"}],
+                "AscendStoreConnector",
+            ),
+            (
+                "MultiConnector",
+                [
+                    {
+                        "kv_connector": "AscendStoreConnector",
+                        "kv_connector_extra_config": {
+                            "use_layerwise": True,
+                            "use_layerwise_range": False,
+                        },
+                    },
+                    {"kv_connector": "MooncakeLayerwiseConnector"},
+                ],
+                "use_layerwise_range=true",
+            ),
+            (
+                "MultiConnector",
+                [
+                    {
+                        "kv_connector": "AscendStoreConnector",
+                        "kv_connector_extra_config": {
+                            "use_layerwise": True,
+                            "use_layerwise_range": True,
+                        },
+                    }
+                ],
+                "MooncakeLayerwiseConnector",
+            ),
+        ]
+        for connector_name, children, match in cases:
+            with self.subTest(connector_name=connector_name, children=children):
+                config = self.mock_layerwise_host_offload_config(
+                    role="kv_producer"
+                )
+                config.kv_transfer_config.kv_connector = connector_name
+                if children is not None:
+                    config.kv_transfer_config.kv_connector_extra_config[
+                        "connectors"
+                    ] = children
+                with self.assertRaisesRegex(ValueError, match):
+                    NPUPlatform._validate_layerwise_host_offload_config(config)
+
+    def test_validate_layerwise_host_offload_config_does_not_require_decode_store(self):
+        config = self.mock_layerwise_host_offload_config(role="kv_consumer")
+        config.kv_transfer_config.kv_connector_extra_config["connectors"] = [
+            {"kv_connector": "MooncakeLayerwiseConnector"}
+        ]
+
+        NPUPlatform._validate_layerwise_host_offload_config(config)
 
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
