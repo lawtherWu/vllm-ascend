@@ -1237,6 +1237,9 @@ class ReqMeta:
 
         self.request_generation = request_generation
         self.chunk_id = chunk_id
+
+        self.request_generation = request_generation
+        self.chunk_id = chunk_id
     @property
     def block_ids(self) -> list[int]:
         return self.block_ids_by_group[0] if self.block_ids_by_group else []
