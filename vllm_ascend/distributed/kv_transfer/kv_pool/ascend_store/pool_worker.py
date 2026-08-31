@@ -385,14 +385,10 @@ class KVPoolWorker:
         return group_uses_align_state
 
     def _get_group_block_size(self, group_id: int) -> int:
-        if group_id >= len(self.grouped_block_size):
-            return self.grouped_block_size[0]
         return self.grouped_block_size[group_id]
 
     @staticmethod
     def _get_group_family(families: list[str], group_id: int) -> str:
-        if group_id >= len(families):
-            return "default"
         return families[group_id]
 
     def _infer_cache_transfer_granularity(self) -> int:
@@ -456,13 +452,10 @@ class KVPoolWorker:
             return True
         if self.num_hidden_layers is None:
             return False
-        try:
-            return extract_layer_index(layer_name) >= self.num_hidden_layers
-        except (IndexError, ValueError):
-            return False
+        return extract_layer_index(layer_name) >= self.num_hidden_layers
 
     def _range_group_layer_names(self, group_id: int) -> list[str]:
-        if self.kv_cache_config is None or group_id >= len(self.kv_cache_config.kv_cache_groups):
+        if self.kv_cache_config is None:
             return [name for name in self.kv_caches if not self._is_mtp_layer_name(name)]
         names = list(self.kv_cache_config.kv_cache_groups[group_id].layer_names)
         return [name for name in names if name in self.kv_caches and not self._is_mtp_layer_name(name)]
@@ -586,7 +579,7 @@ class KVPoolWorker:
         """
 
         request_id = request.req_id
-        supplied = int(getattr(request, "request_generation", 0) or 0)
+        supplied = request.request_generation
         current = self._range_request_generations.get(request_id)
         if current is None:
             if supplied > 0:
@@ -606,7 +599,7 @@ class KVPoolWorker:
                 )
             generation = current
         request.request_generation = generation
-        if int(getattr(request, "chunk_id", 0) or 0) < 0:
+        if request.chunk_id < 0:
             raise ValueError(f"invalid negative Store chunk id for {request_id}")
 
     def _drop_range_request_identity(self, request_id: str) -> None:
@@ -1157,7 +1150,7 @@ class KVPoolWorker:
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         for request in metadata.requests:
             load_spec = request.load_spec
-            history_token_len = int(getattr(request, "history_token_len", 0) or 0)
+            history_token_len = request.history_token_len
             if self.use_layerwise_range and history_token_len > 0:
                 if history_token_len > request.token_len_chunk:
                     raise ValueError(
