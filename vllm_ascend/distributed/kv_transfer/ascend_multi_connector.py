@@ -113,14 +113,9 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         )
 
     def _abort_fence(self, fence: LayerWorkspaceFence) -> None:
-        # Registration must be closed before waiting.  Waiting here prevents a
-        # failed child connector from leaving an earlier child reading the
-        # shared workspace after the model has already unwound the forward.
+        # Close registration before waiting for all readers and compute.
         fence.close_registration()
-        try:
-            fence.wait_workspace_reusable()
-        except BaseException:
-            pass
+        fence.wait_workspace_reusable()
 
     # ==============================
     # Layerwise workspace ordering
