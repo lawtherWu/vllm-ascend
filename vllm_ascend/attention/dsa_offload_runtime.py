@@ -141,20 +141,12 @@ def build_dsa_group_specs(
 
 def _tensor_storage_bytes(tensor: torch.Tensor, seen: set[int]) -> int:
     """Count backing storage once, including expanded metadata views."""
-    try:
-        storage = tensor.untyped_storage()
-        storage_id = int(storage.data_ptr())
-        if storage_id in seen:
-            return 0
-        seen.add(storage_id)
-        return int(storage.nbytes())
-    except (AttributeError, RuntimeError, TypeError):
-        # Keep CPU/mock fixtures usable on older torch versions.
-        storage_id = int(tensor.data_ptr())
-        if storage_id in seen:
-            return 0
-        seen.add(storage_id)
-        return int(tensor.numel() * tensor.element_size())
+    storage = tensor.untyped_storage()
+    storage_id = int(storage.data_ptr())
+    if storage_id in seen:
+        return 0
+    seen.add(storage_id)
+    return int(storage.nbytes())
 
 
 class DsaOffloadRuntime:
