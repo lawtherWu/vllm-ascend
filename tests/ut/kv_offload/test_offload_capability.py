@@ -9,7 +9,7 @@ from vllm_ascend.attention.offload_capability import (
 )
 
 
-def test_legacy_layer_role_fallback_is_preserved():
+def test_layer_role_uses_explicit_names_and_layer_depth():
     assert is_speculative_cache_layer("decoder.mtp.block", num_hidden_layers=32)
     assert is_speculative_cache_layer("model.layers.32.attn", num_hidden_layers=32)
     assert not is_speculative_cache_layer("decoder.block.0.attn", num_hidden_layers=32)

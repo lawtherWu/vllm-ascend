@@ -186,9 +186,7 @@ def get_dsa_offload_backends(
         from vllm_ascend.ops.dsa_offload import get_dsa_config_value
 
         model_config = vllm_config.model_config
-        model_dtype = getattr(model_config, "dtype", None)
-        if model_dtype is None:
-            raise RuntimeError("DSA Host offload requires model dtype metadata")
+        model_dtype = model_config.dtype
         use_mla = bool(get_dsa_config_value(model_config, "use_mla", False))
         use_sparse = get_dsa_config_value(model_config, "index_topk") is not None
         with set_current_vllm_config(vllm_config):
@@ -235,32 +233,17 @@ def resolve_cache_layer_role(
     is_eagle_group: bool = False,
     group_layer_count: int = 0,
 ) -> CacheLayerRole:
-    """Resolve a cache layer role using current vLLM-compatible metadata."""
-
-    if isinstance(num_hidden_layers, int) and num_hidden_layers >= 0:
-        try:
-            try:
-                from vllm.model_executor.models.utils import extract_layer_index
-            except (ImportError, AttributeError):
-                # Keep the layer-role helper usable with older vLLM releases
-                # and the lightweight Store test dependency set.
-                from vllm.v1.worker.utils import extract_layer_index
-
-            if extract_layer_index(layer_name) >= num_hidden_layers:
-                return CacheLayerRole.SPECULATIVE
-        except (
-            AssertionError,
-            IndexError,
-            ValueError,
-            TypeError,
-            ImportError,
-            AttributeError,
-        ):
-            pass
-
+    """Resolve a cache layer role from its name and model depth."""
     lowered = layer_name.lower()
     if "mtp" in lowered or "draft" in lowered:
         return CacheLayerRole.SPECULATIVE
+    if num_hidden_layers is not None:
+        if num_hidden_layers < 0:
+            raise ValueError("num_hidden_layers must be non-negative")
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        if extract_layer_index(layer_name) >= num_hidden_layers:
+            return CacheLayerRole.SPECULATIVE
     if is_eagle_group and group_layer_count == 1:
         return CacheLayerRole.SPECULATIVE
     return CacheLayerRole.BASE
