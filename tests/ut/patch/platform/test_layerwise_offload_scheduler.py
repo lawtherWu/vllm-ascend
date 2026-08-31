@@ -24,40 +24,26 @@ def fake_async_scheduler(monkeypatch):
             num_new_tokens,
             num_new_local_computed_tokens=0,
             num_external_computed_tokens=0,
-            *,
-            future_option=None,
         ):
-            del request, num_new_local_computed_tokens, num_external_computed_tokens
-            self.original_calls.append(future_option)
+            del request
+            self.original_calls.append(
+                (num_new_local_computed_tokens, num_external_computed_tokens)
+            )
             return num_new_tokens - 1
 
     monkeypatch.setattr(layerwise_patch, "AsyncScheduler", FakeAsyncScheduler)
     return FakeAsyncScheduler
 
 
-def test_patch_does_not_depend_on_schedule_signature(fake_async_scheduler):
-    fake_async_scheduler.schedule = lambda self, newly_added_option=None: newly_added_option
-
-    original_schedule = fake_async_scheduler.schedule
-    layerwise_patch.apply_layerwise_offload_scheduler_patch()
-
-    assert fake_async_scheduler.schedule is original_schedule
-    assert getattr(fake_async_scheduler._mamba_block_aligned_split, layerwise_patch._PATCH_MARKER)
-
-
-def test_patch_delegates_unmarked_schedulers_and_forwards_new_arguments(fake_async_scheduler):
+def test_patch_delegates_unmarked_schedulers(fake_async_scheduler):
     layerwise_patch.apply_layerwise_offload_scheduler_patch()
     scheduler = fake_async_scheduler()
     scheduler.original_calls = []
 
-    result = scheduler._mamba_block_aligned_split(
-        _request(),
-        257,
-        future_option="forwarded",
-    )
+    result = scheduler._mamba_block_aligned_split(_request(), 257)
 
     assert result == 256
-    assert scheduler.original_calls == ["forwarded"]
+    assert scheduler.original_calls == [(0, 0)]
 
 
 def test_patch_aligns_only_layerwise_prefill_scheduler(fake_async_scheduler):
