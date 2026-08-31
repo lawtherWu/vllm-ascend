@@ -69,7 +69,6 @@ def test_patch_accounts_for_waiting_request_computed_token_deltas(fake_async_sch
     result = scheduler._mamba_block_aligned_split(
         _request(computed_tokens=128, prompt_tokens=1024),
         200,
-        num_new_local_computed_tokens=0,
         num_external_computed_tokens=128,
     )
 
