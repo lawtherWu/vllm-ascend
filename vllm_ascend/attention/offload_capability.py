@@ -196,7 +196,7 @@ def get_dsa_offload_backends(
                 None,
                 use_mla=use_mla,
                 use_sparse=use_sparse,
-                use_mm_prefix=bool(getattr(model_config, "is_mm_prefix_lm", False)),
+                use_mm_prefix=model_config.is_mm_prefix_lm,
             )
         if not is_dsa_offload_backend(backend):
             raise NotImplementedError(
