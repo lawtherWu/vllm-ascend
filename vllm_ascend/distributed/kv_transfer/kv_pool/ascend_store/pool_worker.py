@@ -387,14 +387,10 @@ class KVPoolWorker:
         return group_uses_align_state
 
     def _get_group_block_size(self, group_id: int) -> int:
-        if group_id >= len(self.grouped_block_size):
-            return self.grouped_block_size[0]
         return self.grouped_block_size[group_id]
 
     @staticmethod
     def _get_group_family(families: list[str], group_id: int) -> str:
-        if group_id >= len(families):
-            return "default"
         return families[group_id]
 
     def _infer_cache_transfer_granularity(self) -> int:
