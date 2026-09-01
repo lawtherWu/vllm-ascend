@@ -246,11 +246,7 @@ class DsaOffloadRuntime:
     def finish_step(self) -> None:
         """Record completion outside the eager/ACL Graph model wrapper."""
 
-        npu = getattr(torch, "npu", None)
-        event_cls = getattr(npu, "Event", None) if npu is not None else None
-        if event_cls is None:
-            return
-        event = event_cls()
+        event = torch.npu.Event()
         event.record()
         self.resident_state.record_final_install_event(event)
 
