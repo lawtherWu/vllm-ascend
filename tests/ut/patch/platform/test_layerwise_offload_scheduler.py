@@ -35,73 +35,57 @@ def fake_async_scheduler(monkeypatch):
     return FakeAsyncScheduler
 
 
-def test_patch_delegates_unmarked_schedulers(fake_async_scheduler):
+def _enabled_scheduler(fake_async_scheduler):
     layerwise_patch.apply_layerwise_offload_scheduler_patch()
     scheduler = fake_async_scheduler()
     scheduler.original_calls = []
+    scheduler.store_granularity = 128
+    setattr(scheduler, layerwise_patch._LAYERWISE_SCHEDULER_MARKER, True)
+    return scheduler
 
-    result = scheduler._mamba_block_aligned_split(_request(), 257)
 
-    assert result == 256
+def test_patch_delegates_unmarked_schedulers_and_is_idempotent(fake_async_scheduler):
+    layerwise_patch.apply_layerwise_offload_scheduler_patch()
+    first_hook = fake_async_scheduler._mamba_block_aligned_split
+    scheduler = fake_async_scheduler()
+    scheduler.original_calls = []
+
+    assert scheduler._mamba_block_aligned_split(_request(), 257) == 256
     assert scheduler.original_calls == [(0, 0)]
 
-
-def test_patch_aligns_only_layerwise_prefill_scheduler(fake_async_scheduler):
     layerwise_patch.apply_layerwise_offload_scheduler_patch()
-    scheduler = fake_async_scheduler()
-    scheduler.original_calls = []
-    scheduler.store_granularity = 128
-    setattr(scheduler, layerwise_patch._LAYERWISE_SCHEDULER_MARKER, True)
-
-    result = scheduler._mamba_block_aligned_split(_request(), 300)
-
-    assert result == 256
-    assert scheduler.original_calls == []
+    assert fake_async_scheduler._mamba_block_aligned_split is first_hook
 
 
-def test_patch_accounts_for_waiting_request_computed_token_deltas(fake_async_scheduler):
-    layerwise_patch.apply_layerwise_offload_scheduler_patch()
-    scheduler = fake_async_scheduler()
-    scheduler.original_calls = []
-    scheduler.store_granularity = 128
-    setattr(scheduler, layerwise_patch._LAYERWISE_SCHEDULER_MARKER, True)
+def test_patch_aligns_prefill_chunk_and_computed_deltas(fake_async_scheduler):
+    scheduler = _enabled_scheduler(fake_async_scheduler)
 
     result = scheduler._mamba_block_aligned_split(
-        _request(computed_tokens=128, prompt_tokens=1024),
+        _request(computed_tokens=128),
         200,
         num_external_computed_tokens=128,
     )
 
     assert result == 128
+    assert scheduler.original_calls == []
 
 
-def test_patch_preserves_final_prefill_and_decode_chunks(fake_async_scheduler):
-    layerwise_patch.apply_layerwise_offload_scheduler_patch()
-    scheduler = fake_async_scheduler()
-    scheduler.original_calls = []
-    scheduler.store_granularity = 128
-    setattr(scheduler, layerwise_patch._LAYERWISE_SCHEDULER_MARKER, True)
-
-    final_prefill = scheduler._mamba_block_aligned_split(
-        _request(computed_tokens=900, prompt_tokens=1024),
-        124,
-    )
-    decode = scheduler._mamba_block_aligned_split(
-        _request(computed_tokens=1024, prompt_tokens=1024),
-        4,
-    )
-
-    assert final_prefill == 124
-    assert decode == 4
+@pytest.mark.parametrize(
+    ("computed_tokens", "proposed_tokens", "expected"),
+    [(900, 124, 124), (1024, 4, 4), (0, 0, 0)],
+)
+def test_patch_preserves_final_prefill_decode_and_empty_chunks(
+    fake_async_scheduler, computed_tokens, proposed_tokens, expected
+):
+    scheduler = _enabled_scheduler(fake_async_scheduler)
+    assert scheduler._mamba_block_aligned_split(
+        _request(computed_tokens=computed_tokens), proposed_tokens
+    ) == expected
 
 
-def test_patch_is_idempotent(fake_async_scheduler):
-    layerwise_patch.apply_layerwise_offload_scheduler_patch()
-    first_hook = fake_async_scheduler._mamba_block_aligned_split
-
-    layerwise_patch.apply_layerwise_offload_scheduler_patch()
-
-    assert fake_async_scheduler._mamba_block_aligned_split is first_hook
+def test_alignment_rejects_invalid_granularity():
+    with pytest.raises(ValueError, match="granularity"):
+        layerwise_patch.align_prefill_chunk_for_store(_request(), 0, 128, 0)
 
 
 def test_patch_fails_when_upstream_hook_is_missing(monkeypatch):
@@ -109,6 +93,5 @@ def test_patch_fails_when_upstream_hook_is_missing(monkeypatch):
         pass
 
     monkeypatch.setattr(layerwise_patch, "AsyncScheduler", SchedulerWithoutHook)
-
     with pytest.raises(RuntimeError, match="pre-allocation hook"):
         layerwise_patch.apply_layerwise_offload_scheduler_patch()
