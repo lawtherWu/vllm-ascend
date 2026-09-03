@@ -47,6 +47,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_session import (
     ChunkStoreSession,
+    ExternalWriterWaitConfig,
     PutBinding,
     PutClaim,
     RequestStoreLease,
@@ -109,6 +110,40 @@ class _LayerwiseRangeSessionState:
     request: ReqMeta
     session: ChunkStoreSession
     records: list[_LayerwiseRangeBlock]
+
+
+def _combine_futures(tasks: list[Future[list[int]]]) -> Future[None]:
+    """Combine tasks without consuming a worker thread to wait for them."""
+
+    aggregate: Future[None] = Future()
+    if not tasks:
+        aggregate.set_result(None)
+        return aggregate
+
+    remaining = len(tasks)
+    first_error: BaseException | None = None
+    callback_lock = threading.Lock()
+
+    def task_done(task: Future[list[int]]) -> None:
+        nonlocal remaining, first_error
+        try:
+            error = task.exception()
+        except BaseException as callback_error:
+            error = callback_error
+        with callback_lock:
+            if error is not None and first_error is None:
+                first_error = error
+            remaining -= 1
+            if remaining != 0 or aggregate.done():
+                return
+            if first_error is None:
+                aggregate.set_result(None)
+            else:
+                aggregate.set_exception(first_error)
+
+    for task in tasks:
+        task.add_done_callback(task_done)
+    return aggregate
 
 
 class KVPoolWorker:
@@ -311,13 +346,46 @@ class KVPoolWorker:
         # cannot reuse an old Store lease or an old in-flight object.
         self._range_request_generations: dict[str, int] = {}
         self._next_range_request_generation = 0
+        self._range_transfer_batch_size = int(
+            extra_config.get("range_transfer_batch_size", 128)
+        )
+        if self._range_transfer_batch_size <= 0:
+            raise ValueError("range_transfer_batch_size must be positive")
+        self._range_transfer_workers = int(
+            extra_config.get("range_transfer_workers", 1)
+        )
+        if self._range_transfer_workers <= 0:
+            raise ValueError("range_transfer_workers must be positive")
         self._range_sessions_by_request: dict[str, _LayerwiseRangeSessionState] = {}
         self._range_load_layers_seen: set[str] = set()
         if self.use_layerwise_range:
-            self._range_executor = ThreadPoolExecutor(
-                max_workers=4, thread_name_prefix="layerwise-store-range", initializer=self.m_store.set_device
+            logger.info(
+                "Layerwise range transfer configuration: workers=%d, "
+                "batch_size=%d",
+                self._range_transfer_workers,
+                self._range_transfer_batch_size,
             )
-            self._range_put_registry = StorePutRegistry(self.m_store)
+            self._range_executor = ThreadPoolExecutor(
+                max_workers=self._range_transfer_workers,
+                thread_name_prefix="layerwise-store-range",
+                initializer=self.m_store.set_device,
+            )
+            self._range_put_registry = StorePutRegistry(
+                self.m_store,
+                external_writer_wait_config=ExternalWriterWaitConfig(
+                    completion_timeout_s=float(
+                        extra_config.get(
+                            "external_writer_completion_timeout_s", 5.0
+                        )
+                    ),
+                    stale_timeout_s=float(
+                        extra_config.get("external_writer_stale_timeout_s", 30.0)
+                    ),
+                    poll_interval_s=float(
+                        extra_config.get("external_writer_poll_interval_s", 0.1)
+                    ),
+                ),
+            )
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = False
         if kv_event_config and kv_event_config.enable_kv_cache_events:
@@ -635,7 +703,11 @@ class KVPoolWorker:
         owner = (request.req_id, request.request_generation)
         lease = self._range_request_leases.get(owner)
         if lease is None:
-            lease = RequestStoreLease(owner, self._range_read_registry)
+            lease = RequestStoreLease(
+                owner,
+                self._range_read_registry,
+                range_batch_size=self._range_transfer_batch_size,
+            )
             self._range_request_leases[owner] = lease
         return lease
 
@@ -1439,6 +1511,7 @@ class KVPoolWorker:
                     self.m_store,
                     lease,
                     self._range_put_registry,
+                    range_batch_size=self._range_transfer_batch_size,
                 )
                 try:
                     session.start(sorted(lease.history_keys), claim)
@@ -1494,10 +1567,11 @@ class KVPoolWorker:
             if not keys:
                 continue
             tasks.append(self._range_executor.submit(state.session.save_layer, keys, ptrs, sizes, offsets, kv_ready_event))
-        def wait_tasks() -> None:
-            for task in tasks:
-                task.result()
-        aggregate = self._range_executor.submit(wait_tasks)
+        # Never submit a task which waits for other tasks to the same bounded
+        # executor. Workspace fences wait for this aggregate before recycling
+        # an arena; waiter tasks can otherwise occupy every worker while the
+        # range PUTs needed to complete them remain queued forever.
+        aggregate = _combine_futures(tasks)
         self._range_layer_futures.append(aggregate)
         return aggregate
 
@@ -1548,6 +1622,7 @@ class KVPoolWorker:
             execution_put_keys: set[str] = set()
             for _, state in states:
                 execution_put_keys.update(state.session.put_keys)
+                execution_put_keys.update(state.session.followed_put_keys)
             try:
                 errors: list[BaseException] = []
                 # Source-range futures must all settle before any put_end.

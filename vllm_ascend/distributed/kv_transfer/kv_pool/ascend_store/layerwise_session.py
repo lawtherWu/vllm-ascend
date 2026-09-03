@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import threading
-from concurrent.futures import Future
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -57,6 +58,33 @@ class StoreCommitError(RuntimeError):
     pass
 
 
+MOONCAKE_OBJECT_ALREADY_EXISTS = -705
+DEFAULT_RANGE_TRANSFER_BATCH_SIZE = 128
+
+
+@dataclass(frozen=True)
+class ExternalWriterWaitConfig:
+    """Timing policy for following a put session owned by another client."""
+
+    completion_timeout_s: float = 5.0
+    # Mooncake's default put_start_discard_timeout_sec is 30 seconds. Deployments
+    # that override that master setting should configure the matching
+    # external_writer_stale_timeout_s connector option.
+    stale_timeout_s: float = 30.0
+    poll_interval_s: float = 0.1
+
+    def __post_init__(self) -> None:
+        if self.completion_timeout_s < 0:
+            raise ValueError("completion_timeout_s must be non-negative")
+        if self.stale_timeout_s < self.completion_timeout_s:
+            raise ValueError(
+                "stale_timeout_s must be greater than or equal to "
+                "completion_timeout_s"
+            )
+        if self.poll_interval_s <= 0:
+            raise ValueError("poll_interval_s must be positive")
+
+
 @dataclass(frozen=True)
 class PutBinding:
     key: str
@@ -71,6 +99,7 @@ class PutBinding:
 class PutClaim:
     owned_keys: list[str] = field(default_factory=list)
     followed_keys: list[str] = field(default_factory=list)
+    external_followed_keys: list[str] = field(default_factory=list)
     failed_keys: list[str] = field(default_factory=list)
     commit_futures: dict[str, Future[list[int]]] = field(default_factory=dict)
 
@@ -85,11 +114,252 @@ class _PutEntry:
 class StorePutRegistry:
     """Coordinates one native put session per canonical key in a Worker."""
 
-    def __init__(self, backend: LayerwiseStoreBackend, replicate_config=None):
+    def __init__(
+        self,
+        backend: LayerwiseStoreBackend,
+        replicate_config=None,
+        external_writer_wait_config: ExternalWriterWaitConfig | None = None,
+    ):
         self.backend = backend
         self.replicate_config = replicate_config
+        self.external_writer_wait_config = (
+            external_writer_wait_config or ExternalWriterWaitConfig()
+        )
         self._entries: dict[str, _PutEntry] = {}
         self._lock = threading.RLock()
+        self._external_writer_executor = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="layerwise-external-writer",
+        )
+
+    def _set_owned(
+        self,
+        execution_id: int,
+        binding: PutBinding,
+        claim: PutClaim,
+    ) -> None:
+        with self._lock:
+            entry = self._entries.get(binding.key)
+            if entry is None:
+                entry = _PutEntry(
+                    future=Future(),
+                    state=PutState.OPEN,
+                    owner_execution_id=execution_id,
+                )
+                self._entries[binding.key] = entry
+            else:
+                entry.state = PutState.OPEN
+                entry.owner_execution_id = execution_id
+            if binding.key not in claim.owned_keys:
+                claim.owned_keys.append(binding.key)
+            claim.commit_futures[binding.key] = entry.future
+
+    def _reserve_external(
+        self,
+        execution_id: int,
+        binding: PutBinding,
+        claim: PutClaim,
+    ) -> None:
+        """Reserve a key while its native session is owned by another worker."""
+
+        with self._lock:
+            entry = self._entries.get(binding.key)
+            if entry is None:
+                entry = _PutEntry(
+                    future=Future(),
+                    state=PutState.OPEN,
+                    owner_execution_id=execution_id,
+                )
+                self._entries[binding.key] = entry
+            if binding.key not in claim.followed_keys:
+                claim.followed_keys.append(binding.key)
+            if binding.key not in claim.external_followed_keys:
+                claim.external_followed_keys.append(binding.key)
+            claim.commit_futures[binding.key] = entry.future
+
+    def _set_followed(
+        self,
+        binding: PutBinding,
+        claim: PutClaim,
+    ) -> None:
+        with self._lock:
+            entry = self._entries.get(binding.key)
+            if entry is None:
+                entry = _PutEntry(future=Future())
+                self._entries[binding.key] = entry
+            entry.state = PutState.COMMITTED
+            entry.owner_execution_id = None
+            if not entry.future.done():
+                entry.future.set_result([0])
+            if binding.key not in claim.followed_keys:
+                claim.followed_keys.append(binding.key)
+            claim.commit_futures[binding.key] = entry.future
+
+    def _set_failed(
+        self,
+        execution_id: int,
+        binding: PutBinding,
+        claim: PutClaim,
+        error: BaseException,
+    ) -> None:
+        with self._lock:
+            entry = self._entries.get(binding.key)
+            if entry is None:
+                entry = _PutEntry(future=Future())
+                self._entries[binding.key] = entry
+            entry.state = PutState.ERROR
+            entry.owner_execution_id = execution_id
+            if not entry.future.done():
+                entry.future.set_exception(error)
+            if binding.key not in claim.failed_keys:
+                claim.failed_keys.append(binding.key)
+            claim.commit_futures[binding.key] = entry.future
+
+    def _completed_keys(self, keys: list[str]) -> set[str]:
+        result = self.backend.exists(keys)
+        if len(result) != len(keys):
+            raise RuntimeError(
+                "Mooncake exists returned an invalid result length: "
+                f"expected={len(keys)}, actual={len(result)}"
+            )
+        invalid = {
+            key: int(code)
+            for key, code in zip(keys, result, strict=True)
+            if int(code) not in (0, 1)
+        }
+        if invalid:
+            raise StoreCommitError(
+                f"Mooncake exists failed while following external puts: {invalid!r}"
+            )
+        return {
+            key
+            for key, code in zip(keys, result, strict=True)
+            if int(code) == 1
+        }
+
+    def _wait_for_external_commits(
+        self,
+        bindings: list[PutBinding],
+        timeout_s: float,
+    ) -> tuple[list[PutBinding], list[PutBinding]]:
+        pending = list(bindings)
+        completed: list[PutBinding] = []
+        deadline = time.monotonic() + timeout_s
+        while pending:
+            completed_keys = self._completed_keys(
+                [binding.key for binding in pending]
+            )
+            if completed_keys:
+                completed.extend(
+                    binding
+                    for binding in pending
+                    if binding.key in completed_keys
+                )
+                pending = [
+                    binding
+                    for binding in pending
+                    if binding.key not in completed_keys
+                ]
+            if not pending:
+                break
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                break
+            time.sleep(
+                min(
+                    self.external_writer_wait_config.poll_interval_s,
+                    remaining_s,
+                )
+            )
+        return completed, pending
+
+    def _resolve_external_writers(
+        self,
+        execution_id: int,
+        bindings: list[PutBinding],
+        claim: PutClaim,
+    ) -> None:
+        config = self.external_writer_wait_config
+        completed, pending = self._wait_for_external_commits(
+            bindings,
+            config.completion_timeout_s,
+        )
+        for binding in completed:
+            self._set_followed(binding, claim)
+        if not pending:
+            return
+
+        # Mooncake reports an in-progress object as absent from exists(), while
+        # PutStart reports OBJECT_ALREADY_EXISTS. Continue watching until the
+        # master's stale PutStart window has elapsed, then make one new claim.
+        stale_wait_s = config.stale_timeout_s - config.completion_timeout_s
+        completed, pending = self._wait_for_external_commits(
+            pending,
+            stale_wait_s,
+        )
+        for binding in completed:
+            self._set_followed(binding, claim)
+        if not pending:
+            return
+
+        keys = [binding.key for binding in pending]
+        retry_result = self.backend.batch_put_session_start(
+            keys,
+            [binding.object_size for binding in pending],
+            self.replicate_config,
+        )
+        if len(retry_result) != len(keys):
+            raise RuntimeError(
+                "Mooncake put_start retry returned an invalid result length"
+            )
+
+        still_contended: list[PutBinding] = []
+        for binding, code in zip(pending, retry_result, strict=True):
+            if code == 0:
+                # This claim has already been returned as a follower and its
+                # range session will not write this key.  Let the scheduler
+                # retry the chunk and become the owner in a fresh execution.
+                self._set_failed(
+                    execution_id,
+                    binding,
+                    claim,
+                    StoreCommitError(
+                        "external writer session expired; key became claimable "
+                        f"for the next execution: {binding.key}"
+                    ),
+                )
+            elif code == MOONCAKE_OBJECT_ALREADY_EXISTS:
+                still_contended.append(binding)
+            else:
+                self._set_failed(
+                    execution_id,
+                    binding,
+                    claim,
+                    StoreCommitError(
+                        f"put_start retry failed for {binding.key}: {code}"
+                    ),
+                )
+
+        if not still_contended:
+            return
+        completed, still_contended = self._wait_for_external_commits(
+            still_contended,
+            config.completion_timeout_s,
+        )
+        for binding in completed:
+            self._set_followed(binding, claim)
+        for binding in still_contended:
+            self._set_failed(
+                execution_id,
+                binding,
+                claim,
+                StoreCommitError(
+                    "external writer did not complete before the stale "
+                    f"PutStart timeout ({config.stale_timeout_s:.1f}s), and "
+                    f"put_start retry failed for {binding.key}: "
+                    f"{MOONCAKE_OBJECT_ALREADY_EXISTS}"
+                ),
+            )
 
     def claim_execution(
         self,
@@ -99,6 +369,7 @@ class StorePutRegistry:
         """Claim keys in scheduler order and open at most one batch session."""
 
         unique: list[PutBinding] = []
+        externally_owned: list[PutBinding] = []
         claim = PutClaim()
         with self._lock:
             seen: set[str] = set()
@@ -145,34 +416,53 @@ class StorePutRegistry:
                         raise RuntimeError("Mooncake put_start returned an invalid result length")
                 except BaseException as error:
                     for binding in unique:
-                        future: Future[list[int]] = Future()
-                        future.set_exception(error)
-                        self._entries[binding.key] = _PutEntry(
-                            future=future,
-                            state=PutState.ERROR,
-                            owner_execution_id=execution_id,
+                        self._set_failed(
+                            execution_id,
+                            binding,
+                            claim,
+                            error,
                         )
-                        claim.failed_keys.append(binding.key)
-                        claim.commit_futures[binding.key] = future
                 else:
                     for binding, code in zip(unique, result, strict=True):
-                        future = Future()
-                        entry = _PutEntry(
-                            future=future,
-                            state=PutState.OPEN if code == 0 else PutState.ERROR,
-                            owner_execution_id=execution_id,
-                        )
-                        self._entries[binding.key] = entry
-                        claim.commit_futures[binding.key] = future
                         if code == 0:
-                            claim.owned_keys.append(binding.key)
+                            self._set_owned(execution_id, binding, claim)
+                        elif code == MOONCAKE_OBJECT_ALREADY_EXISTS:
+                            externally_owned.append(binding)
                         else:
-                            future.set_exception(
+                            self._set_failed(
+                                execution_id,
+                                binding,
+                                claim,
                                 StoreCommitError(
                                     f"put_start failed for {binding.key}: {code}"
-                                )
+                                ),
                             )
-                            claim.failed_keys.append(binding.key)
+                    for binding in externally_owned:
+                        self._reserve_external(execution_id, binding, claim)
+        # Do not hold the registry lock, or the model-forward thread, while
+        # polling another worker's native session. Long prefill sequences can
+        # contain many chunks; waiting synchronously here makes every chunk
+        # pay the external-writer timeout before it can compute anything.
+        if externally_owned:
+            def resolve() -> None:
+                try:
+                    self._resolve_external_writers(
+                        execution_id,
+                        externally_owned,
+                        claim,
+                    )
+                except BaseException as error:
+                    for binding in externally_owned:
+                        future = claim.commit_futures.get(binding.key)
+                        if future is None or not future.done():
+                            self._set_failed(execution_id, binding, claim, error)
+
+            try:
+                self._external_writer_executor.submit(resolve)
+            except BaseException as error:
+                for binding in externally_owned:
+                    self._set_failed(execution_id, binding, claim, error)
+        with self._lock:
             for binding in ordered_bindings:
                 entry = self._entries.get(binding.key)
                 if entry is not None:
@@ -210,9 +500,42 @@ class StorePutRegistry:
                     )
 
     def wait_followed(self, keys: list[str], timeout: float | None = None) -> None:
+        if timeout is None:
+            config = self.external_writer_wait_config
+            timeout = config.stale_timeout_s + config.completion_timeout_s
+        deadline = time.monotonic() + timeout
         for key in keys:
-            entry = self._entries[key]
-            entry.future.result(timeout=timeout)
+            with self._lock:
+                entry = self._entries.get(key)
+            if entry is None:
+                raise StoreCommitError(f"Missing followed put entry: {key}")
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                entry.future.result(timeout=remaining)
+            except TimeoutError as error:
+                terminal_error = StoreCommitError(
+                    f"Followed put did not complete within {timeout:.1f}s: {key}"
+                )
+                with self._lock:
+                    current = self._entries.get(key)
+                    if current is not None and not current.future.done():
+                        current.state = PutState.ERROR
+                        current.future.set_exception(terminal_error)
+                raise terminal_error from error
+
+    def completed_followed(self, keys: list[str]) -> list[str]:
+        """Return followed keys whose external object is already committed."""
+
+        with self._lock:
+            return [
+                key
+                for key in keys
+                if (
+                    (entry := self._entries.get(key)) is not None
+                    and entry.state == PutState.COMMITTED
+                    and entry.future.done()
+                )
+            ]
 
     def mark_native_state(self, keys: list[str], state: PutState) -> None:
         with self._lock:
@@ -443,9 +766,17 @@ class StoreReadLeaseRegistry:
 
 
 class RequestStoreLease:
-    def __init__(self, owner: tuple[str, int], registry: StoreReadLeaseRegistry):
+    def __init__(
+        self,
+        owner: tuple[str, int],
+        registry: StoreReadLeaseRegistry,
+        range_batch_size: int = DEFAULT_RANGE_TRANSFER_BATCH_SIZE,
+    ):
+        if range_batch_size <= 0:
+            raise ValueError("range_batch_size must be positive")
         self.owner = owner
         self.registry = registry
+        self.range_batch_size = range_batch_size
         self.history_keys: set[str] = set()
         self.closed = False
 
@@ -474,12 +805,18 @@ class RequestStoreLease:
     ) -> list[int]:
         self.registry.begin_range(self.owner, keys)
         try:
-            return self.registry.backend.batch_get_into_multi_buffer_ranges(
-                keys,
-                all_buffer_ptrs,
-                all_sizes,
-                all_src_offsets,
-            )
+            result: list[int] = []
+            for start in range(0, len(keys), self.range_batch_size):
+                end = start + self.range_batch_size
+                result.extend(
+                    self.registry.backend.batch_get_into_multi_buffer_ranges(
+                        keys[start:end],
+                        all_buffer_ptrs[start:end],
+                        all_sizes[start:end],
+                        all_src_offsets[start:end],
+                    )
+                )
+            return result
         finally:
             self.registry.end_range(keys)
 
@@ -504,13 +841,18 @@ class ChunkStoreSession:
         backend: LayerwiseStoreBackend,
         request_lease: RequestStoreLease,
         put_registry: StorePutRegistry,
+        range_batch_size: int = DEFAULT_RANGE_TRANSFER_BATCH_SIZE,
     ):
+        if range_batch_size <= 0:
+            raise ValueError("range_batch_size must be positive")
         self.request_chunk = request_chunk
         self.backend = backend
         self.request_lease = request_lease
         self.put_registry = put_registry
+        self.range_batch_size = range_batch_size
         self.put_keys: list[str] = []
         self.followed_put_keys: list[str] = []
+        self.external_followed_put_keys: list[str] = []
         self.put_state: dict[str, PutState] = {}
         self.put_end_attempted = False
         self.closed = False
@@ -525,6 +867,9 @@ class ChunkStoreSession:
         # put session through revoke_uncommitted().
         self.put_keys = list(dict.fromkeys(claim.owned_keys))
         self.followed_put_keys = list(dict.fromkeys(claim.followed_keys))
+        self.external_followed_put_keys = list(
+            dict.fromkeys(claim.external_followed_keys)
+        )
         self.put_state = {key: PutState.OPEN for key in self.put_keys}
         self.request_lease.ensure_history(history_keys)
         if claim.failed_keys:
@@ -552,12 +897,17 @@ class ChunkStoreSession:
             # after the producer stream. Synchronize the event here so the
             # source KV is complete before Mooncake starts reading it.
             ready_event.synchronize()
-        result = self.backend.batch_put_from_multi_buffer_ranges(
-            keys,
-            all_buffer_ptrs,
-            all_sizes,
-            all_dst_offsets,
-        )
+        result: list[int] = []
+        for start in range(0, len(keys), self.range_batch_size):
+            end = start + self.range_batch_size
+            result.extend(
+                self.backend.batch_put_from_multi_buffer_ranges(
+                    keys[start:end],
+                    all_buffer_ptrs[start:end],
+                    all_sizes[start:end],
+                    all_dst_offsets[start:end],
+                )
+            )
         expected_bytes = tuple(sum(row) for row in all_sizes)
         if len(result) != len(keys) or any(
             int(code) != expected
@@ -700,8 +1050,25 @@ class ChunkStoreSession:
             raise StoreCommitError(f"Store put_revoke failed: {failed!r}")
 
     def finalize_followed(self, has_more_prefill_chunks: bool) -> None:
-        self.put_registry.wait_followed(self.followed_put_keys)
-        all_keys = list(dict.fromkeys(self.put_keys + self.followed_put_keys))
+        # A follower (whether local or cross-worker) owns no range data. Do
+        # not hold a duplicate request open until a potentially multi-GB long
+        # chunk has finished uploading elsewhere. Only committed objects are
+        # eligible for lease refresh; pending ones can be discovered by the
+        # next chunk through exists()/the registry. Owners still wait for all
+        # range futures before put_end so their NPU cache buffers are not reused
+        # while Mooncake is reading them.
+        local_followed = [
+            key
+            for key in self.followed_put_keys
+            if key not in self.external_followed_put_keys
+        ]
+        completed_external = self.put_registry.completed_followed(
+            self.external_followed_put_keys
+        )
+        completed_local = self.put_registry.completed_followed(local_followed)
+        all_keys = list(
+            dict.fromkeys(self.put_keys + completed_local + completed_external)
+        )
         if has_more_prefill_chunks:
             self.request_lease.refresh_history(
                 list(self.request_lease.history_keys) + all_keys
