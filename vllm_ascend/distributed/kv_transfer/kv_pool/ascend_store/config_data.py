@@ -96,6 +96,8 @@ class KeyMetadata:
     model_fingerprint: str | None = None
     """Version of the physical cache object layout."""
     cache_layout_version: int | None = None
+    """Engine identity used to isolate layerwise Store namespaces."""
+    engine_id: str | None = None
 
 
 @dataclass(order=True)
@@ -110,6 +112,7 @@ class PoolKey:
             self.key_metadata.pcp_rank,
             self.key_metadata.dcp_rank,
             self.key_metadata.pp_rank,
+            self.key_metadata.engine_id,
             self.key_metadata.kv_cache_group_id,
             self.key_metadata.cache_role,
             self.key_metadata.cache_family,
@@ -133,8 +136,9 @@ class PoolKey:
                 "model_fingerprint and cache_layout_version must be supplied together"
             )
         suffix = "" if fingerprint is None else f"@model:{fingerprint}@layout:{layout_version}"
+        engine_suffix = f"@engine_id:{self.key_metadata.engine_id}" if self.key_metadata.engine_id else ""
         return (
-            f"{self.key_metadata.model_name}"
+            f"{self.key_metadata.model_name}{engine_suffix}"
             f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
             f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}"
             f"@pp_rank:{self.key_metadata.pp_rank}"
@@ -171,6 +175,7 @@ class LayerPoolKey(PoolKey):
             self.key_metadata.head_or_tp_rank,
             self.key_metadata.pcp_rank,
             self.key_metadata.dcp_rank,
+            self.key_metadata.engine_id,
             self.key_metadata.kv_cache_group_id,
             self.key_metadata.cache_role,
             self.key_metadata.cache_family,
@@ -195,8 +200,9 @@ class LayerPoolKey(PoolKey):
                 "model_fingerprint and cache_layout_version must be supplied together"
             )
         suffix = "" if fingerprint is None else f"@model:{fingerprint}@layout:{layout_version}"
+        engine_suffix = f"@engine_id:{self.key_metadata.engine_id}" if self.key_metadata.engine_id else ""
         return (
-            f"{self.key_metadata.model_name}"
+            f"{self.key_metadata.model_name}{engine_suffix}"
             f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
             f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}"
             f"@group:{self.key_metadata.kv_cache_group_id}"
@@ -225,6 +231,7 @@ def build_layerwise_store_key(
     cache_layout_version: int,
     group_id: int | None = None,
     cache_family: str | None = None,
+    engine_id: str | None = None,
 ) -> PoolKey:
     """Build one canonical cross-layer block key.
 
@@ -235,8 +242,11 @@ def build_layerwise_store_key(
 
     if not model_fingerprint or cache_layout_version <= 0:
         raise ValueError("Layerwise keys require a model fingerprint and layout version")
+    if not engine_id:
+        raise ValueError("Layerwise keys require an engine_id")
     metadata = replace(
         base_metadata,
+        engine_id=engine_id,
         kv_cache_group_id=base_metadata.kv_cache_group_id if group_id is None else group_id,
         cache_family=base_metadata.cache_family if cache_family is None else cache_family,
         cache_role="layerwise_kv",
@@ -487,6 +497,7 @@ class ChunkedTokenDatabase:
                 pcp_rank=group_metadata.pcp_rank,
                 dcp_rank=group_metadata.dcp_rank,
                 pp_rank=group_metadata.pp_rank,
+                engine_id=group_metadata.engine_id,
                 kv_cache_group_id=kv_cache_group_id,
                 cache_role=cache_role,
                 cache_family=cache_family,

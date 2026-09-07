@@ -137,9 +137,13 @@ class KVPoolWorker:
         if hasattr(model_config, "use_mla") and isinstance(model_config.use_mla, bool) and model_config.use_mla:
             self.use_mla = True
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        configured_engine_id = getattr(vllm_config.kv_transfer_config, "engine_id", None)
+        self.engine_id = str(configured_engine_id) if configured_engine_id else None
         self.use_sparse = hasattr(model_config.hf_text_config, "index_topk")
         self.use_layerwise = use_layerwize
         self.use_layerwise_range = self.use_layerwise and bool(extra_config.get("use_layerwise_range", False))
+        if self.use_layerwise_range and not self.engine_id:
+            raise ValueError("Layerwise Store keys require a non-empty engine_id")
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_size = parallel_config.pipeline_parallel_size
@@ -260,6 +264,7 @@ class KVPoolWorker:
                     self.dcp_rank,
                     self.pp_rank,
                     group_id,
+                    engine_id=self.engine_id,
                 )
             )
 
@@ -499,7 +504,7 @@ class KVPoolWorker:
         self._init_layerwise_range_layout()
         assert self._range_layout_fingerprint is not None
         family = self._get_group_family(self.kv_cache_group_families, group_id)
-        return build_layerwise_store_key(key.key_metadata, key.chunk_hash, model_fingerprint=self._range_layout_fingerprint, cache_layout_version=self._range_layout_version, group_id=group_id, cache_family=family).to_string()
+        return build_layerwise_store_key(key.key_metadata, key.chunk_hash, model_fingerprint=self._range_layout_fingerprint, cache_layout_version=self._range_layout_version, group_id=group_id, cache_family=family, engine_id=self.engine_id).to_string()
 
     def _range_records(self, request: ReqMeta, token_len: int, group_id: int) -> list[_LayerwiseRangeBlock]:
         if group_id >= len(request.block_ids_by_group):
