@@ -404,25 +404,32 @@ class TestMooncakeBackendMethods(unittest.TestCase):
             b.register_buffer([100], [200])
             mock_te.register_buffer.assert_called_once()
 
-    def test_register_additional_buffer(self):
+    def test_layerwise_session_apis_use_pr_2881_names(self):
         b = self._make_backend()
-        with (
-            patch(
-                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.global_te"
-            ) as mock_te,
-            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_ip"),
-        ):
-            b.register_additional_buffer([300], [400])
-            mock_te.register_additional_buffer.assert_called_once_with([300], [400])
+        b.store.batch_put_session_start.return_value = [0]
+        b.store.batch_put_session_end.return_value = [0]
+        b.store.batch_put_session_revoke.return_value = [0]
+        b.store.batch_get_session_start.return_value = [0]
+        b.store.batch_get_session_end.return_value = 0
 
-    def test_register_additional_buffer_is_noop_with_fabric_memory(self):
+        self.assertEqual(b.batch_put_session_start(["k"], [128]), [0])
+        self.assertEqual(b.batch_put_session_end(["k"]), [0])
+        self.assertEqual(b.batch_put_session_revoke(["k"]), [0])
+        self.assertEqual(b.batch_get_session_start(["k"]), [0])
+        self.assertEqual(b.batch_get_session_end(["k"]), 0)
+
+        b.store.batch_put_session_start.assert_called_once()
+        b.store.batch_put_session_end.assert_called_once()
+        b.store.batch_put_session_revoke.assert_called_once()
+        b.store.batch_get_session_start.assert_called_once()
+        b.store.batch_get_session_end.assert_called_once()
+
+    def test_layerwise_session_api_check_reports_missing_pr(self):
         b = self._make_backend()
-        b._use_fabric_mem = True
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.global_te"
-        ) as mock_te:
-            b.register_additional_buffer([300], [400])
-            mock_te.register_additional_buffer.assert_not_called()
+        b.store = MagicMock(spec=["batch_put_session_start"])
+
+        with self.assertRaisesRegex(RuntimeError, "pull/2881"):
+            b.batch_put_session_start(["k"], [128])
 
 
 # =========================================================================
