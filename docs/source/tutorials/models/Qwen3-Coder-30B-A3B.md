@@ -49,8 +49,16 @@ You can use the official all-in-one Docker image for Qwen3 MoE models.
 :::::{tab-set}
 :sync-group: hardware
 
-::::{tab-item} A3 series
+::::{tab-item} Atlas 800I A3
 :sync: a3
+
+**Docker Pull:**
+
+```{code-block} bash
+   :substitutions:
+
+docker pull quay.io/ascend/vllm-ascend:|vllm_ascend_version|-a3
+```
 
 **Docker Run:**
 
@@ -61,8 +69,9 @@ export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|-a3
 
 docker run \
     --name vllm-ascend-env \
-    --ipc host \
-    --net host \
+    --shm-size=128g \
+    --net=host \
+    --privileged=true \
     --device /dev/davinci0 \
     --device /dev/davinci1 \
     --device /dev/davinci2 \
@@ -87,6 +96,12 @@ docker run \
     -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /usr/local/sbin:/usr/local/sbin \
+    -v /home:/home \
+    -v /data:/data \
+    -v /tmp:/tmp \
+    -v /mnt:/mnt \
+    -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+    -v /root:/host_root \
     -it -d $IMAGE bash
 ```
 
@@ -97,8 +112,16 @@ If you are on a shared machine, map only the chips you need (e.g., `/dev/davinci
 
 ::::
 
-::::{tab-item} A2 series
+::::{tab-item} Atlas 800I A2
 :sync: a2
+
+**Docker Pull:**
+
+```{code-block} bash
+   :substitutions:
+
+docker pull quay.io/ascend/vllm-ascend:|vllm_ascend_version|
+```
 
 **Docker Run:**
 
@@ -109,8 +132,9 @@ export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|
 
 docker run \
     --name vllm-ascend-env \
-    --ipc host \
-    --net host \
+    --shm-size=128g \
+    --net=host \
+    --privileged=true \
     --device /dev/davinci0 \
     --device /dev/davinci1 \
     --device /dev/davinci2 \
@@ -127,16 +151,18 @@ docker run \
     -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /usr/local/sbin:/usr/local/sbin \
+    -v /home:/home \
+    -v /data:/data \
+    -v /tmp:/tmp \
+    -v /mnt:/mnt \
+    -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+    -v /root:/host_root \
     -it -d $IMAGE bash
 ```
 
 ::::
 
 :::::
-
-:::{tip}
-The mounts above are the minimum required for NPU driver access. Add additional `-v` mounts (e.g., model weight paths, datasets) as needed for your environment.
-:::
 
 The default workdir is `/workspace`. vLLM and vLLM-Ascend are installed as Python packages in site-packages.
 
