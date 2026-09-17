@@ -818,6 +818,28 @@ class TestReqMeta(unittest.TestCase):
         # so skip_save, and no load_spec => None
         self.assertIsNone(meta)
 
+    def test_from_request_tracker_retains_chunk_history_metadata(self):
+        tracker = RequestTracker(
+            req_id="r1",
+            token_len=33,
+            allocated_block_ids=[0, 1, 2],
+            num_saved_tokens=32,
+        )
+
+        meta = ReqMeta.from_request_tracker(
+            tracker,
+            cache_transfer_granularity=16,
+            is_last_chunk=True,
+            retain_history_metadata=True,
+        )
+
+        self.assertIsNotNone(meta)
+        self.assertFalse(meta.can_save)
+        self.assertEqual(meta.history_token_len, 32)
+        self.assertEqual(meta.token_len_chunk, 32)
+        self.assertEqual(meta.chunk_id, 3)
+        self.assertTrue(meta.is_last_chunk)
+
     def test_from_request_tracker_with_original_block_size(self):
         tracker = RequestTracker(
             req_id="r1",
@@ -825,15 +847,7 @@ class TestReqMeta(unittest.TestCase):
             allocated_block_ids=[0, 1],
             num_saved_tokens=0,
         )
-        # Provide block_hashes (2 full blocks for token_len=32 / granularity=16)
-        # so the boundary_without_hash short-circuit does not zero out the save
-        # length and skip; this exercises the original_block_size propagation.
-        meta = ReqMeta.from_request_tracker(
-            tracker,
-            cache_transfer_granularity=16,
-            original_block_size=8,
-            block_hashes=[b"h0", b"h1"],
-        )
+        meta = ReqMeta.from_request_tracker(tracker, cache_transfer_granularity=16, original_block_size=8)
         self.assertIsNotNone(meta)
         self.assertEqual(meta.original_block_size, 8)
 
