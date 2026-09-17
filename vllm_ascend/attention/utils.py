@@ -163,6 +163,43 @@ def needs_layer_aware_fia_graph_replay() -> bool:
     return any(model_type in {"gemma4", "gemma4_text"} for model_type in model_types)
 
 
+def cache_graph_workspace(
+    graph_params,
+    num_tokens: int,
+    candidate_workspace: torch.Tensor,
+    *,
+    use_max_workspace: bool,
+) -> torch.Tensor:
+    # Most models keep the original first-workspace cache behavior. Models with
+    # mixed attention layer shapes may need the largest workspace for a graph
+    # size because layers can require different FIA workspace sizes.
+    current_workspace = graph_params.workspaces.get(num_tokens)
+    if use_max_workspace:
+        if current_workspace is None or (
+            candidate_workspace.numel() * candidate_workspace.element_size()
+            > current_workspace.numel() * current_workspace.element_size()
+        ):
+            graph_params.workspaces[num_tokens] = candidate_workspace
+    elif current_workspace is None:
+        graph_params.workspaces[num_tokens] = candidate_workspace
+    return graph_params.workspaces[num_tokens]
+
+
+@lru_cache(maxsize=1)
+def needs_layer_aware_fia_graph_replay() -> bool:
+    vllm_config = get_current_vllm_config()
+    model_config = vllm_config.model_config
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    text_config = getattr(hf_config, "text_config", None)
+    model_types = (
+        getattr(hf_config, "model_type", None),
+        getattr(hf_text_config, "model_type", None),
+        getattr(text_config, "model_type", None),
+    )
+    return any(model_type in {"gemma4", "gemma4_text"} for model_type in model_types)
+
+
 def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
     scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
@@ -265,6 +302,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
 
     # Host mirror of this cache group's block table, including padded rows.
 
+    # CPU copy of the per-token KV-cache slot mapping.  Ascend attention
+    # backends (notably SFA) use this copy for host-side cache bookkeeping;
+    # the upstream CommonAttentionMetadata only carries the device tensor.
+    slot_mapping_cpu: torch.Tensor = None
+
     # CPU tensor of already computed tokens count per request.
     # E.g., tensor([100, 200, 50]) means req0 has 100 tokens already computed.
     num_computed_tokens_cpu: torch.Tensor = None
@@ -338,6 +380,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
             slot_mapping=self.slot_mapping,
+            slot_mapping_cpu=self.slot_mapping_cpu,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
@@ -503,6 +546,10 @@ def wait_for_kv_layer_from_connector(layer_name: str):
 
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
+    # Dummy/profile runs can create attention metadata without entering the
+    # normal KV-connector lifecycle (bind_connector_metadata).  In that case
+    # calling into the connector would eventually assert on missing metadata
+    # (for example in MooncakeLayerwiseConnector).
     if attn_metadata is None or not connector.has_connector_metadata():
         return
     # TODO: assert ascendMetadata
@@ -512,6 +559,8 @@ def wait_for_kv_layer_from_connector(layer_name: str):
 def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],
+    *,
+    kv_ready_event: Any | None = None,
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -520,10 +569,17 @@ def maybe_save_kv_layer_to_connector(
 
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
+    # Keep the save path symmetric with the wait path.  A dummy/profile run
+    # must not access a connector after its metadata has been cleared.
     if attn_metadata is None or not connector.has_connector_metadata():
         return
     # TODO: assert ascendMetadata
-    connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+    connector.save_kv_layer(
+        layer_name,
+        kv_cache_layer,
+        attn_metadata,
+        kv_ready_event=kv_ready_event,
+    )
 
 
 def notify_kv_cache_written(layer_name: str = ""):

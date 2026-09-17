@@ -16,6 +16,7 @@ Refer to [Feature Guide](../../user_guide/feature_guide/index.md) to get the fea
 
 ### 3.1 Model Weight
 
+<<<<<<< HEAD
 |  Weight Version          | Hardware Requirements                                             | Download Links |
 |--------------------------|-------------------------------------------------------------------|----------------|
 |  `GLM-5.2`(BF16 version) | 2 Atlas 800 A3 (128GB × 8) node or 4 Atlas 800 A2 (64GB × 8) node | [ModelScope](https://www.modelscope.cn/models/ZhipuAI/GLM-5.2) |
@@ -25,6 +26,10 @@ Refer to [Feature Guide](../../user_guide/feature_guide/index.md) to get the fea
 |  `GLM-5.2-w4a4c8`        | 950PR&950DT Products | Quantize locally with [msmodelslim](https://gitcode.com/Ascend/msmodelslim/blob/master/lab_practice/glm_5_2/glm_5_2_w4a4c8_mxfp4.yaml) |
 
 - `GLM-5.2-w8a8c8`(Quantized version): The weights have been verified and are recommended for use.
+=======
+- `GLM-5.2`(BF16 version): requires 2 Atlas 800 A3 (128G × 8) node or 4 Atlas 800 A2 (64G × 8) node.[Download model weight](https://www.modelscope.cn/models/ZhipuAI/GLM-5.2).
+- `GLM-5.2-w8a8`: requires 1 Atlas 800 A3 (128G × 8) node or 2 Atlas 800 A2 (64G × 8) node.[Download model weight](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w8a8).
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize the model directly.
 - `GLM-5.2-w4a4c8`(W4A4 MXFP4 mixed-precision quantization): For how the ultra-low-bit quantization preserves accuracy, see the [W4A4C8 FAQ](#q-how-do-the-w4a4c8-ultra-low-bit-quantized-weights-preserve-accuracy).
 
@@ -38,8 +43,7 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
 
 ## 4 Installation
 
-- You can use our official docker image to run GLM-5.2 directly.
-- [KV Cache Pool (Ascend Store) Deployment Guide](https://docs.vllm.ai/projects/ascend/zh-cn/latest/user_guide/feature_guide/kv_pool.html)
+You can use our official docker image to run GLM-5.2 directly.
 
 === "A3 series"
 
@@ -47,15 +51,66 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
 
     ```shell
 
+<<<<<<< HEAD
     export IMAGE=quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}-a3
     export NAME=vllm-ascend
+=======
+```{code-block} bash
+   :substitutions:
 
-    # Run the container using the defined variables
-    # Note: If you are running bridge network with docker, please expose available ports for multiple nodes communication in advance
-    docker run --rm \
-    --name $NAME \
-    --net=host \
+export IMAGE=quay.io/ascend/vllm-ascend:glm5.2-a3
+export NAME=vllm-ascend
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
+
+# Run the container using the defined variables
+# Note: If you are running bridge network with docker, please expose available ports for multiple nodes communication in advance
+docker run --rm \
+--name $NAME \
+--net=host \
+--shm-size=1g \
+--device /dev/davinci0 \
+--device /dev/davinci1 \
+--device /dev/davinci2 \
+--device /dev/davinci3 \
+--device /dev/davinci4 \
+--device /dev/davinci5 \
+--device /dev/davinci6 \
+--device /dev/davinci7 \
+--device /dev/davinci8 \
+--device /dev/davinci9 \
+--device /dev/davinci10 \
+--device /dev/davinci11 \
+--device /dev/davinci12 \
+--device /dev/davinci13 \
+--device /dev/davinci14 \
+--device /dev/davinci15 \
+--device /dev/davinci_manager \
+--device /dev/devmm_svm \
+--device /dev/hisi_hdc \
+-v /usr/local/dcmi:/usr/local/dcmi \
+-v /usr/local/Ascend/driver/tools/hccn_tool:/usr/local/Ascend/driver/tools/hccn_tool \
+-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+-v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+-v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /root/.cache:/root/.cache \
+-it $IMAGE bash
+```
+
+::::
+::::{tab-item} A2 series
+:sync: A2
+
+Start the docker image on each of your nodes.
+
+```{code-block} bash
+   :substitutions:
+
+export IMAGE=quay.io/ascend/vllm-ascend:glm5.2
+docker run --rm \
+    --name vllm-ascend \
     --shm-size=1g \
+    --net=host \
     --device /dev/davinci0 \
     --device /dev/davinci1 \
     --device /dev/davinci2 \
@@ -64,14 +119,6 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
     --device /dev/davinci5 \
     --device /dev/davinci6 \
     --device /dev/davinci7 \
-    --device /dev/davinci8 \
-    --device /dev/davinci9 \
-    --device /dev/davinci10 \
-    --device /dev/davinci11 \
-    --device /dev/davinci12 \
-    --device /dev/davinci13 \
-    --device /dev/davinci14 \
-    --device /dev/davinci15 \
     --device /dev/davinci_manager \
     --device /dev/devmm_svm \
     --device /dev/hisi_hdc \
@@ -85,6 +132,7 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
     -it $IMAGE bash
     ```
 
+<<<<<<< HEAD
 === "A2 series"
 
     Start the docker image on each of your nodes.
@@ -116,6 +164,10 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
         -v /root/.cache:/root/.cache \
         -it $IMAGE bash
     ```
+=======
+::::
+:::::
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 If you want to deploy multi-node environment, you need to set up environment on each node.
 
@@ -123,9 +175,13 @@ If you want to deploy multi-node environment, you need to set up environment on 
 
 ### 5.1 Context Below 1M
 
+<<<<<<< HEAD
 #### 5.1.1 Single-node Deployment
 
 - Quantized model `GLM-5.2-w4a8c8` can be deployed on 1 Atlas 800 A3 (64GB × 16) .
+=======
+- Quantized model `glm-5.2-w8a8` can be deployed on 1 Atlas 800 A3 (64G × 16) .
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 Run the following script to execute online inference.
 
@@ -133,29 +189,41 @@ Run the following script to execute online inference.
 export HCCL_BUFFSIZE=200
 export HCCL_OP_EXPANSION_MODE="AIV"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+<<<<<<< HEAD
 # Ensure the model path matches the directory recorded during download
 vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w4a8c8 \
 --host 0.0.0.0 \
 --port 8000 \
 --api-server-count 1 \
+=======
+export VLLM_ASCEND_BALANCE_SCHEDULING=1
+export VLLM_ASCEND_ENABLE_MLAPO=1
+export VLLM_VERSION=0.21.0
+vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w8a8 \
+--host 0.0.0.0 \
+--port 8077 \
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 --data-parallel-size 2 \
---enable-expert-parallel \
 --tensor-parallel-size 8 \
+--enable-expert-parallel \
 --seed 1024 \
---served-model-name glm-5 \
---tool-call-parser glm47 \
---reasoning-parser glm45 \
---enable-auto-tool-choice \
---max-num-seqs 12 \
---max-model-len 135000 \
---max-num-batched-tokens 8192 \
+--served-model-name glm-52 \
+--max-num-seqs 48 \
+--max-model-len 20480 \
+--max-num-batched-tokens 4096 \
 --trust-remote-code \
---gpu-memory-utilization 0.92 \
+--gpu-memory-utilization 0.95 \
 --quantization ascend \
+--async-scheduling \
+--additional-config '{"enable_npugraph_ex": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true}' \
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+<<<<<<< HEAD
 --attention_config.indexer_kv_dtype int8 \
 --additional-config '{"enable_dsa_cp": true, "enable_balance_scheduling": true,"multistream_overlap_shared_expert":true, "enable_flashcomm1": true, "enable_fused_mc2": 0}' \
 --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
+=======
+--speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 ```
 
@@ -168,6 +236,7 @@ The parameters are explained as follows:
 
 === "A3 series"
 
+<<<<<<< HEAD
     - `GLM-5.2-w4a8c8`: can be deployed on 2 Atlas 800 A3 (64GB × 16).
 
     Run the following scripts on two nodes respectively.
@@ -269,18 +338,39 @@ The parameters are explained as follows:
 === "A2 series"
 
     - `GLM-5.2-w4a8c8`: can be deployed on 2 Atlas 800 A2 (64GB × 32).
+=======
+:::::{tab-set}
+:sync-group: install
+
+::::{tab-item} A3 series
+:sync: A3
+
+- `glm-5.2-w8a8`: can be deployed on 2 Atlas 800 A3 (64G × 16).
+
+Run the following scripts on two nodes respectively.
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     **node 0**
 
+<<<<<<< HEAD
     ```shell
     # this obtained through ifconfig
     # nic_name is the network interface name corresponding to local_ip of the current node
     nic_name="xxx"
     local_ip="xxx"
+=======
+```{code-block} bash
+   :substitutions:
+# this obtained through ifconfig
+# nic_name is the network interface name corresponding to local_ip of the current node
+nic_name="xxx"
+local_ip="xxx"
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
-    # The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
-    node0_ip="xxx"
+# The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
+node0_ip="xxxx"
 
+<<<<<<< HEAD
     export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000
     export HCCL_IF_IP=$local_ip
     export HCCL_OP_EXPANSION_MODE="AIV"
@@ -311,18 +401,67 @@ The parameters are explained as follows:
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     --speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp", "enforce_eager": true}'
     ```
+=======
+export VLLM_VERSION=0.21.0
+export HCCL_OP_EXPANSION_MODE="AIV"
+export VLLM_ASCEND_BALANCE_SCHEDULING=0
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export HCCL_BUFFSIZE=400
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export VLLM_ASCEND_ENABLE_MLAPO=1
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+export ASCEND_LAUNCH_BLOCKING=0
+
+vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w8a8 \
+--host 0.0.0.0 \
+--port 8077 \
+--data-parallel-size 2 \
+--data-parallel-size-local 1 \
+--data-parallel-address $node0_ip \
+--data-parallel-rpc-port 12980 \
+--tensor-parallel-size 16 \
+--seed 1024 \
+--served-model-name glm-52 \
+--max-num-seqs 48 \
+--max-model-len 64000 \
+--max-num-batched-tokens 4096 \
+--trust-remote-code \
+--gpu-memory-utilization 0.93 \
+--quantization ascend \
+--enable-prefix-caching \
+--async-scheduling \
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+--additional-config '{"enable_npugraph_ex": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true}' \
+--speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp"}'
+```
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     **node 1**
 
+<<<<<<< HEAD
     ```shell
     # this obtained through ifconfig
     # nic_name is the network interface name corresponding to local_ip of the current node
     nic_name="xxx"
     local_ip="xxx"
+=======
+```{code-block} bash
+   :substitutions:
+# this obtained through ifconfig
+# nic_name is the network interface name corresponding to local_ip of the current node
+nic_name="xxx"
+local_ip="xxx"
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
-    # The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
-    node0_ip="xxx"
+# The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
+node0_ip="xxxx"
 
+<<<<<<< HEAD
     export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000
     export HCCL_IF_IP=$local_ip
     export HCCL_OP_EXPANSION_MODE="AIV"
@@ -354,10 +493,298 @@ The parameters are explained as follows:
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     --speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp", "enforce_eager": true}'
     ```
+=======
+export VLLM_VERSION=0.21.0
+export HCCL_OP_EXPANSION_MODE="AIV"
+export VLLM_ASCEND_BALANCE_SCHEDULING=0
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export HCCL_BUFFSIZE=400
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export VLLM_ASCEND_ENABLE_MLAPO=1
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+export ASCEND_LAUNCH_BLOCKING=0
+
+vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w8a8 \
+--host 0.0.0.0 \
+--port 8077 \
+--headless \
+--data-parallel-size 2 \
+--data-parallel-size-local 1 \
+--data-parallel-start-rank 1 \
+--data-parallel-rpc-port 12980 \
+--data-parallel-address $node0_ip \
+--tensor-parallel-size 16 \
+--seed 1024 \
+--served-model-name glm-52 \
+--max-num-seqs 48 \
+--max-model-len 64000 \
+--max-num-batched-tokens 4096 \
+--trust-remote-code \
+--gpu-memory-utilization 0.93 \
+--quantization ascend \
+--enable-prefix-caching \
+--async-scheduling \
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+--additional-config '{"enable_npugraph_ex": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true}' \
+--speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp"}'
+```
+
+::::
+::::{tab-item} A2 series
+:sync: A2
+
+- `glm-5.2-w8a8`: can be deployed on 2 Atlas 800 A2 (64G × 32).
+
+**node 0**
+
+```{code-block} bash
+   :substitutions:
+# this obtained through ifconfig
+# nic_name is the network interface name corresponding to local_ip of the current node
+nic_name="xxx"
+local_ip="xxx"
+
+# The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
+node0_ip="xxx"
+
+export HCCL_OP_EXPANSION_MODE="AIV"
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export VLLM_RPC_TIMEOUT=360000
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000
+export HCCL_EXEC_TIMEOUT=200
+export HCCL_CONNECT_TIMEOUT=120
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ACL_OP_INIT_MODE=1
+#export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+#export USE_MULTI_GROUPS_KV_CACHE=1
+#export USE_MULTI_BLOCK_POOL=1
+export TASK_QUEUE_ENABLE=1
+export CPU_AFFINITY_CONF=1
+export VLLM_ENGINE_READY_TIMEOUT_S=1200
+
+export VLLM_VERSION=0.21.0
+vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w8a8 \
+--max_model_len 40000 \
+--max-num-batched-tokens 4096 \
+--served-model-name glm-52 \
+--seed 1024 \
+--gpu-memory-utilization 0.95 \
+--api-server-count 1 \
+--max-num-seqs 16 \
+--data-parallel-size 2 \
+--data-parallel-size-local 1 \
+--data-parallel-address $node0_ip \
+--data-parallel-rpc-port 13389 \
+--tensor-parallel-size 8 \
+--enable-expert-parallel \
+--quantization ascend \
+--port 7000 \
+--safetensors-load-strategy 'prefetch' \
+--block-size 128 \
+--async-scheduling \
+--additional-config '{"fuse_muls_add": true, "multistream_overlap_shared_expert": true}' \
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+--speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp"}'
+```
+
+**node 1**
+
+```{code-block} bash
+   :substitutions:
+# this obtained through ifconfig
+# nic_name is the network interface name corresponding to local_ip of the current node
+nic_name="xxx"
+local_ip="xxx"
+
+# The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
+node0_ip="xxx"
+
+export HCCL_OP_EXPANSION_MODE="AIV"
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export VLLM_RPC_TIMEOUT=360000
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000
+export HCCL_EXEC_TIMEOUT=200
+export HCCL_CONNECT_TIMEOUT=120
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ACL_OP_INIT_MODE=1
+#export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+#export USE_MULTI_GROUPS_KV_CACHE=1
+#export USE_MULTI_BLOCK_POOL=1
+export TASK_QUEUE_ENABLE=1
+export CPU_AFFINITY_CONF=1
+export VLLM_ENGINE_READY_TIMEOUT_S=1200
+
+export VLLM_VERSION=0.21.0
+vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w8a8 \
+--max_model_len 40000 \
+--max-num-batched-tokens 4096 \
+--served-model-name glm-52 \
+--seed 1024 \
+--gpu-memory-utilization 0.95 \
+--max-num-seqs 16 \
+--headless \
+--data-parallel-size 2 \
+--data-parallel-size-local 1 \
+--data-parallel-start-rank 1 \
+--data-parallel-address $node0_ip \
+--data-parallel-rpc-port 13389 \
+--tensor-parallel-size 8 \
+--enable-expert-parallel \
+--quantization ascend \
+--port 7000 \
+--safetensors-load-strategy 'prefetch' \
+--block-size 128 \
+--async-scheduling \
+--additional-config '{"fuse_muls_add": true, "multistream_overlap_shared_expert": true}' \
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+--speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp"}'
+```
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 #### 5.1.3 Prefill-Decode Disaggregation
 
+<<<<<<< HEAD
 We'd like to show the deployment guide of `GLM-5.2` on multi-node environment with 1P1D for better performance.
+=======
+### Co-located Deployment on 4 Nodes (200k context)
+
+In a co-located (mixed) deployment, prefill and decode run together on the same nodes, in contrast to the disaggregated setup below. The following templates deploy `GLM-5.2` across 4 nodes with `DP4 TP8` (`data-parallel-size-local=1` per node), a 200k context window, and MTP (`num_speculative_tokens=5`). Node 0 hosts the API server and is the DP master; Node 1 to Node 3 run with `--headless`. Prefix caching is disabled (`--no-enable-prefix-caching`) in this configuration. All IPs, NIC names, ports and weight paths are placeholders.
+
+**Node 0** (API server / DP master):
+
+```bash
+#!/usr/bin/bash
+
+nic_name="<NIC_NAME>"
+local_ip=$(hostname -I | awk -F " " '{print $1}')
+echo "$local_ip"
+
+export HCCL_OP_EXPANSION_MODE="AIV"
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+
+export VLLM_RPC_TIMEOUT=360000
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000
+export HCCL_EXEC_TIMEOUT=200
+export HCCL_CONNECT_TIMEOUT=120
+
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ACL_OP_INIT_MODE=1
+
+export TASK_QUEUE_ENABLE=1
+export CPU_AFFINITY_CONF=1
+export VLLM_ENGINE_READY_TIMEOUT_S=1200
+
+export VLLM_VERSION=0.21.0
+
+vllm serve <MODEL_PATH> \
+  --max_model_len 200000 \
+  --max-num-batched-tokens 4096 \
+  --served-model-name glm-52 \
+  --seed 1024 \
+  --api-server-count 1 \
+  --gpu-memory-utilization 0.95 \
+  --max-num-seqs 32 \
+  --data-parallel-size 4 \
+  --data-parallel-size-local 1 \
+  --data-parallel-address $local_ip \
+  --data-parallel-rpc-port 13389 \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --quantization ascend \
+  --port 7000 \
+  --safetensors-load-strategy 'prefetch' \
+  --block-size 128 \
+  --enable-chunked-prefill \
+  --no-enable-prefix-caching \
+  --async-scheduling \
+  --additional-config '{"fuse_muls_add": true, "multistream_overlap_shared_expert": true}' \
+  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+  --speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp"}'
+```
+
+**Node 1** (headless, `--data-parallel-start-rank 1`):
+
+```bash
+#!/usr/bin/bash
+
+nic_name="<NIC_NAME>"
+local_ip=$(hostname -I | awk -F " " '{print $1}')
+node0_ip="<NODE0_IP>"
+echo "$local_ip"
+
+export HCCL_OP_EXPANSION_MODE="AIV"
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+
+export VLLM_RPC_TIMEOUT=360000
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000
+export HCCL_EXEC_TIMEOUT=200
+export HCCL_CONNECT_TIMEOUT=120
+
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ACL_OP_INIT_MODE=1
+
+export TASK_QUEUE_ENABLE=1
+export CPU_AFFINITY_CONF=1
+export VLLM_ENGINE_READY_TIMEOUT_S=1200
+
+export VLLM_VERSION=0.21.0
+
+vllm serve <MODEL_PATH> \
+  --max_model_len 200000 \
+  --max-num-batched-tokens 4096 \
+  --headless \
+  --served-model-name glm-52 \
+  --seed 1024 \
+  --gpu-memory-utilization 0.95 \
+  --max-num-seqs 32 \
+  --safetensors-load-strategy 'prefetch' \
+  --data-parallel-size 4 \
+  --data-parallel-size-local 1 \
+  --data-parallel-start-rank 1 \
+  --data-parallel-address $node0_ip \
+  --data-parallel-rpc-port 13389 \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --quantization ascend \
+  --port 7000 \
+  --block-size 128 \
+  --enable-chunked-prefill \
+  --no-enable-prefix-caching \
+  --async-scheduling \
+  --additional-config '{"fuse_muls_add": true, "multistream_overlap_shared_expert": true}' \
+  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+  --speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp"}'
+```
+
+Node 2 and Node 3 use the same script as Node 1, with `--data-parallel-start-rank` set to `2` and `3` respectively (and `node0_ip` pointing to Node 0).
+
+### Prefill-Decode Disaggregation
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 In the PD disaggregation scenario, Mooncake is used as the KV cache transfer connector between the prefill and decode nodes. Please refer to [KV Cache Pool (Ascend Store) Deployment Guide](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md) for the Mooncake configuration.
 
@@ -1234,7 +1661,12 @@ prepare the script `launch_online_dp.py` on each node (used by the prefill and d
 
 prepare the script `run_dp_template.sh` on each node.
 
+<<<<<<< HEAD
 1. Prefill node 0
+=======
+    To support a 200k context window on the stage of prefill, the parameter `"layer_sharding": ["q_b_proj"]` needs to be added to `--additional_config` on each prefill node.
+    1. Prefill node 0
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     ```shell
     nic_name="<NIC_NAME>" # change to your own nic name
@@ -1242,6 +1674,7 @@ prepare the script `run_dp_template.sh` on each node.
     # p0: api server on this node; p1: --headless
     server_role_args="--api-server-count 1"
 
+<<<<<<< HEAD
     export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000
     export HCCL_BUFFSIZE=400
     export HCCL_IF_IP=$local_ip
@@ -1286,16 +1719,78 @@ prepare the script `run_dp_template.sh` on each node.
         --reasoning-parser glm45 \
         --kv-transfer-config '{
             "kv_connector": "MooncakeConnectorV1",
+=======
+        export VLLM_VERSION=0.21.0
+        export HCCL_OP_EXPANSION_MODE="AIV"
+        export HCCL_IF_IP=$local_ip
+        export GLOO_SOCKET_IFNAME=$nic_name
+        export TP_SOCKET_IFNAME=$nic_name
+        export HCCL_SOCKET_IFNAME=$nic_name
+        export OMP_PROC_BIND=false
+        export OMP_NUM_THREADS=1
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export HCCL_BUFFSIZE=400
+        export ASCEND_AGGREGATE_ENABLE=1
+        export ASCEND_TRANSPORT_PRINT=1
+        export ACL_OP_INIT_MODE=1
+        export ASCEND_A3_ENABLE=1
+        export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=480
+        export ASCEND_RT_VISIBLE_DEVICES=$1
+        export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+        export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+
+        vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w8a8 \
+            --host 0.0.0.0 \
+            --port $2 \
+            --data-parallel-size $3 \
+            --data-parallel-rank $4 \
+            --data-parallel-address $5 \
+            --data-parallel-rpc-port $6 \
+            --tensor-parallel-size $7 \
+            --enable-expert-parallel \
+            --seed 1024 \
+            --served-model-name glm-52 \
+            --max-model-len 135000 \
+            --speculative-config '{"num_speculative_tokens": 5, "method":"deepseek_mtp"}' \
+            --additional-config '{"enable_sparse_c8":false,"fuse_muls_add": true, "multistream_overlap_shared_expert": true, "enable_dsa_cp": true}' \
+            --max-num-batched-tokens 4096 \
+            --trust-remote-code \
+            --max-num-seqs 64 \
+            --async-scheduling \
+            --quantization ascend \
+            --gpu-memory-utilization 0.95 \
+            --enforce-eager \
+            --enable-auto-tool-choice \
+            --tool-call-parser glm47 \
+            --reasoning-parser glm45 \
+            --kv-transfer-config \
+            '{"kv_connector": "MooncakeConnectorV1",
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             "kv_role": "kv_producer",
             "kv_port": "30000",
             "engine_id": "0",
             "kv_connector_extra_config": {
+<<<<<<< HEAD
                 "use_ascend_direct": true,
                 "prefill": {"dp_size": 2, "tp_size": 16},
                 "decode": { "dp_size": 4, "tp_size": 8}
             }
         }'
     ```
+=======
+                        "use_ascend_direct": true,
+                        "prefill": {
+                                "dp_size": 2,
+                                "tp_size": 16
+                        },
+                        "decode": {
+                                "dp_size": 8,
+                                "tp_size": 4
+                        }
+                }
+            }'
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 2. Prefill node 1
 
@@ -1307,6 +1802,7 @@ prepare the script `run_dp_template.sh` on each node.
     # p0: api server on this node; p1: --headless
     server_role_args="--headless"
 
+<<<<<<< HEAD
     export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000
     export HCCL_BUFFSIZE=400
     export HCCL_IF_IP=$local_ip
@@ -1350,16 +1846,79 @@ prepare the script `run_dp_template.sh` on each node.
         --reasoning-parser glm45 \
         --kv-transfer-config '{
             "kv_connector": "MooncakeConnectorV1",
+=======
+        export VLLM_VERSION=0.21.0
+        export HCCL_OP_EXPANSION_MODE="AIV"
+        export HCCL_IF_IP=$local_ip
+        export GLOO_SOCKET_IFNAME=$nic_name
+        export TP_SOCKET_IFNAME=$nic_name
+        export HCCL_SOCKET_IFNAME=$nic_name
+        export OMP_PROC_BIND=false
+        export OMP_NUM_THREADS=1
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export HCCL_BUFFSIZE=400
+        export ASCEND_AGGREGATE_ENABLE=1
+        export ASCEND_TRANSPORT_PRINT=1
+        export ACL_OP_INIT_MODE=1
+        export ASCEND_A3_ENABLE=1
+        export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=480
+        export ASCEND_RT_VISIBLE_DEVICES=$1
+        export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+        export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        
+        vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w8a8 \
+            --host 0.0.0.0 \
+            --port $2 \
+            --data-parallel-size $3 \
+            --data-parallel-rank $4 \
+            --data-parallel-address $5 \
+            --data-parallel-rpc-port $6 \
+            --tensor-parallel-size $7 \
+            --enable-expert-parallel \
+            --seed 1024 \
+            --served-model-name glm-52 \
+            --max-model-len 135000 \
+            --speculative-config '{"num_speculative_tokens": 5, "method":"deepseek_mtp"}' \
+            --additional-config '{"enable_sparse_c8":false,"fuse_muls_add": true, "multistream_overlap_shared_expert": true, "enable_dsa_cp": true}' \
+            --max-num-batched-tokens 4096 \
+            --trust-remote-code \
+            --max-num-seqs 64 \
+            --async-scheduling \
+            --quantization ascend \
+            --gpu-memory-utilization 0.95 \
+            --enforce-eager \
+            --enable-auto-tool-choice \
+            --tool-call-parser glm47 \
+            --reasoning-parser glm45 \
+            --kv-transfer-config \
+            '{"kv_connector": "MooncakeConnectorV1",
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             "kv_role": "kv_producer",
             "kv_port": "30000",
             "engine_id": "0",
             "kv_connector_extra_config": {
+<<<<<<< HEAD
                 "use_ascend_direct": true,
                 "prefill": {"dp_size": 2, "tp_size": 16},
                 "decode": { "dp_size": 4, "tp_size": 8}
             }
         }'
     ```
+=======
+                        "use_ascend_direct": true,
+                        "prefill": {
+                                "dp_size": 2,
+                                "tp_size": 16
+                        },
+                        "decode": {
+                                "dp_size": 8,
+                                "tp_size": 4
+                        }
+                }
+            }'
+        ```
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 3. Decode node 0
 
@@ -1367,6 +1926,7 @@ prepare the script `run_dp_template.sh` on each node.
     nic_name="<NIC_NAME>" # change to your own nic name
     local_ip="<CURRENT_DECODE_NODE_IP>" # change to your own ip
 
+<<<<<<< HEAD
     # d0: api server on this node; d1: --headless
     server_role_args="--api-server-count 1"
 
@@ -1413,19 +1973,84 @@ prepare the script `run_dp_template.sh` on each node.
         --reasoning-parser glm45 \
         --kv-transfer-config '{
             "kv_connector": "MooncakeConnectorV1",
+=======
+        export HCCL_OP_EXPANSION_MODE="AIV"
+        export HCCL_IF_IP=$local_ip
+        export GLOO_SOCKET_IFNAME=$nic_name
+        export TP_SOCKET_IFNAME=$nic_name
+        export HCCL_SOCKET_IFNAME=$nic_name
+        export OMP_PROC_BIND=false
+        export OMP_NUM_THREADS=1
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export HCCL_BUFFSIZE=500
+        export ASCEND_AGGREGATE_ENABLE=1
+        export ASCEND_TRANSPORT_PRINT=1
+        export ACL_OP_INIT_MODE=1
+        export ASCEND_A3_ENABLE=1
+        export VLLM_VERSION=0.21.0
+        export TASK_QUEUE_ENABLE=1
+        export ASCEND_RT_VISIBLE_DEVICES=$1
+        export DYNAMIC_EPLB=1
+        export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+        export VLLM_ASCEND_ENABLE_MLAPO=1
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+
+        vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w8a8 \
+            --host 0.0.0.0 \
+            --port $2 \
+            --data-parallel-size $3 \
+            --data-parallel-rank $4 \
+            --data-parallel-address $5 \
+            --data-parallel-rpc-port $6 \
+            --tensor-parallel-size $7 \
+            --enable-expert-parallel \
+            --seed 1024 \
+            --served-model-name glm-52 \
+            --max-model-len 135000 \
+            --max-num-batched-tokens 164 \
+            --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+            --speculative-config '{"num_speculative_tokens": 5, "method":"deepseek_mtp"}' \
+            --additional-config '{"enable_sparse_c8":false,"fuse_muls_add": true, "multistream_overlap_shared_expert": true, "recompute_scheduler_enable": true}' \
+            --trust-remote-code \
+            --max-num-seqs 48 \
+            --gpu-memory-utilization 0.92 \
+            --async-scheduling \
+            --quantization ascend \
+            --enable-auto-tool-choice \
+            --tool-call-parser glm47 \
+            --reasoning-parser glm45 \
+            --kv-transfer-config \
+            '{"kv_connector": "MooncakeConnectorV1",
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             "kv_role": "kv_consumer",
             "kv_port": "30200",
             "engine_id": "2",
             "kv_connector_extra_config": {
+<<<<<<< HEAD
                 "use_ascend_direct": true,
                 "prefill": {"dp_size": 2, "tp_size": 16},
                 "decode": { "dp_size": 4, "tp_size": 8}
             }
         }'
     ```
+=======
+                        "use_ascend_direct": true,
+                        "prefill": {
+                                "dp_size": 2,
+                                "tp_size": 16
+                        },
+                        "decode": {
+                                "dp_size": 8,
+                                "tp_size": 4
+                        }
+                }
+            }'
+        ```
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 4. Decode node 1
 
+<<<<<<< HEAD
     ```shell
     nic_name="<NIC_NAME>" # change to your own nic name
     local_ip="<CURRENT_DECODE_NODE_IP>" # change to your own ip
@@ -1476,16 +2101,84 @@ prepare the script `run_dp_template.sh` on each node.
         --reasoning-parser glm45 \
         --kv-transfer-config '{
             "kv_connector": "MooncakeConnectorV1",
+=======
+         ```shell
+        nic_name="xxxx" # change to your own nic name
+        local_ip="xxxx" # change to your own ip
+            
+        export HCCL_OP_EXPANSION_MODE="AIV"
+        export HCCL_IF_IP=$local_ip
+        export GLOO_SOCKET_IFNAME=$nic_name
+        export TP_SOCKET_IFNAME=$nic_name
+        export HCCL_SOCKET_IFNAME=$nic_name
+        export OMP_PROC_BIND=false
+        export OMP_NUM_THREADS=1
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export HCCL_BUFFSIZE=500
+        export ASCEND_AGGREGATE_ENABLE=1
+        export ASCEND_TRANSPORT_PRINT=1
+        export ACL_OP_INIT_MODE=1
+        export ASCEND_A3_ENABLE=1
+        export TASK_QUEUE_ENABLE=1
+        export VLLM_VERSION=0.21.0
+        export ASCEND_RT_VISIBLE_DEVICES=$1
+        export DYNAMIC_EPLB=1
+        export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+        export VLLM_ASCEND_ENABLE_MLAPO=1
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+
+        vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w8a8 \
+            --host 0.0.0.0 \
+            --port $2 \
+            --data-parallel-size $3 \
+            --data-parallel-rank $4 \
+            --data-parallel-address $5 \
+            --data-parallel-rpc-port $6 \
+            --tensor-parallel-size $7 \
+            --enable-expert-parallel \
+            --seed 1024 \
+            --served-model-name glm-52 \
+            --max-model-len 135000 \
+            --max-num-batched-tokens 164 \
+            --speculative-config '{"num_speculative_tokens": 5, "method":"deepseek_mtp"}' \
+            --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+            --additional-config '{"enable_sparse_c8":false,"fuse_muls_add": true, "multistream_overlap_shared_expert": true, "recompute_scheduler_enable": true}' \
+            --trust-remote-code \
+            --max-num-seqs 48 \
+            --gpu-memory-utilization 0.92 \
+            --async-scheduling \
+            --quantization ascend \
+            --enable-auto-tool-choice \
+            --tool-call-parser glm47 \
+            --reasoning-parser glm45 \
+            --kv-transfer-config \
+            '{"kv_connector": "MooncakeConnectorV1",
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             "kv_role": "kv_consumer",
             "kv_port": "30200",
             "engine_id": "2",
             "kv_connector_extra_config": {
+<<<<<<< HEAD
                 "use_ascend_direct": true,
                 "prefill": {"dp_size": 2, "tp_size": 16},
                 "decode": { "dp_size": 4, "tp_size": 8}
             }
         }'
     ```
+=======
+                         "use_ascend_direct": true,
+                         "prefill": {
+                                 "dp_size": 2,
+                                 "tp_size": 16
+                         },
+                         "decode": {
+                                 "dp_size": 8,
+                                 "tp_size": 4
+                         }
+                 }
+             }'
+         ```
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 Once the preparation is done, start the server on each node:
 
@@ -1493,31 +2186,50 @@ Once the preparation is done, start the server on each node:
 
     ```shell
     # change ip to your own
+<<<<<<< HEAD
     python launch_online_dp.py --dp-size 2 --tp-size 16 --dp-size-local 1 --dp-rank-start 0 --dp-address $node_p0_ip --dp-rpc-port 16591 --vllm-start-port 9081
+=======
+    python launch_online_dp.py --dp-size 2 --tp-size 16  --dp-size-local 1 --dp-rank-start 0 --dp-address $node_p0_ip --dp-rpc-port 16591 --vllm-start-port 9081
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     ```
 
 2. Prefill node 1
 
     ```shell
     # change ip to your own
+<<<<<<< HEAD
     python launch_online_dp.py --dp-size 2 --tp-size 16 --dp-size-local 1 --dp-rank-start 1 --dp-address $node_p0_ip --dp-rpc-port 16591 --vllm-start-port 9082
+=======
+    python launch_online_dp.py --dp-size 2 --tp-size 16  --dp-size-local 1 --dp-rank-start 1 --dp-address $node_p0_ip --dp-rpc-port 16591 --vllm-start-port 9081
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     ```
 
 3. Decode node 0
 
     ```shell
     # change ip to your own
+<<<<<<< HEAD
     python launch_online_dp.py --dp-size 4 --tp-size 8 --dp-size-local 2 --dp-rank-start 0 --dp-address $node_d0_ip --dp-rpc-port 16600 --vllm-start-port 9900
+=======
+    python launch_online_dp.py --dp-size 8 --tp-size 4 --dp-size-local 4 --dp-rank-start 0 --dp-address $node_d0_ip --dp-rpc-port 16600 --vllm-start-port 9900
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     ```
 
 4. Decode node 1
 
     ```shell
     # change ip to your own
+<<<<<<< HEAD
     python launch_online_dp.py --dp-size 4 --tp-size 8 --dp-size-local 2 --dp-rank-start 2 --dp-address $node_d0_ip --dp-rpc-port 16600 --vllm-start-port 9900
     ```
 
 To set up request forwarding, run the following script on any machine.
+=======
+    python launch_online_dp.py --dp-size 8 --tp-size 4 --dp-size-local 4 --dp-rank-start 4 --dp-address $node_d0_ip --dp-rpc-port 16600 --vllm-start-port 9900
+    ```
+
+To set up request forwarding, run the following script on any machine. You can get the proxy program in the repository's examples: [load_balance_proxy_server_example.py](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py)
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 ```shell
 unset http_proxy
@@ -1528,6 +2240,7 @@ python load_balance_proxy_server_example.py \
     --host 0.0.0.0 \
     --prefiller-hosts \
       $node_p0_ip \
+<<<<<<< HEAD
     --prefiller-ports \
       9081 \
     --decoder-hosts \
@@ -1535,6 +2248,23 @@ python load_balance_proxy_server_example.py \
       $node_d0_ip \
     --decoder-ports \
       9900 9901
+=======
+      $node_p1_ip \
+    --prefiller-ports \
+      9081 9081 \
+    --decoder-hosts \
+      $node_d0_ip \
+      $node_d0_ip \
+      $node_d0_ip \
+      $node_d0_ip \
+      $node_d1_ip \
+      $node_d1_ip \
+      $node_d1_ip \
+      $node_d1_ip \
+    --decoder-ports \
+      9900 9901 9902 9903 \
+      9900 9901 9902 9903
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 ```
 
 Key Parameter Descriptions (in addition to [Prefill-Decode Disaggregation](#513-prefill-decode-disaggregation) and [Single-Node 1M Deployment](#521-single-node-1m-deployment)):
@@ -1545,6 +2275,7 @@ The `run_dp_template.sh` templates use the positional parameters passed by `laun
 
 - `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000` / `MF_GROUP_JOIN_MAX_TIMEOUT=1200`: Timeout settings for the slow multi-node startup and model execution of the 1M context scenario. Increase them if the engine fails to become ready in time.
 
+<<<<<<< HEAD
 **Prefill nodes (1M):**
 
 - `--speculative-config '{"num_speculative_tokens": 1, ...}'`: Minimal MTP speculation during prefill.
@@ -1552,6 +2283,81 @@ The `run_dp_template.sh` templates use the positional parameters passed by `laun
 - `--kv-transfer-config`: Mooncake connector as `kv_producer` with `prefill: dp2 tp16` / `decode: dp4 tp8`.
 
 **Decode nodes (1M):**
+=======
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export VLLM_HOST_IP=$local_ip
+
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+export HCCL_OP_EXPANSION_MODE="AIV"
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export HCCL_BUFFSIZE=256
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_AGGREGATE_ENABLE=1
+export ASCEND_TRANSPORT_PRINT=1
+export ACL_OP_INIT_MODE=1
+export VLLM_NIXL_ABORT_REQUEST_TIMEOUT=300000
+export VLLM_VERSION=0.21.0
+
+export ASCEND_RT_VISIBLE_DEVICES=$1
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+
+vllm serve <MODEL_PATH> \
+  --host 0.0.0.0 \
+  --port $2 \
+  --data-parallel-size $3 \
+  --data-parallel-rank $4 \
+  --data-parallel-address $5 \
+  --data-parallel-rpc-port $6 \
+  --tensor-parallel-size $7 \
+  --enable-expert-parallel \
+  --seed 1024 \
+  --served-model-name glm-52 \
+  --max-model-len 115168 \
+  --max-num-batched-tokens 4096 \
+  --trust-remote-code \
+  --max-num-seqs 64 \
+  --gpu-memory-utilization 0.95 \
+  --quantization ascend \
+  --async-scheduling \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --enforce-eager \
+  --enable-auto-tool-choice \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --kv-transfer-config \
+  '{
+    "kv_connector": "MooncakeConnector",
+    "kv_role": "kv_producer",
+    "kv_port": "30000",
+    "engine_id": "0",
+    "kv_connector_module_path": "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector",
+    "kv_connector_extra_config": {
+      "use_ascend_direct": true,
+      "prefill": {
+        "dp_size": 4,
+        "tp_size": 8
+      },
+      "decode": {
+        "dp_size": 8,
+        "tp_size": 4
+      }
+    }
+  }' \
+  --additional-config \
+  '{
+    "enable_sparse_c8": false,
+    "fuse_muls_add": true,
+    "multistream_overlap_shared_expert": true,
+    "enable_dsa_cp": true
+  }' \
+  --speculative-config '{"num_speculative_tokens": 3, "method":"deepseek_mtp"}'
+```
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 - `--max-num-batched-tokens 192`: Small batch token limit on decode nodes — decode nodes store the large 1M KV cache received from prefill nodes.
 - `enable_mlapo`: MLAPO fusion on decode nodes for memory-bandwidth-bound token generation.
@@ -1559,7 +2365,151 @@ The `run_dp_template.sh` templates use the positional parameters passed by `laun
 
 Please refer to [envs.py](https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/envs.py) for further explanation and restrictions of the environment variables above.
 
+<<<<<<< HEAD
 ## 6 Functional Verification
+=======
+nic_name="<NIC_NAME>"
+local_ip="<CURRENT_NODE_IP>"
+
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export VLLM_HOST_IP=$local_ip
+
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+export VLLM_ASCEND_ENABLE_MLAPO=1
+export HCCL_OP_EXPANSION_MODE="AIV"
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export HCCL_BUFFSIZE=500
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TASK_QUEUE_ENABLE=1
+export ASCEND_AGGREGATE_ENABLE=1
+export ASCEND_TRANSPORT_PRINT=1
+export ACL_OP_INIT_MODE=1
+export VLLM_VERSION=0.21.0
+export DYNAMIC_EPLB=1
+
+export ASCEND_RT_VISIBLE_DEVICES=$1
+
+vllm serve <MODEL_PATH> \
+  --host 0.0.0.0 \
+  --port $2 \
+  --data-parallel-size $3 \
+  --data-parallel-rank $4 \
+  --data-parallel-address $5 \
+  --data-parallel-rpc-port $6 \
+  --tensor-parallel-size $7 \
+  --enable-expert-parallel \
+  --seed 1024 \
+  --served-model-name glm-52 \
+  --max-model-len 135168 \
+  --max-num-batched-tokens 164 \
+  --trust-remote-code \
+  --max-num-seqs 48 \
+  --gpu-memory-utilization 0.92 \
+  --async-scheduling \
+  --quantization ascend \
+  --enable-prefix-caching \
+  --enable-auto-tool-choice \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --kv-transfer-config \
+  '{
+    "kv_connector": "MooncakeConnector",
+    "kv_role": "kv_consumer",
+    "kv_port": "30100",
+    "engine_id": "1",
+    "kv_connector_module_path": "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector",
+    "kv_connector_extra_config": {
+      "use_ascend_direct": true,
+      "prefill": {
+        "dp_size": 4,
+        "tp_size": 8
+      },
+      "decode": {
+        "dp_size": 8,
+        "tp_size": 4
+      }
+    }
+  }' \
+  --compilation-config \
+  '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+  --additional-config \
+  '{
+    "enable_sparse_c8": false,
+    "fuse_muls_add": true,
+    "multistream_overlap_shared_expert": true,
+    "recompute_scheduler_enable": true
+  }' \
+  --speculative-config '{"num_speculative_tokens": 3, "method":"deepseek_mtp"}'
+```
+
+Once the preparation is done, start the server with the following commands:
+
+1. Prefill nodes — run on `$node_p0_ip`, `$node_p1_ip`, `$node_p2_ip`, `$node_p3_ip` with `--dp-rank-start` `0/1/2/3`:
+
+    ```shell
+    python launch_online_dp.py --dp-size 4 --tp-size 8 --dp-size-local 1 --dp-rank-start 0 --dp-address $node_p0_ip --dp-rpc-port 16591 --vllm-start-port 9081
+    python launch_online_dp.py --dp-size 4 --tp-size 8 --dp-size-local 1 --dp-rank-start 1 --dp-address $node_p0_ip --dp-rpc-port 16591 --vllm-start-port 9081
+    python launch_online_dp.py --dp-size 4 --tp-size 8 --dp-size-local 1 --dp-rank-start 2 --dp-address $node_p0_ip --dp-rpc-port 16591 --vllm-start-port 9081
+    python launch_online_dp.py --dp-size 4 --tp-size 8 --dp-size-local 1 --dp-rank-start 3 --dp-address $node_p0_ip --dp-rpc-port 16591 --vllm-start-port 9081
+    ```
+
+2. Decode nodes — run on `$node_d0_ip`, `$node_d1_ip`, `$node_d2_ip`, `$node_d3_ip` with `--dp-rank-start` `0/2/4/6`:
+
+    ```shell
+    python launch_online_dp.py --dp-size 8 --tp-size 4 --dp-size-local 2 --dp-rank-start 0 --dp-address $node_d0_ip --dp-rpc-port 16600 --vllm-start-port 9900
+    python launch_online_dp.py --dp-size 8 --tp-size 4 --dp-size-local 2 --dp-rank-start 2 --dp-address $node_d0_ip --dp-rpc-port 16600 --vllm-start-port 9900
+    python launch_online_dp.py --dp-size 8 --tp-size 4 --dp-size-local 2 --dp-rank-start 4 --dp-address $node_d0_ip --dp-rpc-port 16600 --vllm-start-port 9900
+    python launch_online_dp.py --dp-size 8 --tp-size 4 --dp-size-local 2 --dp-rank-start 6 --dp-address $node_d0_ip --dp-rpc-port 16600 --vllm-start-port 9900
+    ```
+
+For request forwarding on this 8-node A2 layout, use 4 prefiller hosts (1 endpoint each) and 4 decoder hosts (2 endpoints each) in the Request Forwarding command below.
+
+To set up request forwarding, run the following script on any machine. You can get the proxy program in the repository's examples: [load_balance_proxy_server_example.py](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py)
+
+```shell
+unset http_proxy
+unset https_proxy
+
+python load_balance_proxy_server_example.py \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --prefiller-hosts \
+      $node_p0_ip \
+      $node_p1_ip \
+      $node_p2_ip \
+      $node_p3_ip \
+    --prefiller-ports \
+      9081 9081 \
+      9081 9081 \
+    --decoder-hosts \
+      $node_d0_ip \
+      $node_d0_ip \
+      $node_d1_ip \
+      $node_d1_ip \
+      $node_d2_ip \
+      $node_d2_ip \
+      $node_d3_ip \
+      $node_d3_ip \
+    --decoder-ports \
+      9900 9901 9900 9901 \
+      9900 9901 9900 9901
+```
+
+**Notice:**
+
+Some configurations for optimization are shown below:
+
+- `VLLM_ASCEND_ENABLE_FLASHCOMM1`: Enable FlashComm optimization to reduce communication and computation overhead on prefill node. With FlashComm enabled, layer_sharding list cannot include o_proj as an element.
+- `VLLM_ASCEND_ENABLE_FUSED_MC2`: Enable following fused operators: dispatch_gmm_combine_decode and dispatch_ffn_combine operator.
+
+Please refer to the following python file for further explanation and restrictions of the environment variables above: [envs.py](https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/envs.py)
+
+## Functional Verification
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 Once your server is started, you can query the model with input prompts:
 
@@ -1639,7 +2589,11 @@ Refer to [Using AISBench for performance evaluation](../../developer_guide/evalu
 Refer to [vllm benchmark](https://docs.vllm.ai/en/latest/benchmarking/) for more details.
 
 **Notice:**
+<<<<<<< HEAD
 `max-model-len` and `max-num-seqs` need to be set according to the actual usage scenario. For other settings, please refer to the **[Deployment](#5-deployment)** chapter.
+=======
+`max-model-len` and `max-num-seqs` need to be set according to the actual usage scenario. For other settings, please refer to the **[Deployment](#deployment)** chapter.
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 ## 9 Performance Tuning
 

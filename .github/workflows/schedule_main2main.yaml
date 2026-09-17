@@ -186,7 +186,11 @@ jobs:
       group: main2main
       cancel-in-progress: false
     container:
+<<<<<<< HEAD
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12
+=======
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.12
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
       env:
         VLLM_LOGGING_LEVEL: ERROR
         VLLM_USE_MODELSCOPE: True
@@ -208,10 +212,15 @@ jobs:
       run:
         shell: bash -el {0}
     env:
+<<<<<<< HEAD
       GH_TOKEN: ${{ secrets.DEV_SUBMITTER_TOKEN }}
       OBS_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.HW_OBS_AK }}
       OBS_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.HW_OBS_SK }}
       MAIN2MAIN_IMAGE_TAG: 9.1.0-a3-ubuntu22.04-py3.12
+=======
+      GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+      MAIN2MAIN_IMAGE_TAG: 9.0.0-910b-ubuntu22.04-py3.12
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
       TARGET_COMMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.target_commit || '' }}
       PUSH_TO_GITHUB: 'true'
       GITHUB_REPO: vllm-project/vllm-ascend

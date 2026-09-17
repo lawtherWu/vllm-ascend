@@ -50,9 +50,24 @@ You can use the official all-in-one Docker image for Qwen3 MoE models.
 
 === "A3 series"
 
+<<<<<<< HEAD
     **Docker Run:**
 
     ```bash
+=======
+::::{tab-item} Atlas 800I A3
+:sync: a3
+
+**Docker Pull:**
+
+```{code-block} bash
+   :substitutions:
+
+docker pull quay.io/ascend/vllm-ascend:|vllm_ascend_version|-a3
+```
+
+**Docker Run:**
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     export IMAGE=quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}-a3
 
@@ -87,16 +102,71 @@ You can use the official all-in-one Docker image for Qwen3 MoE models.
         -it -d $IMAGE bash
     ```
 
+<<<<<<< HEAD
     !!! note
+=======
+docker run \
+    --name vllm-ascend-env \
+    --shm-size=128g \
+    --net=host \
+    --privileged=true \
+    --device /dev/davinci0 \
+    --device /dev/davinci1 \
+    --device /dev/davinci2 \
+    --device /dev/davinci3 \
+    --device /dev/davinci4 \
+    --device /dev/davinci5 \
+    --device /dev/davinci6 \
+    --device /dev/davinci7 \
+    --device /dev/davinci8 \
+    --device /dev/davinci9 \
+    --device /dev/davinci10 \
+    --device /dev/davinci11 \
+    --device /dev/davinci12 \
+    --device /dev/davinci13 \
+    --device /dev/davinci14 \
+    --device /dev/davinci15 \
+    --device /dev/davinci_manager \
+    --device /dev/devmm_svm \
+    --device /dev/hisi_hdc \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /home:/home \
+    -v /data:/data \
+    -v /tmp:/tmp \
+    -v /mnt:/mnt \
+    -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+    -v /root:/host_root \
+    -it -d $IMAGE bash
+```
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
         A3 has 8 NPUs with dual-die design (16 chips total: `/dev/davinci[0-15]`).
         If you are on a shared machine, map only the chips you need (e.g., `/dev/davinci[0-7]` for NPU 0-3).
 
 === "A2 series"
 
+<<<<<<< HEAD
     **Docker Run:**
 
     ```bash
+=======
+::::{tab-item} Atlas 800I A2
+:sync: a2
+
+**Docker Pull:**
+
+```{code-block} bash
+   :substitutions:
+
+docker pull quay.io/ascend/vllm-ascend:|vllm_ascend_version|
+```
+
+**Docker Run:**
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     export IMAGE=quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}
 
@@ -123,8 +193,44 @@ You can use the official all-in-one Docker image for Qwen3 MoE models.
         -it -d $IMAGE bash
     ```
 
+<<<<<<< HEAD
 !!! tip
     The mounts above are the minimum required for NPU driver access. Add additional `-v` mounts (e.g., model weight paths, datasets) as needed for your environment.
+=======
+docker run \
+    --name vllm-ascend-env \
+    --shm-size=128g \
+    --net=host \
+    --privileged=true \
+    --device /dev/davinci0 \
+    --device /dev/davinci1 \
+    --device /dev/davinci2 \
+    --device /dev/davinci3 \
+    --device /dev/davinci4 \
+    --device /dev/davinci5 \
+    --device /dev/davinci6 \
+    --device /dev/davinci7 \
+    --device /dev/davinci_manager \
+    --device /dev/devmm_svm \
+    --device /dev/hisi_hdc \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /home:/home \
+    -v /data:/data \
+    -v /tmp:/tmp \
+    -v /mnt:/mnt \
+    -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+    -v /root:/host_root \
+    -it -d $IMAGE bash
+```
+
+::::
+
+:::::
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 The default workdir is `/workspace`. vLLM and vLLM-Ascend are installed as Python packages in site-packages.
 

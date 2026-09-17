@@ -346,6 +346,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         self,
         token_dispatch_input: MoETokenDispatchInput,
     ):
+<<<<<<< HEAD
         quant_type = token_dispatch_input.quant.quant_type
         dynamic_scale = token_dispatch_input.routing.pertoken_scale
         unquantized_mxfp4_dispatch = quant_type == QuantType.W4A4MXFP and dynamic_scale is None
@@ -360,15 +361,23 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
                 dynamic_scale=dynamic_scale,
             )
             with_quant = False
+=======
+        # TODO: After AllGather MXFP4 communication quantization thorough verification, remove this judgment.
+        #  MXFP4 keeps dispatch unquantized in AllGather path, and quantizes again inside the MLP path.
+        with_quant = (
+            token_dispatch_input.quant.dispatch_with_quant
+            and token_dispatch_input.quant.quant_type != QuantType.W8A8FP8
+        )
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         is_mxfp = token_dispatch_input.quant.is_mxfp
         hidden_states = token_dispatch_input.hidden_states
         topk_weights = token_dispatch_input.topk_weights
         topk_ids = token_dispatch_input.topk_ids
         expert_map = token_dispatch_input.routing.expert_map
+        dynamic_scale = token_dispatch_input.routing.pertoken_scale
+        quant_type = token_dispatch_input.quant.quant_type
         act_quant_type = (
-            token_dispatch_input.quant.mxfp.act_quant_type
-            if token_dispatch_input.quant.mxfp is not None and not unquantized_mxfp4_dispatch
-            else None
+            token_dispatch_input.quant.mxfp.act_quant_type if token_dispatch_input.quant.mxfp is not None else None
         )
         global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
         restore_shape = hidden_states.shape
@@ -478,6 +487,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
     ):
         use_mxfp_quant = token_dispatch_input.quant.is_mxfp
         with_quant = token_dispatch_input.quant.dispatch_with_quant
+<<<<<<< HEAD
         if has_lora(self.lora_context) and token_dispatch_input.quant.is_quant:
             validate_quant_moe_lora_activation_input(
                 quant_type=token_dispatch_input.quant.quant_type,
@@ -489,6 +499,9 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             # each local expert GMM, after the AlltoAll exchange.
             with_quant = False
         dst_type = token_dispatch_input.quant.get_dst_type
+=======
+        scale_type = token_dispatch_input.quant.get_scale_type
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         hidden_states = token_dispatch_input.hidden_states
         topk_weights = token_dispatch_input.topk_weights
         topk_ids = token_dispatch_input.topk_ids
@@ -506,6 +519,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
 
         dynamic_scale_after_all2all = None
         if with_quant:
+            dst_type = token_dispatch_input.quant.get_dst_type
             permutated_local_input_tokens, dynamic_scale = DeviceOperator.npu_dynamic_quant(
                 permutated_local_input_tokens, act_quant_type=dst_type, use_mxfp_quant=use_mxfp_quant
             )
@@ -536,7 +550,11 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                 dynamic_scale_after_all2all,
                 global_input_tokens_local_experts_indices,
                 with_quant,
+<<<<<<< HEAD
                 dst_type,
+=======
+                scale_type,
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             )
         )
 
@@ -664,7 +682,11 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         dynamic_scale_after_all2all,
         global_input_tokens_local_experts_indices,
         with_quant,
+<<<<<<< HEAD
         dst_type,
+=======
+        scale_type,
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     ):
         # Early return if no local experts or no tokens
         if self.num_local_experts <= 1:
@@ -674,6 +696,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             "global_input_tokens_local_experts_indices must be provided"
         )
 
+<<<<<<< HEAD
         if with_quant:
             global_input_tokens, reversed_global_input_permutation_mapping, _, dynamic_scale_after_all2all = (
                 torch_npu.npu_moe_init_routing_v2(
@@ -685,6 +708,32 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                     active_expert_range=[0, self.num_local_experts],
                     x_dtype=dst_type,
                 )
+=======
+        experts_indices_2d_copy = global_input_tokens_local_experts_indices.reshape(
+            global_input_tokens_local_experts_indices.shape[0], 1
+        )
+
+        if scale_type == torch.float8_e8m0fnu:
+            dynamic_scale_for_routing = dynamic_scale_after_all2all.view(torch.float8_e8m0fnu)
+            global_input_tokens, reversed_global_input_permutation_mapping, _, routed_scale = (
+                torch_npu.npu_moe_init_routing_v2(
+                    global_input_tokens,
+                    experts_indices_2d_copy,
+                    scale=dynamic_scale_for_routing,
+                    active_num=experts_indices_2d_copy.shape[0],
+                    expert_num=self.num_local_experts,
+                    expert_tokens_num_type=1,
+                    expert_tokens_num_flag=True,
+                    active_expert_range=[0, self.num_local_experts],
+                )
+            )
+            dynamic_scale_after_all2all = routed_scale.view(torch.uint8)
+            experts_indices_2d_copy.untyped_storage().resize_(0)
+            return global_input_tokens, dynamic_scale_after_all2all, reversed_global_input_permutation_mapping
+        elif with_quant:
+            dynamic_scale_after_all2all, _ = torch_npu.npu_moe_token_permute(
+                dynamic_scale_after_all2all.unsqueeze(-1), global_input_tokens_local_experts_indices
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             )
         else:
             global_input_tokens, reversed_global_input_permutation_mapping = torch_npu.npu_moe_token_permute(

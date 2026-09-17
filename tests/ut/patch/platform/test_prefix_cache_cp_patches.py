@@ -9,6 +9,7 @@ import pytest
 import torch
 import vllm.v1.core.kv_cache_utils as vllm_kv_cache_utils
 from vllm.v1.core.block_pool import BlockPool
+<<<<<<< HEAD
 from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     generate_scheduler_kv_cache_config,
@@ -18,6 +19,8 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     SlidingWindowManager,
     register_all_kvcache_specs,
 )
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -25,7 +28,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
-    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -1285,6 +1287,7 @@ def test_ascend_mamba_manager_uses_logical_block_size_with_prefix_caching() -> N
     manager = AscendMambaManager(**manager_kwargs)
 
     assert manager.block_size == mamba_spec.block_size
+<<<<<<< HEAD
 
 
 def test_ascend_mamba_cache_lookup_ignores_dcp_sharding() -> None:
@@ -1364,3 +1367,5 @@ def test_swa_reachable_block_mask_sparse_with_lcm_alignment() -> None:
         f"expected {expected} cached blocks ({4}/{128} per segment), got {true_blocks}/{total_blocks}"
     )
     assert true_blocks > 0 and true_blocks < total_blocks, f"mask should be sparse, got {true_blocks}/{total_blocks}"
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)

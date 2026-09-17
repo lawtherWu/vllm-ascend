@@ -232,8 +232,13 @@ vllm serve your_model_path \
     --no-enable-prefix-caching \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     --gpu-memory-utilization 0.95 \
+<<<<<<< HEAD
     --additional-config '{"weight_nz_mode": 2}' \
     --port 8000
+=======
+    --additional-config '{"enable_flashcomm1": true, "weight_nz_mode": 2}' \
+    --port 8000 
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 ```
 
 !!! note
@@ -477,7 +482,11 @@ vllm serve your_model_path \
     --no-enable-prefix-caching \
     --quantization ascend \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+<<<<<<< HEAD
     --additional-config '{"weight_nz_mode": 2}' \
+=======
+    --additional-config '{"enable_flashcomm1": true, "weight_nz_mode": 2}' \
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     --gpu-memory-utilization 0.95 \
     --port 8000 \
     --speculative-config '{"method": "eagle3","model": "your_eagle3_model_path", "num_speculative_tokens": 3}'
@@ -544,7 +553,11 @@ vllm serve your_model_path \
     --no-enable-prefix-caching \
     --quantization ascend \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+<<<<<<< HEAD
     --additional-config '{"weight_nz_mode": 2}' \
+=======
+    --additional-config '{"enable_flashcomm1": true, "weight_nz_mode": 2}' \
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     --gpu-memory-utilization 0.95 \
     --port 8000 \
     --hf-overrides '{"rope_parameters": {"rope_type":"yarn","factor":4,"original_max_position_embeddings":32768}}'

@@ -322,6 +322,72 @@ class TestAscendEmbeddingForwardOOT:
 
         assert mock_npu_op.call_args[0][-1] is True
 
+<<<<<<< HEAD
+=======
+    @patch("vllm_ascend.ops.rotary_embedding.is_forward_context_available", return_value=True)
+    @patch("torch.ops.vllm.maybe_all_gather_and_maybe_unpad")
+    @patch("torch.ops.vllm.npu_rotary_embedding")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_gather_unpad_called_when_all_conditions_met(
+        self, mock_get_forward_context, mock_npu_op, mock_gather, mock_is_ctx, make_embedding
+    ):
+        """
+        maybe_all_gather_and_maybe_unpad is called iff:
+          is_draft_model=True AND use_mtp=True AND flash_comm_v1_enabled=True
+        """
+        mock_get_forward_context.return_value = MagicMock()
+        mock_get_forward_context.return_value.is_draft_model = True
+        mock_get_forward_context.return_value.flash_comm_v1_enabled = True
+        gathered_positions = torch.arange(SEQ_LEN, dtype=torch.long)
+        mock_gather.return_value = gathered_positions
+        mock_npu_op.return_value = MagicMock()
+
+        emb = make_embedding(use_mtp=True)
+        positions, query, key = _make_tensors()
+
+        emb.forward_oot(positions, query, key)
+
+        mock_gather.assert_called_once()
+        # npu op should receive the gathered positions, not the originals
+        assert mock_npu_op.call_args[0][0] is gathered_positions
+
+    @pytest.mark.parametrize(
+        "is_draft_model,flash_comm,use_mtp",
+        [
+            (False, True, True),  # not draft
+            (True, False, True),  # flash_comm disabled
+            (True, True, False),  # use_mtp disabled
+        ],
+    )
+    @patch("torch.ops.vllm.maybe_all_gather_and_maybe_unpad")
+    @patch("torch.ops.vllm.npu_rotary_embedding")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_gather_unpad_skipped_unless_all_conditions_met(
+        self,
+        mock_get_forward_context,
+        mock_npu_op,
+        mock_gather,
+        is_draft_model,
+        flash_comm,
+        use_mtp,
+        make_embedding,
+    ):
+        """gather/unpad must NOT fire if any one of the three conditions is False."""
+        mock_get_forward_context.return_value = MagicMock()
+        mock_get_forward_context.return_value.is_draft_model = is_draft_model
+        mock_get_forward_context.return_value.flash_comm_v1_enabled = flash_comm
+        mock_npu_op.return_value = MagicMock()
+
+        emb = make_embedding(use_mtp=use_mtp)
+        positions, query, key = _make_tensors()
+
+        emb.forward_oot(positions, query, key)
+
+        mock_gather.assert_not_called()
+        # Original positions tensor is passed through untouched
+        assert mock_npu_op.call_args[0][0] is positions
+
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     def test_parent_init_signature_has_not_changed(self):
         """
         Fail loudly if RotaryEmbedding.__init__ adds, removes, or

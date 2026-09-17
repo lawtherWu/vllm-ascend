@@ -14,7 +14,11 @@ import torch
 from einops import rearrange
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+<<<<<<< HEAD
 from vllm.third_party.flash_linear_attention.ops.utils import SUPPRESS_LEVEL
+=======
+from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
@@ -99,6 +103,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens_host = tuple(cu_seqlens.tolist())
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
         chunk_indices_chunk64_host = tuple(chunk_indices.flatten().tolist())
+<<<<<<< HEAD
     # Compact zero-length segments for the AscendC kernels (see
     # _compact_empty_segments).  chunk_indices_chunk64 is already compact-
     # ranked and is reused as-is; only cu_seqlens / initial_state need
@@ -113,27 +118,23 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens_kern, initial_state_kern = cu_seqlens_host, initial_state
         keep_meta = None
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h_vllm(
+=======
+    h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         k_ascendc,
         w_ascendc,
         u_ascendc,
         g=g_transpose,
         gk=None,
-        initial_state=initial_state_kern,
+        initial_state=initial_state,
         output_final_state=True,
         chunk_size=64,
         save_new_value=True,
-        cu_seqlens=cu_seqlens_kern,
+        cu_seqlens=cu_seqlens_host,
         chunk_indices=chunk_indices_chunk64_host,
         use_exp2=False,
         transpose_state_layout=False,
     )
-    if keep_meta is not None:
-        # Scatter the compacted final_state back to the original [N, H, K, V]
-        # layout the PCP state recursion expects; empty segments keep their
-        # initial state.
-        _fs_full = initial_state.clone()
-        _fs_full[keep_meta] = final_state
-        final_state = _fs_full
 
     if get_pcp_group().world_size > 1:
         # When integrating mtp, since `mix_qkv` has been split, `num_decode`
@@ -162,9 +163,12 @@ def chunk_gated_delta_rule_fwd(
         updated_state = final_state.new_empty(get_pcp_group().world_size, *final_state.shape)
         updated_state[0, ...] = all_final_state[0]
         for i in range(1, get_pcp_group().world_size):
+<<<<<<< HEAD
             # correct_i = all_final_state[i] + Φ_i · (correct_{i-1} - s0) = Φ_i · correct_{i-1} + p_i
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             updated_final_state = all_final_state[i] + torch.matmul(
-                all_final_h_update[i, ...], updated_state[i - 1, ...] - initial_state
+                all_final_h_update[i, ...], updated_state[i - 1, ...]
             )
             updated_state[i, ...] = updated_final_state
 
@@ -177,7 +181,11 @@ def chunk_gated_delta_rule_fwd(
 
         if get_pcp_group().rank_in_group > 0:
             rerun_initial_state = initial_state.clone()
-            prefill_seq_offset = actual_num_decodes
+            if cu_seqlens is not None:
+                _ns_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                prefill_seq_offset = int(((_ns_lens > 0) & (_ns_lens <= 1)).sum().item())
+            else:
+                prefill_seq_offset = num_decodes
             prefill_slice = slice(prefill_seq_offset, final_state.shape[0])
             rerun_initial_state[prefill_slice] = updated_h_state[prefill_slice]
             h, v_new, _ = chunk_gated_delta_rule_fwd_h(

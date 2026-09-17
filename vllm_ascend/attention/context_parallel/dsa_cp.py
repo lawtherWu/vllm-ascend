@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention import dsa_v1
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+<<<<<<< HEAD
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
 from vllm_ascend.attention.dsa_attn_kv_plan import (
     get_dsa_attn_kv_plan,
@@ -38,14 +39,22 @@ from vllm_ascend.attention.utils import (
 )
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, get_storage_block_size
 from vllm_ascend.device.device_config import is_950
+=======
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.device.mxfp_compat import is_rms_norm_dynamic_mx_quant_fusion_available
+<<<<<<< HEAD
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.models.common.ops.sequence_parallel import sp_reduce_scatter
 from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata
 from vllm_ascend.models.deepseek_v4.indexer import AscendIndexerMetadata
 from vllm_ascend.ops.cv_linear import CVLinearWrapper
+=======
+from vllm_ascend.distributed.utils import all_gather_async
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.ops.triton.dsa_cp import BUILD_LOCAL_METADATA_BLOCK_SIZE, build_local_metadata_triton
@@ -1027,6 +1036,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_heads = self.model_config.hf_config.num_attention_heads
         index_topk = self.model_config.hf_config.index_topk
 
+<<<<<<< HEAD
         if self._device_metadata_enabled:
             assert build_local_metadata is not None
             device_local_metadata_group_id = id(self.req_sas_metadata)
@@ -1092,6 +1102,28 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_q=max_local_query_len,
                 max_seqlen_k=max_local_seq_lens,
             )
+=======
+        sas_metadata = self._build_sas_metadata(
+            num_heads=num_heads,
+            query_start_loc=local_query_start_loc,
+            seq_lens=local_seq_lens,
+            seq_lens_q=local_seq_lens_q,
+            max_query_len=max_local_query_len,
+            max_seq_lens=max_local_seq_lens,
+            index_topk=index_topk,
+            num_reqs=num_reqs,
+            has_prefill=has_prefill,
+            cu_cmp_seqlen_list=cu_cmp_seqlens,
+        )
+
+        # --- QLI metadata (all requests combined) ---
+        qli_metadata = self._build_qli_metadata(
+            query_start_loc=local_query_start_loc,
+            seq_lens=local_seq_lens,
+            seq_lens_q=local_seq_lens_q,
+            num_reqs=num_reqs,
+        )
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
         cp_metadata = DSACPMetadata(
             local_query_start_loc=local_query_start_loc,
@@ -1285,6 +1317,10 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_heads,
         query_start_loc,
         seq_lens,
+<<<<<<< HEAD
+=======
+        seq_lens_q,
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         max_query_len,
         max_seq_lens,
         index_topk,
@@ -1353,6 +1389,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.req_sas_metadata[:SAS_METADATA_SIZE] = metadata
         return self.req_sas_metadata[:SAS_METADATA_SIZE]
 
+<<<<<<< HEAD
     def _build_qli_metadata(
         self,
         query_start_loc,
@@ -1361,6 +1398,9 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         max_seqlen_q,
         max_seqlen_k,
     ):
+=======
+    def _build_qli_metadata(self, query_start_loc, seq_lens, seq_lens_q, num_reqs):
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         if self.compressor_ratio != 4:
             return None
 
@@ -1381,7 +1421,15 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         metadata = self.common_ratio_to_sas_metadata.get(cache_key)
 
         if metadata is None:
+<<<<<<< HEAD
             metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+=======
+            max_seqlen_q = max(1, int(seq_lens_q.max().item()))
+            max_seqlen_k = max(1, int(seq_lens.max().item()))
+            metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
+                actual_seq_lengths_query=query_start_loc[1:].clone(),
+                actual_seq_lengths_key=seq_lens.clone(),
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
                 num_heads_q=self.model_config.hf_config.index_n_heads,
                 num_heads_k=1,
                 head_dim=self.model_config.hf_config.index_head_dim,
@@ -1392,10 +1440,20 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 cmp_residual_k=qli_cmp_residual_k,
                 batch_size=num_reqs,
                 max_seqlen_q=max_seqlen_q,
+<<<<<<< HEAD
                 max_seqlen_k=max_seqlen_k // 4,
                 layout_q="TND",
                 layout_k="PA_BBND",
                 mask_mode=3,
+=======
+                max_seqlen_k=max_seqlen_k,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.model_config.hf_config.index_topk,
+                sparse_mode=3,
+                pre_tokens=(1 << 63) - 1,
+                next_tokens=(1 << 63) - 1,
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
                 cmp_ratio=4,
                 device=str(self.seqused_q.device),
             )
@@ -1742,6 +1800,7 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
         if attn_metadata is None:
             # Profiling run.
             return output.fill_(0)
+<<<<<<< HEAD
         layer_metadata = self._get_layer_metadata(layer_name, attn_metadata)
         common_attn_metadata = layer_metadata.compressor_cache
         if common_attn_metadata is None:
@@ -1753,6 +1812,20 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
         }
         full_gather_wo_a_enabled = self.tp_size > 1 and self.enable_dsa_cp_full_o_proj and not is_decode
         local_attn_output = self._forward(
+=======
+        if not isinstance(attn_metadata, list):
+            attn_metadata = [attn_metadata]
+        full_gather_wo_a_enabled = (
+            self.tp_size > 1
+            and self.enable_dsa_cp_with_o_proj_tp
+            and attn_metadata[0].attn_state
+            not in {
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding,
+            }
+        )
+        local_attn_output, o_proj_full_handles = self._forward(
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             layer_name,
             hidden_states,
             kv_cache,
@@ -1810,6 +1883,7 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                     perm_x2=(0, 1, 2),
                     perm_y=(1, 0, 2),
                 )
+<<<<<<< HEAD
             o_proj_input = o.reshape(num_tokens, -1)
         else:
             o_proj_input = o_proj_input.view(num_tokens, o_proj_groups, -1)
@@ -1829,6 +1903,33 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
         if output is None:
             return projected_output
         output[...] = projected_output
+=======
+                o = o.reshape(num_tokens, -1)
+                output[...] = self._apply_wo_b(o, full_gather_wo_a_enabled)
+            else:
+                o_proj_input = o_proj_input.view(num_tokens, o_proj_groups, -1)
+                if olora_tp_enable():
+                    o_proj_input = self.wo_a(o_proj_input)
+                else:
+                    # wo_a = self.wo_a.weight.view(o_proj_groups, self.o_lora_rank, -1)
+                    # o = torch.einsum("tgd,grd->tgr", o, wo_a)
+                    o_proj_input = torch_npu.npu_transpose_batchmatmul(
+                        o_proj_input,
+                        self.wo_a.weight,
+                        bias=None,
+                        scale=None,
+                        perm_x1=(1, 0, 2),
+                        perm_x2=(0, 1, 2),
+                        perm_y=(1, 0, 2),
+                        batch_split_factor=1,
+                    )
+                o_proj_input = o_proj_input.reshape(num_tokens, -1)
+                output[...] = self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)
+        finally:
+            if full_gather_wo_a_enabled:
+                self._switch_o_proj_to_tp_weight()
+
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         return output
 
     def _forward(
@@ -2002,10 +2103,15 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                 compress_kv_cache, compressed_kv, compress_slot_mapping
             )
 
+<<<<<<< HEAD
         notify_kv_cache_written(layer_name)
         kv_plan = get_dsa_attn_kv_plan(self.vllm_config)
         attn_op = kv_plan.get_dsa_sparse_attn_op()
         extra_attn_kwargs = kv_plan.get_dsa_sparse_attn_base_kwargs()
+=======
+        attn_op = DeviceOperator.get_dsa_sparse_attn_op()
+        extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         if has_prefill:
             kv_plan.add_dsa_sparse_attn_extra_kwargs(extra_attn_kwargs, cu_seqlens_ori_kv=local_seq_lengths_query)
         if swa_req_metadata.dspark_swa_indices is not None:

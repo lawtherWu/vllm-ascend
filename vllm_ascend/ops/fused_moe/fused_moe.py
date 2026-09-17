@@ -82,6 +82,7 @@ direct_register_custom_op(
 )
 
 
+<<<<<<< HEAD
 class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     def __init__(
         self,
@@ -98,6 +99,222 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         routed_scaling_factor=1,
     ):
         super().__init__(
+=======
+@dataclass
+class FusedMoEEvents:
+    before_routed_experts: torch.npu.Event
+    after_routed_experts: torch.npu.Event | None = field(default=None)
+    before_dispatch: torch.npu.Event | None = field(default=None)
+    before_gmm2: torch.npu.Event | None = field(default=None)
+    before_combine: torch.npu.Event | None = field(default=None)
+    swiglu_limit: float = 0.0
+
+
+def mock_false():
+    return False
+
+
+def mock_true():
+    return True
+
+
+class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+    def __init__(self, moe: FusedMoEConfig = None, tid2eid=None):
+        super().__init__(moe=moe)
+        self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
+        self.tid2eid = tid2eid
+
+    @property
+    def is_monolithic(self) -> bool:
+        return False
+
+    def maybe_make_prepare_finalize(self, routing_tables=None):
+        # Ascend uses its own MoE communication and forward_impl path.
+        # Do not let upstream modular-kernel initialization replace it.
+        return None
+
+    def process_weights_after_loading(self, layer):
+        super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
+
+        if not vllm_version_is("0.23.0"):
+            w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2)
+            layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+
+            w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2)
+            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+        else:
+            w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
+            layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+
+            w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
+            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+
+        # TODO: Current dispatch_ffn_combine fusion operator ONLY supports NZ format.
+        # Therefore, we must cast weights to NZ when fusion is enabled.
+        # Once the underlying dispatch_ffn_combine operator is updated to support
+        # ND format (or other formats), remove this specific 'if' check and the forced
+        # npu_format_cast. At that point, the operator should be able to handle weights
+        # in their native format without explicit casting here.
+        if get_ascend_config().enable_fused_mc2:
+            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+        else:
+            layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
+            layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: int | None = None,
+        num_expert_group: int | None = None,
+        custom_routing_function: Callable | None = None,
+        scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: torch.Tensor | None = None,
+        num_experts: int = -1,
+        expert_map: torch.Tensor | None = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
+        enable_force_load_balance: bool = False,
+        log2phy: torch.Tensor = None,
+        global_redundant_expert_num: int = 0,
+        pertoken_scale: torch.Tensor | None = None,
+        mc2_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        zero_expert_num = getattr(layer, "zero_expert_num", 0)
+        zero_expert_type = getattr(layer, "zero_expert_type", None)
+        input_ids = getattr(get_forward_context(), "input_ids", None)
+        num_shared_experts = getattr(layer, "n_shared_experts", 0)
+        if num_shared_experts is None:
+            num_shared_experts = 0
+        num_logical_experts = get_moe_num_logical_experts(
+            layer,
+            num_experts,
+            global_redundant_expert_num=global_redundant_expert_num,
+            num_shared_experts=num_shared_experts,
+        )
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            num_experts=num_logical_experts,
+            tid2eid=self.tid2eid,
+            input_ids=input_ids,
+        )
+        if vllm_version_is("0.23.0"):
+            model_config = layer.vllm_config.model_config
+        else:
+            try:
+                _vllm_config = get_current_vllm_config()
+            except AssertionError:
+                _vllm_config = None
+            model_config = None if _vllm_config is None else _vllm_config.model_config
+        if model_config is not None and model_config.enable_return_routed_experts:
+            capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
+            if capturer is not None:
+                capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
+
+        if zero_expert_num > 0 and zero_expert_type is not None:
+            topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
+                expert_indices=topk_ids,
+                expert_scales=topk_weights,
+                num_experts=num_logical_experts,
+                zero_expert_type=zero_expert_type,
+                hidden_states=x,
+            )
+
+        topk_weights = topk_weights.to(x.dtype)
+        # this is a naive implementation for experts load balance so as
+        # to avoid accumulating too much tokens on a single rank.
+        # currently it is only activated when doing profile runs.
+        if enable_force_load_balance:
+            random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
+            topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
+
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        # NOTE: In the MoECommType.FUSED_MC2 branch, we wrap weights (w1, w2) into lists
+        # and provide dummy scales (w1_scale, w2_scale). This is required because:
+        # The underlying Ascend fused operator (e.g., dispatch_ffn_combine) expects
+        # inputs in a list format.
+        # TODO: Passing an empty tensor as scale for float (BF16) cases is semantically
+        # incorrect. The ideal solution is to pass None. However, if the underlying
+        # dispatch_ffn_combine C++ operator does not support None for the scale argument
+        # (due to signature constraints), we are forced to use a placeholder empty tensor.
+        # This TODO tracks the requirement to update the C++ operator to accept Optional[Tensor]
+        # or None for scales in non-quantized scenarios.
+        if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+            w1 = [layer.w13_weight]
+            w1_scale = [torch.tensor([], dtype=torch.int64)]
+            w2 = [layer.w2_weight]
+            w2_scale = [torch.tensor([], dtype=torch.int64)]
+            w1_scale_bias = [torch.tensor([], dtype=torch.float32)]
+            w2_scale_bias = [torch.tensor([], dtype=torch.float32)]
+        else:
+            w1 = layer.w13_weight
+            w1_scale = None
+            w2 = layer.w2_weight
+            w2_scale = None
+            w1_scale_bias = None
+            w2_scale_bias = None
+
+        final_hidden_states = moe_comm_method.fused_experts(
+            fused_experts_input=build_fused_experts_input(
+                hidden_states=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                w1=w1,
+                w2=w2,
+                w1_bias=layer.w13_bias if self.moe.has_bias else None,
+                w2_bias=layer.w2_bias if self.moe.has_bias else None,
+                quant_type=QuantType.NONE,
+                dynamic_eplb=self.dynamic_eplb,
+                expert_map=expert_map,
+                global_redundant_expert_num=global_redundant_expert_num,
+                mc2_mask=mc2_mask,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                log2phy=log2phy,
+                pertoken_scale=pertoken_scale,
+                activation=activation,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w1_scale_bias=w1_scale_bias,
+                w2_scale_bias=w2_scale_bias,
+                swiglu_limit=layer.swiglu_limit,
+            )
+        )
+        if zero_expert_num > 0 and zero_expert_type is not None:
+            final_hidden_states += zero_expert_result
+        return final_hidden_states
+
+
+if vllm_version_is("0.23.0"):
+    from vllm_ascend.ops.fused_moe.fused_moe_0_23_0 import AscendFusedMoE, AscendMoERunner
+
+    AscendFusedMoE.__module__ = __name__
+    AscendMoERunner.__module__ = __name__
+
+else:
+
+    class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+        moe_counter = -1
+        gate_stream: torch.npu.Stream | None = None
+
+        def __init__(
+            self,
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             layer_name,
             moe_config,
             router,
@@ -155,6 +372,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     persistent=False,
                 )
 
+<<<<<<< HEAD
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -164,6 +382,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     ) -> torch.Tensor:
         """Mirror of upstream ``MoERunner.forward`` (this class is instantiated
         through the OOT PluggableLayer dispatch of ``MoERunner``).
+=======
+            self.quant_type = self._get_quant_type()
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
         Upstream inlines the shared+routed output combine, which is not
         exposed as an overridable hook. On NPU the combine goes through the
@@ -303,6 +524,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     def ep_rank(self) -> int:
         return self.moe_config.ep_rank
 
+<<<<<<< HEAD
     def _should_reduce_routed_before_combine(self) -> bool:
         """Static layer policy; communication-dependent decisions stay in the op."""
         # Shared DP already produces a complete output, so reduce routed first.
@@ -310,6 +532,26 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             return True
         # A routed transform must receive the complete TP result.
         if self.routed_output_transform is None or self.moe_config.is_sequence_parallel:
+=======
+        def _get_quant_type(self) -> QuantType:
+            quant_type = QuantType.NONE
+            method = getattr(self._quant_method, "quant_method", None)
+
+            if method is not None:
+                quant_type = getattr(method, "quant_type", QuantType.NONE)
+
+            return quant_type
+
+        @property
+        def is_internal_router(self) -> bool:
+            gate = self.gate
+            return gate is not None and hasattr(gate, "weight_fp32")
+
+        @property
+        def use_dp_chunking(self) -> bool:
+            """Ascend uses its own forward_impl path, not the FlashInfer Cutlass
+            chunked path. Always return False to stay on forward_impl."""
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             return False
         return self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1
 
@@ -357,6 +599,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             return states[..., :trunc_size]
         return states
 
+<<<<<<< HEAD
     def set_lora_context(self, lora_context):
         self.routed_experts._ascend_moe_lora_context = lora_context
         if self.ascend_shared_experts is not None:
@@ -377,6 +620,17 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             torch.npu.current_stream().wait_event(prepared_input.ready_event)
             shared_input = prepared_input.hidden_states
         return routed_input, shared_input
+=======
+        def no_shared_forward_impl(  # type: ignore[override]
+            self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
+        ) -> torch.Tensor | FusedMoEResult:
+            forward_context = get_forward_context()
+            # When static kernels are enabled, the forward pass runs twice (compilation + capture),
+            # causing moe_layer_index to overflow. Wrap the index to prevent out-of-bounds errors.
+            if self.enable_npugraph_ex_static_kernel and forward_context.all_moe_layers:
+                moe_layer_index = forward_context.moe_layer_index % (len(forward_context.all_moe_layers))
+                forward_context.moe_layer_index = moe_layer_index
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     def apply_routed_output_transform(self, fused_output: torch.Tensor) -> torch.Tensor:
         """Run the latent up projection before joining the SP shared output."""

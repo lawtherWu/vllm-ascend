@@ -26,8 +26,11 @@ vLLM Ascend Plugin
 ---
 *Latest News* 🔥
 
+<<<<<<< HEAD
 - [2026/09] We released the new release candidate [v0.26.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.26.0rc1)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.26.0rc1/) to start using vLLM Ascend Plugin on Ascend.
 - [2026/08] We released the new official version [v0.23.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.23.0/) to start using vLLM Ascend Plugin on Ascend.
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 - [2026/05] We released the new official version [v0.18.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.18.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.18.0/) to start using vLLM Ascend Plugin on Ascend.
 - [2026/02] We released the new official version [v0.13.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.13.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.13.0/) to start using vLLM Ascend Plugin on Ascend.
 
@@ -69,9 +72,15 @@ Whether you are a performance tuner looking to deploy vLLM-Ascend in production 
 - Hardware: Atlas 800I A2 Inference series, Atlas A2 Training series, Atlas 800I A3 Inference series, Atlas A3 Training series, Atlas 300I Duo (Experimental)
 - OS: Linux
 - Software:
+<<<<<<< HEAD
     - Python >= 3.10, < 3.13
     - CANN == 9.1.0 (For Ascend HDK version, please refer to the [Release Notes](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/softwareinst/releasenote/9.1.0/release-notes.md))
     - PyTorch == 2.10.0, TorchNPU == 2.10.0.post4
+=======
+    - Python >= 3.10, < 3.12
+    - CANN == 9.0.0 (For Ascend HDK version, please refer to the [Release Notes](https://www.hiascend.com/document/detail/zh/canncommercial/900/releasenote/releasenote_0000.html))
+    - PyTorch == 2.10.0, torch-npu == 2.10.0
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     - vLLM (the same version as vllm-ascend)
 
 ## Accessing Ascend NPU
@@ -84,9 +93,14 @@ Please use the following recommended versions to get started quickly:
 
 | Version    | Release type | Doc                                  |
 |------------|--------------|--------------------------------------|
+<<<<<<< HEAD
 | v0.30.0rc1 | Release candidate | See [QuickStart](https://docs.vllm.ai/projects/ascend/en/v0.30.0rc1/quick_start.html) and [Installation](https://docs.vllm.ai/projects/ascend/en/v0.30.0rc1/installation.html) for more details |
 | v0.26.0rc1 | Release candidate | See [QuickStart](https://docs.vllm.ai/projects/ascend/en/v0.26.0rc1/quick_start.html) and [Installation](https://docs.vllm.ai/projects/ascend/en/v0.26.0rc1/installation.html) for more details |
 | v0.23.0 | Latest stable version | See [QuickStart](https://docs.vllm.ai/projects/ascend/en/v0.23.0/quick_start.html) and [Installation](https://docs.vllm.ai/projects/ascend/en/v0.23.0/installation.html) for more details |
+=======
+| v0.22.1rc1 | Latest release candidate | See [QuickStart](https://docs.vllm.ai/projects/ascend/en/latest/quick_start.html) and [Installation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html) for more details |
+| v0.18.0 | Latest stable version | See [QuickStart](https://docs.vllm.ai/projects/ascend/en/v0.18.0/quick_start.html) and [Installation](https://docs.vllm.ai/projects/ascend/en/v0.18.0/installation.html) for more details |
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 ## Branch
 
@@ -102,9 +116,15 @@ Below are the maintained branches:
 | main             | Maintained   | CI commitment for vLLM main branch and vLLM v0.30.0 tag |
 | releases/v0.13.0 | Maintained   | Only bug fixes are allowed, and no new release tags anymore. |
 | releases/v0.18.0 | Maintained   | CI commitment for vLLM 0.18.0 version |
+<<<<<<< HEAD
 | releases/v0.23.0 | Maintained   | CI commitment for vLLM 0.23.0 version |
 | rfc/<feature-name> | Maintained   | [Feature branches](https://docs.vllm.ai/projects/ascend/en/latest/community/versioning_policy.html#feature-branches) for collaboration |
 
+=======
+| releases/v0.20.2rc | Maintained | CI commitment for vLLM 0.20.2 version |
+| rfc/feature-name | Maintained   | [Feature branches](https://docs.vllm.ai/projects/ascend/en/latest/community/versioning_policy.html#feature-branches) for collaboration |
+  
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 Please refer to [Versioning policy](https://docs.vllm.ai/projects/ascend/en/latest/community/versioning_policy.html) for more details.
 
 ## Contributing

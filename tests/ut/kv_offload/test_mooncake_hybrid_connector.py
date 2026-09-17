@@ -7,9 +7,7 @@ import unittest
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
-from unittest.mock import MagicMock, patch
-
-import torch
+from unittest.mock import MagicMock
 
 fake_engine = types.ModuleType("mooncake.engine")
 fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]

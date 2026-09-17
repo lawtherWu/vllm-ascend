@@ -726,6 +726,7 @@ class TestAscendConfig(TestBase):
             init_ascend_config(test_vllm_config)
 
     @_clean_up_ascend_config
+<<<<<<< HEAD
     @patch("vllm_ascend.ascend_config.logger.warning")
     @patch(
         "vllm_ascend.device.hardware_profile.get_current_hardware_profile",
@@ -759,6 +760,9 @@ class TestAscendConfig(TestBase):
         )
 
     @_clean_up_ascend_config
+=======
+    @patch("vllm_ascend.ascend_config.logger.info_once")
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_msmonitor_daemon_uses_additional_config(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()

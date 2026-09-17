@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+<<<<<<< HEAD
 import math
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
@@ -37,6 +38,17 @@ from vllm.config import (
 )
 from vllm.distributed import get_dcp_group, get_tensor_model_parallel_rank
 from vllm.logger import logger
+=======
+from collections.abc import Sequence
+from contextlib import contextmanager
+from typing import Any
+
+import numpy as np
+import torch
+import vllm
+from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
+from vllm.model_executor.layers.attention import Attention
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
@@ -1680,7 +1692,11 @@ def _reshape_kv_cache_v2(
     return kv_caches
 
 
+<<<<<<< HEAD
 _BUILD_ATTN_METADATA_MODULE = _speculator
+=======
+_BUILD_ATTN_METADATA_MODULE = vllm.v1.worker.gpu.spec_decode.speculator
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 
 @contextmanager
@@ -1692,6 +1708,7 @@ def build_attn_metadata_wrapper():
         yield
     finally:
         _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = original_func
+<<<<<<< HEAD
 
 
 @contextmanager
@@ -1724,3 +1741,5 @@ def build_attn_metadata_factory(
         yield
     finally:
         _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = raw  # restore
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)

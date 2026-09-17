@@ -29,6 +29,7 @@ def init_speculator(
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+<<<<<<< HEAD
     if speculative_config.method == "extract_hidden_states":
         # No Ascend-specific behavior beyond update_stream assignment in
         # NPUModelRunner; reuse upstream ExtractHiddenStatesSpeculator as-is.
@@ -50,11 +51,15 @@ def init_speculator(
             )
 
             return AscendDFlash2Speculator(vllm_config, device)
+=======
+    if speculative_config.use_dflash():
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
             AscendDFlashSpeculator,
         )
 
         return AscendDFlashSpeculator(vllm_config, device)
+<<<<<<< HEAD
     if (
         speculative_config.method == "mtp"
         and not speculative_config.use_gemma4_mtp()
@@ -65,6 +70,8 @@ def init_speculator(
         )
 
         return AscendMTPSpeculator(vllm_config, device)
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     if speculative_config.use_eagle():
         from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 

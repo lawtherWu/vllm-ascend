@@ -74,8 +74,34 @@ class FakeStore:
 
 class FakeTokenDatabase(ChunkedTokenDatabase):
     def __init__(self, block_size=16):
+<<<<<<< HEAD
         super().__init__([KeyMetadata("m", 0, 0, 0)], [block_size], None)
         self.set_group_buffers({0: [1000]}, {0: [block_size]}, {0: [1]}, group_num_layers={0: 1})
+=======
+        self.block_size = block_size
+
+    def process_tokens(self, token_len, block_hashes, mask_num=0):
+        meta = KeyMetadata("m", 0, 0, 0, 0)
+        for i, h in enumerate(block_hashes):
+            start = i * self.block_size
+            if start >= token_len:
+                break
+            end = min(start + self.block_size, token_len)
+            if start < mask_num:
+                continue
+            yield start, end, PoolKey(meta, f"k{i}")
+
+    def prepare_value(self, start, end, block_ids):
+        block_id = block_ids[start // self.block_size]
+        return [1000 + block_id], [end - start], block_id
+
+    def prepare_value_layer(self, start, end, block_ids, layer_id):
+        block_id = block_ids[start // self.block_size]
+        return [2000 + layer_id * 100 + block_id], [end - start], block_id
+
+    def decode_adaptor_prefill_pp(self, keys, addrs, sizes):
+        return keys, addrs, sizes
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 
 class MaskedFakeTokenDatabase(FakeTokenDatabase):
@@ -1010,8 +1036,66 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
         self.assertEqual(len(keys), 1)
 
 
+<<<<<<< HEAD
 class TestLayerBatchBuilder(unittest.TestCase):
     def _make_builder(self):
+=======
+    def test_hybrid_c128_async_load_aggregates_pages_and_loads_directly(self):
+        thread, store, get_staging, merge_staging = self._make_hybrid_c128_thread()
+        load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=1024, can_load=True, token_len=1024)
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=1024,
+            block_ids_by_group=[[7, 8], [9]],
+            block_hashes=[bytes([index]) * 32 for index in range(8)],
+            kv_cache_group_ids=[0, 1],
+            load_spec=load_spec,
+        )
+        thread.request_queue.put(request)
+
+        thread._handle_request(request)
+
+        self.assertEqual(store.get.call_count, 2)
+        get_keys, get_addrs, get_sizes = store.get.call_args_list[1].args
+        self.assertEqual(len(get_keys), 1)
+        self.assertIn("@range:4_8", get_keys[0])
+        self.assertEqual(get_addrs, [[2000 + 9 * 1280]])
+        self.assertEqual(get_sizes, [[1280]])
+        get_staging.assert_not_called()
+        merge_staging.assert_not_called()
+        self.assertIn("r1", thread.get_and_clear_finished_requests())
+
+    def test_hybrid_c128_async_load_does_not_merge_failed_chunk(self):
+        thread, store, get_staging, merge_staging = self._make_hybrid_c128_thread()
+        store.get.side_effect = lambda keys, _addrs, _sizes: [1] * len(keys)
+        load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=512, can_load=True, token_len=512)
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=512,
+            block_ids_by_group=[[], [9]],
+            block_hashes=[bytes([index]) * 32 for index in range(4)],
+            kv_cache_group_ids=[1],
+            load_spec=load_spec,
+        )
+        thread.request_queue.put(request)
+
+        thread._handle_request(request)
+
+        self.assertEqual(store.get.call_count, 1)
+        get_keys, get_addrs, get_sizes = store.get.call_args.args
+        self.assertEqual(len(get_keys), 1)
+        self.assertIn("@range:0_4", get_keys[0])
+        self.assertEqual(get_addrs, [[2000 + 9 * 1280]])
+        self.assertEqual(get_sizes, [[1280]])
+        get_staging.assert_not_called()
+        merge_staging.assert_not_called()
+        self.assertIn("r1", thread.get_and_clear_finished_requests())
+
+
+class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
+    def _make_thread(self, exists_result=None, num_layers=2, enable_kv_event=False):
+        store = FakeStore(exists_result or [0, 0])
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         db = FakeTokenDatabase()
         db.set_group_buffers(
             {0: [1000, 2000, 3000, 4000]},
@@ -1102,6 +1186,7 @@ class TestKVTransferTpMismatchDispatch(unittest.TestCase):
             tp_rank=0,
             dcp_size=1,
             put_step=1,
+<<<<<<< HEAD
             kv_role="kv_producer",
             ready_event=threading.Event(),
             group_uses_align_state=[False],
@@ -1112,6 +1197,142 @@ class TestKVTransferTpMismatchDispatch(unittest.TestCase):
 
     def _make_recving(self, worker=None):
         store = FakeStore([0, 0, 0, 0])
+=======
+            ready_event=threading.Event(),
+            num_layers=num_layers,
+            enable_kv_event=enable_kv_event,
+        )
+        return t, store
+
+    def _make_layer_req(self, layer_id=0, is_last_chunk=False, num_keys=2):
+        meta = KeyMetadata("m", 0, 0, 0, 0)
+        keys = [LayerPoolKey(meta, f"h{i}", layer_id) for i in range(num_keys)]
+        return LayerMultiBlockReqMeta(
+            req_id="r1",
+            keys=keys,
+            starts=[i * 16 for i in range(num_keys)],
+            ends=[(i + 1) * 16 for i in range(num_keys)],
+            block_ids=list(range(num_keys)),
+            layer_id=layer_id,
+            is_last_chunk=is_last_chunk,
+            current_event=None,
+            token_ids=list(range(num_keys * 16)),
+            original_block_size=16,
+            block_hashes=[f"h{i}".encode() for i in range(num_keys)],
+        )
+
+    def test_handle_request_puts_missing(self):
+        t, store = self._make_thread([1, 0])
+        req = self._make_layer_req(layer_id=0)
+        t.add_stored_request(req.req_id)
+        t.request_queue.put(req)
+        t._handle_request(req)
+        self.assertEqual(len(store.put_calls), 1)
+        keys, _, _ = store.put_calls[0]
+        self.assertEqual(len(keys), 1)
+
+    def test_handle_request_all_exist_not_last(self):
+        t, store = self._make_thread([1, 1])
+        req = self._make_layer_req(layer_id=0, is_last_chunk=False)
+        t.add_stored_request(req.req_id)
+        t.request_queue.put(req)
+        t._handle_request(req)
+        self.assertEqual(len(store.put_calls), 0)
+
+    def test_handle_request_all_exist_last_chunk_final_layer(self):
+        t, store = self._make_thread([1, 1], num_layers=2)
+        req = self._make_layer_req(layer_id=1, is_last_chunk=True)
+        t.add_stored_request(req.req_id)
+        t.request_queue.put(req)
+        t._handle_request(req)
+        finished = t.get_and_clear_finished_requests()
+        self.assertIn("r1", finished)
+
+    def test_handle_request_empty_keys(self):
+        t, store = self._make_thread()
+        _meta = KeyMetadata("m", 0, 0, 0, 0)
+        req = LayerMultiBlockReqMeta(
+            req_id="r1",
+            keys=[],
+            starts=[],
+            ends=[],
+            block_ids=[],
+            layer_id=0,
+            is_last_chunk=True,
+        )
+        t.add_stored_request(req.req_id)
+        t.request_queue.put(req)
+        t._handle_request(req)
+        finished = t.get_and_clear_finished_requests()
+        self.assertNotIn("r1", finished)
+
+    def test_handle_request_with_current_event(self):
+        t, store = self._make_thread([0])
+        event = MagicMock()
+        meta = KeyMetadata("m", 0, 0, 0, 0)
+        req = LayerMultiBlockReqMeta(
+            req_id="r1",
+            keys=[LayerPoolKey(meta, "h0", 0)],
+            starts=[0],
+            ends=[16],
+            block_ids=[0],
+            layer_id=0,
+            is_last_chunk=False,
+            current_event=event,
+        )
+        t.add_stored_request(req.req_id)
+        t.request_queue.put(req)
+        t._handle_request(req)
+        event.synchronize.assert_called_once()
+
+    def test_handle_request_last_chunk_final_layer_with_missing(self):
+        t, store = self._make_thread([0], num_layers=2)
+        req = self._make_layer_req(layer_id=1, is_last_chunk=True, num_keys=1)
+        t.add_stored_request(req.req_id)
+        t.request_queue.put(req)
+        t._handle_request(req)
+        finished = t.get_and_clear_finished_requests()
+        self.assertIn("r1", finished)
+
+    def test_layerwise_kv_event_published_on_final_layer(self):
+        t, store = self._make_thread([0], num_layers=2, enable_kv_event=True)
+        req = self._make_layer_req(layer_id=1, is_last_chunk=True, num_keys=1)
+        t.add_stored_request(req.req_id)
+        t.request_queue.put(req)
+        t._handle_request(req)
+        events = t.get_kv_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].block_hashes, [maybe_convert_block_hash(b"h0")])
+        self.assertEqual(events[0].token_ids, list(range(16)))
+        self.assertEqual(events[0].block_size, 16)
+
+    def test_layerwise_kv_event_not_published_before_final_layer(self):
+        t, store = self._make_thread([0], num_layers=2, enable_kv_event=True)
+        req = self._make_layer_req(layer_id=0, is_last_chunk=False, num_keys=1)
+        t.add_stored_request(req.req_id)
+        t.request_queue.put(req)
+        t._handle_request(req)
+        self.assertEqual(t.get_kv_events(), [])
+
+    def test_layerwise_kv_event_uses_missing_blocks_from_previous_layers(self):
+        t, store = self._make_thread([0], num_layers=2, enable_kv_event=True)
+        first_layer_req = self._make_layer_req(layer_id=0, is_last_chunk=True, num_keys=1)
+        t.add_stored_request(first_layer_req.req_id)
+        t.request_queue.put(first_layer_req)
+        t._handle_request(first_layer_req)
+        t.m_store.exists_result = [1]
+        final_layer_req = self._make_layer_req(layer_id=1, is_last_chunk=True, num_keys=1)
+        t.request_queue.put(final_layer_req)
+        t._handle_request(final_layer_req)
+        events = t.get_kv_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].block_hashes, [maybe_convert_block_hash(b"h0")])
+
+
+class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
+    def test_handle_request(self):
+        store = FakeStore()
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         db = FakeTokenDatabase()
         t = KVCacheStoreRecvingThread(
             m_store=store,

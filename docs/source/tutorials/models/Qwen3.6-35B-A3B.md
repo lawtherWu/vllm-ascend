@@ -18,10 +18,15 @@ Refer to [Feature Guide](../../user_guide/feature_guide/index.md) to get feature
 
 ### 3.1 Model Weight
 
+<<<<<<< HEAD
 |  Weight Version  | Hardware Requirements | Download Links |
 |------------------|-----------------------|----------------|
 | `Qwen3.6-35B-A3B` (BF16 version) | 1 Atlas A3 inference products (64GB x 16) node, 1 Atlas A2 inference products (64GB x 8) node, or Atlas 300I DUO | [ModelScope](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B) |
 | `Qwen3.6-35B-A3B-w8a8` (quantized version) | 1 Atlas A3 inference products (64GB x 16) node, 1 Atlas A2 inference products (64GB x 8) node, or Atlas 300I DUO | [ModelScope](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-35B-A3B-w8a8) |
+=======
+- `Qwen3.6-35B-A3B` (BF16 version): requires 1 Atlas 800 A3 (64G x 16) node or 1 Atlas 800 A2 (64G x 8) node. [Download model weight](https://modelscope.cn/models/Qwen/Qwen3.6-35B-A3B).
+- `Qwen3.6-35B-A3B-w8a8` (quantized version): requires 1 Atlas 800 A3 (64G x 16) node or 1 Atlas 800 A2 (64G x 8) node. [Download model weight](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-35B-A3B-w8a8).
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 It is recommended to download the model weight to `/root/.cache/`.
 
@@ -31,10 +36,15 @@ It is recommended to download the model weight to `/root/.cache/`.
 
 ### 4.1 Docker Image Installation
 
+<<<<<<< HEAD
 Select an image based on your machine type. For example, use `quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}` for Atlas A2 inference products, `quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}-a3` for Atlas A3 inference products, and `quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}-310p` for Atlas 300I DUO.
+=======
+Select an image based on your machine type. For example, use `quay.io/ascend/vllm-ascend:|vllm_ascend_version|` for Atlas 800 A2 and `quay.io/ascend/vllm-ascend:|vllm_ascend_version|-a3` for Atlas 800 A3.
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 Refer to [using docker](../../getting_started/installation.md#installation-prebuilt-image) for the complete installation guide.
 
+<<<<<<< HEAD
 === "Atlas A3 inference products"
 
     ```bash
@@ -83,6 +93,17 @@ Refer to [using docker](../../getting_started/installation.md#installation-prebu
     # Download the model weight to /root/.cache in advance.
     export IMAGE=quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}
     export NAME=vllm-ascend
+=======
+```{code-block} bash
+:substitutions:
+
+# Update --device according to your device.
+# Atlas A2: /dev/davinci[0-7]
+# Atlas A3: /dev/davinci[0-15]
+# Download the model weight to /root/.cache in advance.
+export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|
+export NAME=vllm-ascend
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     docker run --rm \
       --name $NAME \
@@ -109,6 +130,7 @@ Refer to [using docker](../../getting_started/installation.md#installation-prebu
       -it $IMAGE bash
     ```
 
+<<<<<<< HEAD
 === "Atlas 300I DUO"
 
     #### Standard container
@@ -142,6 +164,8 @@ Refer to [using docker](../../getting_started/installation.md#installation-prebu
     -it $IMAGE bash
     ```
 
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 After entering the container, verify that vLLM and vLLM-Ascend can be imported:
 
 ```shell
@@ -152,6 +176,7 @@ python -c "import vllm, vllm_ascend; print('vllm and vllm_ascend are ready')"
 
 You can also build and install `vllm-ascend` from source. Refer to [set up using python](../../getting_started/installation.md#installation-existing-cann-install).
 
+<<<<<<< HEAD
 !!! note
 
     For Atlas 300I DUO, source installation may pull in `triton` and `triton-ascend`. Uninstall them before running vLLM-Ascend on Atlas 300I DUO:
@@ -169,6 +194,15 @@ Single-node deployment runs both Prefill and Decode on the same node. `Qwen3.6-3
 === "Atlas A2 inference products / Atlas A3 inference products"
 
     Run the following script to execute online inference with up to 262144 context length on 1 Atlas A3 inference products (64G x 16).
+=======
+## 5 Online Service Deployment
+
+### 5.1 Single-Node Online Deployment
+
+Single-node deployment runs both Prefill and Decode on the same node. `Qwen3.6-35B-A3B-w8a8` can be deployed on 1 Atlas 800 A3 (64G x 16) or 1 Atlas 800 A2 (64G x 8). The W8A8 version needs `--quantization ascend`.
+
+Run the following script to execute online inference with up to 262144 context length on 1 Atlas 800 A3 (64G x 16).
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     ```shell
     #!/bin/sh
@@ -207,7 +241,13 @@ Single-node deployment runs both Prefill and Decode on the same node. `Qwen3.6-3
       --additional-config '{"enable_cpu_binding":true, "multistream_overlap_shared_expert": true}'
     ```
 
+<<<<<<< HEAD
     **Key parameters:**
+=======
+Common Issues Tip: If the service fails to start, HBM is insufficient, or requests are not scheduled as expected, refer to [FAQs](../../faqs.md) first, and then check the model-specific FAQ in Section 10.
+
+**Key parameters:**
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     - `--data-parallel-size 1` and `--tensor-parallel-size 2` set DP and TP for the default single-node serving example.
     - `--enable-expert-parallel` enables expert parallelism for MoE layers. Do not mix MoE tensor parallelism and expert parallelism in the same MoE layer.
@@ -219,6 +259,7 @@ Single-node deployment runs both Prefill and Decode on the same node. `Qwen3.6-3
     - `--quantization ascend` enables Ascend quantization for the W8A8 model. Remove this option when deploying the BF16 model.
     - `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'` enables full decode ACLGraph replay to reduce dispatch overhead.
 
+<<<<<<< HEAD
 === "Atlas 300I DUO"
 
     ```shell
@@ -255,6 +296,8 @@ Single-node deployment runs both Prefill and Decode on the same node. `Qwen3.6-3
 
 Common Issues Tip: If the service fails to start, HBM is insufficient, or requests are not scheduled as expected, refer to [Public FAQs](../../faqs.md) first, and then check the model-specific FAQ in Section 10.
 
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 ## 6 Functional Verification
 
 After the server is started, send a request to verify basic model functionality.

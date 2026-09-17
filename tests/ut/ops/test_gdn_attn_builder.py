@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -9,14 +10,24 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.third_party.flash_linear_attention.ops import index as _fla_index
 from vllm.v1.attention.backend import CommonAttentionMetadata
+<<<<<<< HEAD
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_ascend._310p.ops.gdn_attn_builder_310 import GDNAttentionMetadataBuilder310
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.ops import gdn as ascend_gdn
+=======
+from vllm.v1.kv_cache_interface import MambaSpec
+
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 from vllm_ascend.ops import gdn_attn_builder as ascend_gdn_attn_builder
-from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+from vllm_ascend.ops.gdn import (
+    AscendGatedDeltaNetAttention,
+    get_non_spec_causal_conv1d_host_args,
+    get_non_spec_chunked_prefill_meta,
+    to_int64_tuple,
+)
 from vllm_ascend.ops.gdn_attn_builder import (
     AscendGDNAttentionBackend,
     AscendGDNAttentionMetadataBuilder,
@@ -96,17 +107,21 @@ def create_common_attn_metadata(
     block_size: int,
     device: torch.device,
 ) -> CommonAttentionMetadata:
-    query_lens_cpu = torch.tensor(batch_spec.query_lens, dtype=torch.int32)
-    query_start_loc_cpu = torch.zeros(
+    query_start_loc = torch.zeros(
         batch_spec.batch_size + 1,
         dtype=torch.int32,
+        device=device,
     )
-    query_start_loc_cpu[1:] = query_lens_cpu.cumsum(0)
-    query_start_loc = query_start_loc_cpu.to(device=device)
+    query_start_loc[1:] = torch.tensor(
+        batch_spec.query_lens,
+        dtype=torch.int32,
+        device=device,
+    ).cumsum(0)
+    query_start_loc_cpu = query_start_loc.cpu()
     num_tokens = sum(batch_spec.query_lens)
 
-    seq_lens_cpu = torch.tensor(batch_spec.seq_lens, dtype=torch.int32)
-    seq_lens = seq_lens_cpu.to(device=device)
+    seq_lens = torch.tensor(batch_spec.seq_lens, dtype=torch.int32, device=device)
+    seq_lens_cpu = seq_lens.cpu()
     max_seq_len = int(seq_lens_cpu.max())
     context_lens = [batch_spec.seq_lens[i] - batch_spec.query_lens[i] for i in range(batch_spec.batch_size)]
     num_computed_tokens_cpu = torch.tensor(context_lens, dtype=torch.int32)
@@ -128,15 +143,12 @@ def create_common_attn_metadata(
     ).view(batch_spec.batch_size, max_blocks)
     slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
 
-    return AscendCommonAttentionMetadata(
+    return CommonAttentionMetadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens=seq_lens,
         _seq_lens_cpu=seq_lens_cpu,
-        seq_lens_cpu=seq_lens_cpu,
-        seq_lens_cpu_upper_bound=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
-        num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_reqs=batch_spec.batch_size,
         num_actual_tokens=num_tokens,
         max_query_len=max(batch_spec.query_lens),
@@ -155,8 +167,11 @@ def _make_vllm_config(
     max_num_batched_tokens: int = 8192,
     num_heads: int = 32,
     num_speculative_tokens: int = 0,
+<<<<<<< HEAD
     mamba_cache_mode: str = "none",
     cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 ):
     speculative_config = None
     if num_speculative_tokens > 0:
@@ -169,9 +184,9 @@ def _make_vllm_config(
     model_config.get_num_attention_heads = lambda parallel_config: num_heads
 
     return SimpleNamespace(
-        cache_config=SimpleNamespace(mamba_cache_mode=mamba_cache_mode),
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
         compilation_config=SimpleNamespace(
-            cudagraph_mode=cudagraph_mode,
+            cudagraph_mode=CUDAGraphMode.NONE,
             max_cudagraph_capture_size=None,
         ),
         speculative_config=speculative_config,
@@ -181,7 +196,10 @@ def _make_vllm_config(
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
+<<<<<<< HEAD
             prefill_context_parallel_size=1,
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             tensor_parallel_size=1,
         ),
         model_config=model_config,
@@ -189,6 +207,7 @@ def _make_vllm_config(
     )
 
 
+<<<<<<< HEAD
 def _make_builder(
     *,
     device: torch.device,
@@ -205,13 +224,18 @@ def _make_builder(
         num_speculative_tokens=num_speculative_tokens,
         mamba_cache_mode=mamba_cache_mode,
         cudagraph_mode=cudagraph_mode,
+=======
+def _make_builder(*, device: torch.device, num_heads: int, num_speculative_tokens: int):
+    vllm_config = _make_vllm_config(
+        num_heads=num_heads,
+        num_speculative_tokens=num_speculative_tokens,
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     )
     spec = MambaSpec(
-        block_size=block_size,
+        block_size=16,
         shapes=((1,), (1,)),
         dtypes=(torch.float32,),
-        mamba_cache_mode=mamba_cache_mode,
-        num_speculative_blocks=num_speculative_blocks,
+        mamba_cache_mode="none",
     )
     return builder_cls(spec, ["layer0"], vllm_config, device)
 
@@ -238,6 +262,7 @@ def _build_attn_metadata(
         num_accepted_tokens = torch.ones(
             batch_spec.batch_size,
             dtype=torch.int32,
+            device=device,
         )
 
     attn_metadata = builder.build(
@@ -250,6 +275,7 @@ def _build_attn_metadata(
 
 
 def _assert_chunk_meta_matches_runtime(builder, chunk_meta, cu_seqlens: torch.Tensor) -> None:
+<<<<<<< HEAD
     hf_text_config = getattr(builder.vllm_config.model_config, "hf_text_config", None)
     linear_attn_config = getattr(hf_text_config, "linear_attn_config", None)
     if isinstance(linear_attn_config, dict) and linear_attn_config.get("num_heads") is not None:
@@ -266,6 +292,8 @@ def _assert_chunk_meta_matches_runtime(builder, chunk_meta, cu_seqlens: torch.Te
     )
     cumsum_chunk_size = 1 if cumsum_chunks <= 1 else 1 << (cumsum_chunks - 1).bit_length()
 
+=======
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     assert torch.equal(
         chunk_meta.chunk_indices_chunk64,
         runtime_prepare_chunk_indices(cu_seqlens, ascend_gdn_attn_builder._GDN_CHUNK_SIZE),
@@ -299,7 +327,7 @@ def _assert_chunk_meta_matches_runtime(builder, chunk_meta, cu_seqlens: torch.Te
         chunk_meta.block_indices_cumsum,
         runtime_prepare_chunk_indices(
             cu_seqlens,
-            cumsum_chunk_size,
+            builder._ascend_gdn_cumsum_block_size,
         ),
     )
 
@@ -467,10 +495,11 @@ def test_sequence_index_buffers_cover_spec_decode_when_cudagraph_disabled():
         num_spec_decodes=1,
     )
 
-    assert torch.equal(spec_indices, torch.tensor([0]))
+    assert torch.equal(spec_indices.cpu(), torch.tensor([0]))
     assert non_spec_indices.numel() == 0
 
 
+<<<<<<< HEAD
 @pytest.mark.parametrize("sample_from_anchor", [False, True])
 def test_dspark_target_reorder_threshold_includes_base_token_regardless_of_anchor(
     sample_from_anchor: bool,
@@ -502,8 +531,14 @@ def _assert_non_spec_conv1d_args_match_metadata(attn_metadata) -> None:
     assert torch.equal(
         _cache_index_first_column(conv1d_meta.cache_indices),
         attn_metadata.non_spec_state_indices_tensor,
+=======
+def _expected_conv1d_host_args(attn_metadata) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    return (
+        to_int64_tuple(attn_metadata.non_spec_query_start_loc),
+        to_int64_tuple(attn_metadata.non_spec_state_indices_tensor),
+        to_int64_tuple(attn_metadata.has_initial_state),
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     )
-    assert torch.equal(conv1d_meta.initial_state_mode, attn_metadata.has_initial_state)
 
 
 @pytest.mark.parametrize(
@@ -539,7 +574,7 @@ def _assert_non_spec_conv1d_args_match_metadata(attn_metadata) -> None:
     ],
     ids=lambda case: case.name if isinstance(case, BatchSpec) else None,
 )
-def test_non_spec_prefill_metadata_matches_original_inputs_and_runtime_helpers(
+def test_non_spec_prefill_fallback_meta_matches_original_inputs_and_runtime_helpers(
     batch_spec: BatchSpec,
     num_speculative_tokens: int,
     num_decode_draft_tokens_cpu: torch.Tensor | None,
@@ -552,159 +587,105 @@ def test_non_spec_prefill_metadata_matches_original_inputs_and_runtime_helpers(
         num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
     )
 
-    prefill_metadata = getattr(attn_metadata, "non_spec_prefill_metadata", None)
-    assert prefill_metadata is not None
-    assert prefill_metadata.causal_conv1d is not None
-    assert prefill_metadata.chunk is not None
+    fallback_meta = getattr(attn_metadata, "non_spec_prefill_fallback_meta", None)
+    assert fallback_meta is not None
+    assert fallback_meta.causal_conv1d is not None
+    assert fallback_meta.chunk is not None
 
-    _assert_non_spec_conv1d_args_match_metadata(attn_metadata)
+    assert get_non_spec_causal_conv1d_host_args(attn_metadata) == _expected_conv1d_host_args(attn_metadata)
 
     _assert_chunk_meta_matches_runtime(
         builder,
-        prefill_metadata.chunk,
-        attn_metadata.prefill_query_start_loc,
-    )
-
-
-def test_non_spec_prefill_metadata_uses_prefill_tail_for_chunk_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    _patch_missing_runtime_cdiv(monkeypatch)
-    batch_spec = BatchSpec(
-        seq_lens=[5, 12, 9],
-        query_lens=[1, 8, 4],
-        name="decode_prefill_without_spec",
-    )
-    builder, _, attn_metadata = _build_attn_metadata(
-        batch_spec,
-        num_speculative_tokens=0,
-        num_decode_draft_tokens_cpu=None,
-    )
-
-    assert attn_metadata.num_decodes == 1
-    assert attn_metadata.num_prefills == 2
-    assert torch.equal(
+        fallback_meta.chunk,
         attn_metadata.non_spec_query_start_loc,
-        torch.tensor([0, 1, 9, 13], dtype=torch.int32),
-    )
-    assert torch.equal(
-        attn_metadata.prefill_query_start_loc,
-        torch.tensor([0, 8, 12], dtype=torch.int32),
-    )
-    assert torch.equal(
-        attn_metadata.non_spec_state_indices_tensor,
-        torch.tensor([0, 1, 2], dtype=torch.int32),
-    )
-    assert torch.equal(
-        attn_metadata.prefill_state_indices,
-        torch.tensor([1, 2], dtype=torch.int32),
     )
 
-    prefill_metadata = getattr(attn_metadata, "non_spec_prefill_metadata", None)
-    assert prefill_metadata is not None
-    decode_metadata = getattr(attn_metadata, "non_spec_decode_metadata", None)
-    assert decode_metadata is not None
-    assert torch.equal(
-        decode_metadata.actual_seq_lengths,
-        torch.tensor([0, 1], dtype=torch.int32),
+
+def test_build_non_spec_causal_conv1d_host_meta_avoids_seq_lens_cpu_fallback():
+    class GuardSeqLens:
+        def to(self, *args, **kwargs):
+            raise AssertionError("seq_lens.to('cpu') should not be reached")
+
+    builder = SimpleNamespace(use_spec_decode=False)
+    attn_metadata = SimpleNamespace(
+        num_prefills=2,
+        non_spec_state_indices_tensor=torch.tensor([3, 9], dtype=torch.int32),
+        has_initial_state=torch.tensor([True, False]),
     )
+<<<<<<< HEAD
     conv1d_meta = prefill_metadata.causal_conv1d
     assert torch.equal(conv1d_meta.query_start_loc, torch.tensor([0, 1, 9, 13], dtype=torch.int32))
     assert torch.equal(_cache_index_first_column(conv1d_meta.cache_indices), torch.tensor([0, 1, 2], dtype=torch.int32))
     assert torch.equal(conv1d_meta.initial_state_mode, torch.tensor([True, True, True]))
     _assert_chunk_meta_matches_runtime(
+=======
+
+    host_meta = ascend_gdn_attn_builder._build_non_spec_causal_conv1d_host_meta(
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         builder,
-        prefill_metadata.chunk,
-        attn_metadata.prefill_query_start_loc,
+        attn_metadata,
+        non_spec_query_start_loc_cpu=torch.tensor([0, 4, 12], dtype=torch.int32),
     )
 
+<<<<<<< HEAD
 
 def test_spec_conv1d_args_use_device_cache_and_accepted_tokens():
     batch_spec = BatchSpec(
         seq_lens=[4, 4],
         query_lens=[4, 4],
         name="spec_only_device_args",
-    )
-    common_attn_metadata = create_common_attn_metadata(
-        batch_spec=batch_spec,
-        block_size=16,
-        device=torch.device("cpu"),
-    )
-    common_attn_metadata.block_table_tensor = torch.tensor(
-        [[10, 11, 12, 13], [20, 21, 22, 23]],
-        dtype=torch.int32,
-    )
-    builder = _make_builder(
-        device=torch.device("cpu"),
-        num_heads=32,
-        num_speculative_tokens=3,
-    )
-    num_accepted_tokens = torch.tensor([2, 4], dtype=torch.int32)
-
-    attn_metadata = builder.build(
-        0,
-        common_attn_metadata,
-        num_accepted_tokens=num_accepted_tokens,
-        num_decode_draft_tokens_cpu=torch.tensor([3, 3], dtype=torch.int32),
-    )
-
-    spec_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
-    query_start_loc = spec_conv1d_meta.query_start_loc
-    assert torch.equal(query_start_loc, torch.tensor([0, 4, 8], dtype=torch.int32))
+=======
+    assert host_meta is not None
     assert torch.equal(
-        spec_conv1d_meta.cache_indices,
-        torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32),
-    )
-    assert torch.equal(spec_conv1d_meta.num_accepted_tokens, num_accepted_tokens)
-    assert torch.equal(
-        attn_metadata.spec_decode_metadata.actual_seq_lengths,
-        torch.tensor([0, 4, 4], dtype=torch.int32),
+        host_meta.has_initial_state_cpu,
+        torch.tensor([True, False]),
     )
 
 
-def test_full_graph_spec_conv1d_args_keep_request_granularity():
-    batch_spec = BatchSpec(
-        seq_lens=[4, 4, 4],
-        query_lens=[4, 4, 4],
-        name="full_graph_spec_only_device_args",
+def test_build_non_spec_causal_conv1d_host_meta_requires_has_initial_state():
+    builder = SimpleNamespace(use_spec_decode=False)
+    attn_metadata = SimpleNamespace(
+        num_prefills=2,
+        non_spec_state_indices_tensor=torch.tensor([3, 9], dtype=torch.int32),
+        has_initial_state=None,
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     )
-    common_attn_metadata = create_common_attn_metadata(
-        batch_spec=batch_spec,
-        block_size=16,
-        device=torch.device("cpu"),
-    )
-    common_attn_metadata.block_table_tensor = torch.tensor(
-        [[10, 11, 12, 13], [20, 21, 22, 23], [30, 31, 32, 33]],
-        dtype=torch.int32,
-    )
-    builder = _make_builder(
-        device=torch.device("cpu"),
-        num_heads=32,
-        num_speculative_tokens=3,
-        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
-    )
-    num_accepted_tokens = torch.tensor([2, 4, 3], dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="has_initial_state"):
+        ascend_gdn_attn_builder._build_non_spec_causal_conv1d_host_meta(
+            builder,
+            attn_metadata,
+            non_spec_query_start_loc_cpu=torch.tensor([0, 4, 12], dtype=torch.int32),
+        )
 
-    attn_metadata = builder.build(
-        0,
-        common_attn_metadata,
-        num_accepted_tokens=num_accepted_tokens,
-        num_decode_draft_tokens_cpu=torch.tensor([3, 3, 3], dtype=torch.int32),
+
+def test_get_non_spec_causal_conv1d_host_args_falls_back_to_runtime_metadata():
+    attn_metadata = SimpleNamespace(
+        non_spec_prefill_fallback_meta=None,
+        non_spec_query_start_loc=torch.tensor([0, 4, 12], dtype=torch.int32),
+        non_spec_state_indices_tensor=torch.tensor([3, 9], dtype=torch.int32),
+        has_initial_state=torch.tensor([True, False]),
     )
 
-    spec_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
-    query_start_loc = spec_conv1d_meta.query_start_loc
-    assert torch.equal(query_start_loc, torch.tensor([0, 4, 8, 12], dtype=torch.int32))
-    assert query_start_loc.numel() == batch_spec.batch_size + 1
-    assert spec_conv1d_meta.cache_indices.shape == (batch_spec.batch_size, 4)
-    assert torch.equal(spec_conv1d_meta.cache_indices[:, 0], torch.tensor([10, 20, 30], dtype=torch.int32))
-    assert torch.equal(spec_conv1d_meta.num_accepted_tokens, num_accepted_tokens)
-    assert torch.equal(
-        attn_metadata.spec_decode_metadata.actual_seq_lengths,
-        torch.tensor([0, 4, 4, 4], dtype=torch.int32),
+    assert get_non_spec_causal_conv1d_host_args(attn_metadata) == (
+        (0, 4, 12),
+        (3, 9),
+        (1, 0),
     )
 
 
+def test_get_non_spec_causal_conv1d_host_args_requires_runtime_metadata():
+    attn_metadata = SimpleNamespace(
+        non_spec_prefill_fallback_meta=None,
+        non_spec_query_start_loc=torch.tensor([0, 4, 12], dtype=torch.int32),
+        non_spec_state_indices_tensor=torch.tensor([3, 9], dtype=torch.int32),
+        has_initial_state=None,
+    )
+
+    with pytest.raises(RuntimeError, match="has_initial_state"):
+        get_non_spec_causal_conv1d_host_args(attn_metadata)
+
+
+<<<<<<< HEAD
 def test_full_graph_spec_actual_seq_lengths_use_padded_builder_buffer():
     batch_spec = BatchSpec(
         seq_lens=[4, 4],
@@ -874,6 +855,15 @@ def test_mamba_align_cache_indices_follow_device_seq_lens(monkeypatch: pytest.Mo
 
 
 def test_builder_builds_prebuilt_chunk_metadata_with_prefill_query_start_loc(monkeypatch):
+=======
+def test_get_non_spec_chunked_prefill_meta_allows_missing_prefill_fallback_meta():
+    attn_metadata = SimpleNamespace(non_spec_prefill_fallback_meta=None)
+
+    assert get_non_spec_chunked_prefill_meta(attn_metadata) is None
+
+
+def test_builder_uses_device_chunk_builder_with_non_spec_query_start_loc(monkeypatch):
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     _patch_missing_runtime_cdiv(monkeypatch)
     batch_spec = BatchSpec(
         seq_lens=[8, 4, 0, 12],
@@ -886,6 +876,38 @@ def test_builder_builds_prebuilt_chunk_metadata_with_prefill_query_start_loc(mon
         num_decode_draft_tokens_cpu=torch.tensor([-1, 3, -1, -1], dtype=torch.int32),
     )
 
+    builder._ascend_gdn_chunk_meta_initialized = True
+    builder._ascend_gdn_chunk_meta_device = SimpleNamespace(type="npu")
+    builder._ascend_gdn_chunk_size = ascend_gdn_attn_builder._GDN_CHUNK_SIZE
+    builder._ascend_gdn_large_block_size = ascend_gdn_attn_builder._GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE
+    builder._ascend_gdn_cumsum_block_size = 256
+    builder._ascend_gdn_chunked_prefill_pool_idx = -1
+    builder._ascend_gdn_chunked_prefill_pool = [
+        SimpleNamespace(
+            chunk_indices_chunk64=torch.zeros((8, 2), dtype=torch.int32),
+            chunk_offsets_chunk64=torch.zeros((8,), dtype=torch.int32),
+            update_chunk_offsets_chunk64=torch.zeros((8,), dtype=torch.int32),
+            final_chunk_indices_chunk64=torch.zeros((8,), dtype=torch.int32),
+            chunk_indices_large_block=torch.zeros((8, 2), dtype=torch.int32),
+            block_indices_cumsum=torch.zeros((8, 2), dtype=torch.int32),
+        )
+    ]
+    builder._ascend_gdn_causal_conv1d_host_meta_initialized = True
+    builder._ascend_gdn_causal_conv1d_host_pool = []
+    builder._ascend_gdn_causal_conv1d_host_pool_idx = -1
+
+    helper_calls: dict[int, dict[str, object]] = {}
+
+    def fake_build_chunk_meta_device(**kwargs):
+        helper_calls[kwargs["chunk_size"]] = kwargs
+
+    monkeypatch.setattr(
+        ascend_gdn_attn_builder,
+        "build_chunk_meta_device",
+        fake_build_chunk_meta_device,
+        raising=False,
+    )
+
     attn_metadata = builder.build(
         0,
         common_attn_metadata,
@@ -893,20 +915,48 @@ def test_builder_builds_prebuilt_chunk_metadata_with_prefill_query_start_loc(mon
         num_decode_draft_tokens_cpu=torch.tensor([-1, 3, -1, -1], dtype=torch.int32),
     )
 
-    chunk_meta = attn_metadata.non_spec_prefill_metadata.chunk
-    assert chunk_meta.chunk_indices_chunk64 is attn_metadata.chunk_indices
-    assert chunk_meta.chunk_offsets_chunk64 is attn_metadata.chunk_offsets
-    _assert_chunk_meta_matches_runtime(
-        builder,
-        chunk_meta,
-        attn_metadata.prefill_query_start_loc,
-    )
-    assert chunk_meta.cu_seqlens_host == tuple(attn_metadata.prefill_query_start_loc.to(torch.int64).tolist())
     expected_chunk_indices = runtime_prepare_chunk_indices(
-        attn_metadata.prefill_query_start_loc,
+        attn_metadata.non_spec_query_start_loc,
         ascend_gdn_attn_builder._GDN_CHUNK_SIZE,
     )
-    assert chunk_meta.chunk_indices_chunk64_host == tuple(expected_chunk_indices.to(torch.int64).reshape(-1).tolist())
+    expected_chunk_offsets = runtime_prepare_chunk_offsets(
+        attn_metadata.non_spec_query_start_loc,
+        ascend_gdn_attn_builder._GDN_CHUNK_SIZE,
+    )
+    expected_update_chunk_offsets = runtime_prepare_update_chunk_offsets(
+        attn_metadata.non_spec_query_start_loc,
+        ascend_gdn_attn_builder._GDN_CHUNK_SIZE,
+    )
+    expected_final_chunk_indices = runtime_prepare_final_chunk_indices(
+        attn_metadata.non_spec_query_start_loc,
+        ascend_gdn_attn_builder._GDN_CHUNK_SIZE,
+    )
+
+    chunk64_call = helper_calls[ascend_gdn_attn_builder._GDN_CHUNK_SIZE]
+    out_chunk_indices = cast(torch.Tensor, chunk64_call["out_chunk_indices"])
+    out_chunk_offsets = cast(torch.Tensor, chunk64_call["out_chunk_offsets"])
+    out_update_chunk_offsets = cast(
+        torch.Tensor,
+        chunk64_call["out_update_chunk_offsets"],
+    )
+    out_final_chunk_indices = cast(
+        torch.Tensor,
+        chunk64_call["out_final_chunk_indices"],
+    )
+    fallback_meta = get_non_spec_chunked_prefill_meta(attn_metadata)
+    assert chunk64_call["cu_seqlens"] is attn_metadata.non_spec_query_start_loc
+    assert out_chunk_indices.shape == expected_chunk_indices.shape
+    assert out_chunk_indices.dtype == expected_chunk_indices.dtype
+    assert out_chunk_offsets.shape == expected_chunk_offsets.shape
+    assert out_chunk_offsets.dtype == torch.int32
+    assert out_update_chunk_offsets.shape == expected_update_chunk_offsets.shape
+    assert out_update_chunk_offsets.dtype == torch.int32
+    assert out_final_chunk_indices.shape == expected_final_chunk_indices.shape
+    assert out_final_chunk_indices.dtype == torch.int32
+    assert fallback_meta.cu_seqlens_host == tuple(attn_metadata.non_spec_query_start_loc.to(torch.int64).tolist())
+    assert fallback_meta.chunk_indices_chunk64_host == tuple(
+        expected_chunk_indices.to(torch.int64).reshape(-1).tolist()
+    )
 
 
 @pytest.mark.parametrize(
@@ -934,6 +984,7 @@ def test_builder_skips_prebuilt_meta_without_non_spec_prefill(batch_spec: BatchS
         num_accepted_tokens = torch.ones(
             batch_spec.batch_size,
             dtype=torch.int32,
+            device="cpu",
         )
         num_decode_draft_tokens_cpu = torch.full(
             (batch_spec.batch_size,),
@@ -948,6 +999,7 @@ def test_builder_skips_prebuilt_meta_without_non_spec_prefill(batch_spec: BatchS
         num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
     )
 
+<<<<<<< HEAD
     assert getattr(attn_metadata, "non_spec_prefill_metadata", None) is None
     if batch_spec.name == "decode_only":
         decode_metadata = getattr(attn_metadata, "non_spec_decode_metadata", None)
@@ -1458,3 +1510,6 @@ def test_spec_graph_real_prefill_is_not_treated_as_padding():
 
     assert runtime.num_spec_decodes == 1
     assert runtime.num_prefills == 1
+=======
+    assert getattr(attn_metadata, "non_spec_prefill_fallback_meta", None) is None
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)

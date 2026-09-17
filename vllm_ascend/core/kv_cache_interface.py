@@ -91,15 +91,41 @@ def requires_padded_page_layout(kv_cache_specs: Iterable[KVCacheSpec]) -> bool:
 
 @dataclass(frozen=True, kw_only=True)
 class AscendMLAAttentionSpec(MLAAttentionSpec):
+<<<<<<< HEAD
     """MLA cache spec with Ascend-specific layout metadata.
 
     For SFA, this spec describes only the main MLA cache. The indexer K
     tensor, its quantization scale, and DCP replication are described by a
     separate :class:`AscendSFAIndexerCacheSpec`.
+=======
+    """MLAAttentionSpec extended to support DSA models, with optional Sparse C8 support.
+
+    When Sparse C8 is enabled, the KV cache tuple changes from
+    (kv_cache[0]: bfloat16, kv_cache[1]: bfloat16, kv_cache[2]: bfloat16)
+    to
+    (kv_cache[0]: bfloat16, kv_cache[1]: bfloat16, kv_cache[2]: int8, kv_cache[3]: float16).
+
+    The semantic meaning of each KV cache entry is as follows:
+    1. kv_cache[0] stores kv_lora.
+    2. kv_cache[1] stores k_rope.
+    3. kv_cache[2] stores the key tensor from the indexer module.
+    4. kv_cache[3] stores the key scale tensor from the indexer module,
+       and exists only when Sparse C8 is enabled.
+
+    The main changes are as follows:
+    1. The key tensor from the indexer module stored in kv_cache[2] is
+       converted from bf16 to int8 to reduce memory usage. It is then
+       processed with int8 precision in Lightning_indexer computation
+       to improve computational efficiency.
+    2. The quantization scale of the key tensor in the indexer module
+       must also be stored for the Lightning_indexer_quant operator,
+       and is therefore saved in kv_cache[3].
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     """
 
     scale_dim: int = 0
     scale_dtype: torch.dtype = torch.int8
+<<<<<<< HEAD
     # Sparse C8 changes the main cache into one packed byte tensor. Keep that
     # main-cache property here; indexer-specific C8 properties belong to the
     # indexer spec.
@@ -110,6 +136,12 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     # stride. vLLM main removed this field from AttentionSpec, but it remains
     # part of the Ascend runner/backend contract.
     indexes_kv_by_block_stride: bool = False
+=======
+    sparse_head_dim: tuple[int, ...] | None = None
+    cache_sparse_c8: bool = False
+    c8_k_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_cache_dtype)
+    c8_k_scale_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_scale_cache_dtype)
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     @property
     def uses_packed_sfa_main_cache(self) -> bool:
@@ -118,6 +150,30 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+<<<<<<< HEAD
+=======
+        if self.cache_sparse_c8:
+            assert self.sparse_head_dim is not None
+            assert len(self.sparse_head_dim) == 3
+            num_heads_per_page = self.block_size * self.num_kv_heads
+
+            kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
+
+            # A5: kv_lora and k_rope are merged into a single CKV tensor (fp8).
+            # A3: separate kv_lora + k_rope (bf16).
+            if qk_rope_head_dim == 0:
+                kv_dtype = self.c8_k_cache_dtype  # A5 CKV: float8_e4m3fn
+                kv_dim = kv_lora_rank
+            else:
+                kv_dtype = self.dtype  # A3 kv_lora + k_rope: bfloat16
+                kv_dim = kv_lora_rank + qk_rope_head_dim
+
+            kv_bytes = num_heads_per_page * kv_dim * get_dtype_size(kv_dtype)
+            qli_bytes = num_heads_per_page * index_head_dim * get_dtype_size(self.c8_k_cache_dtype)
+            qli_scale_bytes = num_heads_per_page * 1 * get_dtype_size(self.c8_k_scale_cache_dtype)
+            return kv_bytes + qli_bytes + qli_scale_bytes
+
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         return (
             get_storage_block_size(self)
             * self.num_kv_heads
@@ -125,8 +181,80 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         )
 
     @property
+<<<<<<< HEAD
     def unpadded_page_size_bytes(self) -> int:
         return self.real_page_size_bytes
+=======
+    def sparse_kv_cache_ratio(self) -> tuple[float, float, float, float | None]:
+        """
+        Compute the relative byte share of each KV cache entry.
+
+        Returns:
+            A tuple containing the ratios for:
+            - kv_cache[0]
+            - kv_cache[1]
+            - kv_cache[2]
+            - kv_cache[3] (None if Sparse C8 is disabled or Sparse C8 on A5 device)
+        """
+
+        assert self.sparse_head_dim is not None
+
+        def get_sparse_head_dim_virtual() -> tuple[int, int, int, int]:
+            assert self.sparse_head_dim is not None
+            assert self.cache_sparse_c8 is True
+
+            kv_lora_rank, qk_rope_head_dim, index_k_head_dim = self.sparse_head_dim
+
+            if qk_rope_head_dim == 0:
+                # A5: ckv (float8_e4m3fn) and qli share c8_k_cache_dtype;
+                ckv_virtual = kv_lora_rank * get_dtype_size(self.c8_k_cache_dtype)
+                qk_rope_virtual = 0
+                qli_virtual = index_k_head_dim * get_dtype_size(self.c8_k_cache_dtype)
+                scale_virtual = get_dtype_size(self.c8_k_scale_cache_dtype)
+                return (ckv_virtual, qk_rope_virtual, qli_virtual, scale_virtual)
+
+            # A3: keep the original element-count / byte mix
+            factor = get_dtype_size(self.dtype) // get_dtype_size(self.c8_k_cache_dtype)
+            index_k_head_dim_virtual = index_k_head_dim // factor
+
+            assert get_dtype_size(self.dtype) == get_dtype_size(self.c8_k_scale_cache_dtype)
+            index_k_scale_head_dim_virtual = 1
+
+            return (
+                kv_lora_rank,
+                qk_rope_head_dim,
+                index_k_head_dim_virtual,
+                index_k_scale_head_dim_virtual,
+            )
+
+        if self.cache_sparse_c8:
+            virtual_dims = get_sparse_head_dim_virtual()
+            total_virtual_head_dim = sum(virtual_dims)
+
+            if virtual_dims[1] == 0:
+                # A5: ckv merged (kv_lora + k_rope + scale) → 3-tensor
+                return (
+                    total_virtual_head_dim / virtual_dims[0],  # kv_cache[0]: ckv
+                    total_virtual_head_dim / virtual_dims[2],  # kv_cache[1]: qli
+                    total_virtual_head_dim / virtual_dims[3],  # kv_cache[2]: qli_scale
+                    None,  # kv_cache[3] does not exist for A5
+                )
+            else:
+                # A3: 4-tensor
+                return (
+                    total_virtual_head_dim / virtual_dims[0],  # kv_cache[0]
+                    total_virtual_head_dim / virtual_dims[1],  # kv_cache[1]
+                    total_virtual_head_dim / virtual_dims[2],  # kv_cache[2]
+                    total_virtual_head_dim / virtual_dims[3],  # kv_cache[3]
+                )
+
+        return (
+            self.head_size / self.sparse_head_dim[0],  # kv_cache[0]
+            self.head_size / self.sparse_head_dim[1],  # kv_cache[1]
+            self.head_size / self.sparse_head_dim[2],  # kv_cache[2]
+            None,  # kv_cache[3] does not exist
+        )
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -135,6 +263,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         assert all(isinstance(spec, AscendMLAAttentionSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be AscendMLAAttentionSpec."
         )
+<<<<<<< HEAD
         ascend_layouts = {
             (
                 spec.scale_dim,
@@ -166,6 +295,36 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             cache_sparse_sfa_turboquant=first_spec.cache_sparse_sfa_turboquant,
             store_on_host=first_spec.store_on_host,
             indexes_kv_by_block_stride=first_spec.indexes_kv_by_block_stride,
+=======
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        assert len(cache_dtype_str_set) == 1, (
+            "All attention layers in the same KV cache group must use the same quantization method."
+        )
+        cache_sparse_c8_set = set(spec.cache_sparse_c8 for spec in specs)
+        assert len(cache_sparse_c8_set) == 1, (
+            "All attention layers in the same KV cache group must use the same sparse C8 setting."
+        )
+        page_size_padded_set = set(spec.page_size_padded for spec in specs)
+        assert len(page_size_padded_set) == 1, (
+            "All attention layers in the same KV cache group must use the same padded page size."
+        )
+        model_version_set = set(spec.model_version for spec in specs)
+        assert len(model_version_set) == 1, (
+            "All attention layers in the same KV cache group must use the same model version."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            scale_dim=specs[0].scale_dim,
+            scale_dtype=specs[0].scale_dtype,
+            sparse_head_dim=specs[0].sparse_head_dim,
+            dtype=specs[0].dtype,
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            cache_sparse_c8=specs[0].cache_sparse_c8,
+            page_size_padded=page_size_padded_set.pop(),
+            model_version=model_version_set.pop(),
+>>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
