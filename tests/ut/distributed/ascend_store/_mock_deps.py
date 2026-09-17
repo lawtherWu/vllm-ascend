@@ -51,6 +51,11 @@ if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     _torch.npu = _npu  # type: ignore[attr-defined]
     sys.modules["torch"] = _torch
     sys.modules["torch.distributed"] = _torch.distributed  # type: ignore[attr-defined]
+else:
+    import torch as _runtime_torch
+
+    if not hasattr(_runtime_torch, "npu"):
+        _runtime_torch.npu = MagicMock()  # type: ignore[attr-defined]
 
 if "torch_npu" not in sys.modules:
     sys.modules["torch_npu"] = MagicMock()
@@ -98,6 +103,8 @@ _vllm_mock_modules = [
     "vllm.v1.outputs",
     "vllm.v1.request",
     "vllm.v1.serial_utils",
+    "vllm.v1.worker",
+    "vllm.v1.worker.utils",
 ]
 if _MOCK_VLLM_DEPS:
     for _mod_name in _vllm_mock_modules:
@@ -107,6 +114,9 @@ if _MOCK_VLLM_DEPS:
 if _MOCK_VLLM_DEPS:
     sys.modules["vllm.utils.math_utils"].cdiv = lambda a, b: -(-a // b)  # type: ignore[attr-defined]
     sys.modules["vllm.logger"].logger = logging.getLogger("vllm")  # type: ignore[attr-defined]
+    sys.modules["vllm.v1.worker.utils"].extract_layer_index = (  # type: ignore[attr-defined]
+        lambda layer_name: int(str(layer_name).split(".")[-1])
+    )
 
 _base_mod: Any = (
     sys.modules["vllm.distributed.kv_transfer.kv_connector.v1.base"] if _MOCK_VLLM_DEPS else types.SimpleNamespace()
@@ -117,7 +127,6 @@ _base_mod.KVConnectorWorkerMetadata = type("KVConnectorWorkerMetadata", (), {}) 
 _base_mod.KVConnectorRole = MagicMock()  # type: ignore[attr-defined]
 _base_mod.KVConnectorRole.SCHEDULER = "SCHEDULER"
 _base_mod.KVConnectorRole.WORKER = "WORKER"
-_base_mod.SupportsHMA = type("SupportsHMA", (), {})  # type: ignore[attr-defined]
 
 _events_mod: Any = sys.modules["vllm.distributed.kv_events"] if _MOCK_VLLM_DEPS else types.SimpleNamespace()
 _events_mod.KVCacheEvent = type("KVCacheEvent", (), {})  # type: ignore[attr-defined]
@@ -380,6 +389,14 @@ for _pkg in ["vllm_ascend", "vllm_ascend.distributed"]:
     if _pkg not in sys.modules:
         sys.modules[_pkg] = _make_pkg(_pkg)
 
+_attention_pkg = _make_pkg("vllm_ascend.attention")
+sys.modules["vllm_ascend.attention"] = _attention_pkg
+_cache_layout = types.ModuleType("vllm_ascend.attention.cache_layout")
+_cache_layout.stable_model_fingerprint = (  # type: ignore[attr-defined]
+    lambda payload: str(payload)
+)
+sys.modules["vllm_ascend.attention.cache_layout"] = _cache_layout
+
 _distributed_utils = types.ModuleType("vllm_ascend.distributed.utils")
 _distributed_utils.get_decode_context_model_parallel_rank = MagicMock(  # type: ignore[attr-defined]
     return_value=0
@@ -392,6 +409,22 @@ sys.modules["vllm_ascend.distributed.utils"] = _distributed_utils
 _kv_transfer_init = _make_pkg("vllm_ascend.distributed.kv_transfer")
 _kv_transfer_init.register_connector = MagicMock()  # type: ignore[attr-defined]
 sys.modules["vllm_ascend.distributed.kv_transfer"] = _kv_transfer_init
+_workspace_fence = types.ModuleType(
+    "vllm_ascend.distributed.kv_transfer.layer_workspace_fence"
+)
+
+
+class _FakeRequestChunkKey:
+    def __init__(self, request_id, request_generation, chunk_id):
+        self.request_id = request_id
+        self.request_generation = request_generation
+        self.chunk_id = chunk_id
+
+
+_workspace_fence.RequestChunkKey = _FakeRequestChunkKey  # type: ignore[attr-defined]
+sys.modules[
+    "vllm_ascend.distributed.kv_transfer.layer_workspace_fence"
+] = _workspace_fence
 
 _kv_utils_pkg = _make_pkg("vllm_ascend.distributed.kv_transfer.utils")
 sys.modules["vllm_ascend.distributed.kv_transfer.utils"] = _kv_utils_pkg
@@ -424,35 +457,8 @@ _backend_pkg = _make_pkg(
 )
 sys.modules["vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend"] = _backend_pkg
 
-# Mirror the real backend/__init__.py entry points. The scheduler/worker resolve
-# the backend class dynamically via ``importlib.import_module(path)``; tests that
-# exercise those paths patch ``<module>.importlib`` locally (see
-# test_pool_scheduler.py / test_pool_worker.py) so the backend resolves to a
-# MagicMock. Do NOT register the backends in sys.modules or globally wrap
-# import_module here: test_backend.py imports the real backend classes and also
-# relies on ``mock.patch`` (which itself calls importlib.import_module) resolving
-# those real modules.
-_backend_module_paths = {
-    "mooncake": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend",
-    "memcache": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend",
-    "yuanrong": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend",
-}
-_backend_pkg.backend_map = {  # type: ignore[attr-defined]
-    "mooncake": {"name": "MooncakeBackend", "path": _backend_module_paths["mooncake"]},
-    "memcache": {"name": "MemcacheBackend", "path": _backend_module_paths["memcache"]},
-    "yuanrong": {"name": "YuanrongBackend", "path": _backend_module_paths["yuanrong"]},
-}
-
 if "vllm_ascend.utils" not in sys.modules or not hasattr(sys.modules["vllm_ascend.utils"], "AscendDeviceType"):
     _ascend_utils = MagicMock()
     _ascend_utils.AscendDeviceType = MagicMock()
     _ascend_utils.get_ascend_device_type = MagicMock()
     sys.modules["vllm_ascend.utils"] = _ascend_utils
-
-# NOTE: vllm_ascend.{ascend_config, memcache_comm_fence} and their helpers
-# (get_ascend_config, AttentionComputeStartGate, ...) are intentionally NOT
-# mocked here. Doing so by mutating these real modules leaks into every other
-# UT in the same pytest session (breaking test_ascend_config / test_platform,
-# which collect after ascend_store and bind the polluted symbols at import).
-# These helpers are mocked per-test, scoped to the ascend_store tests only,
-# via the autouse fixture in tests/ut/conftest.py.
