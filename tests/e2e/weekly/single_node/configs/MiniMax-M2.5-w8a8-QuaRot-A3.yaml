@@ -9,8 +9,12 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
+      VLLM_ASCEND_ENABLE_NZ: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -36,7 +40,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true,"weight_nz_mode":1}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"method":"eagle3","model":"vllm-ascend/MiniMax-M2.5-eagle-model-0318","num_speculative_tokens":3}'
     benchmarks:
@@ -49,7 +53,7 @@ test_cases:
         max_out_len: 1024
         batch_size: 30
         request_rate: 0
-        baseline: 586.15
+        baseline: 548.06
         threshold: 0.97
   - name: "MiniMax-M2.5-w8a8-in16k-16-4"
     model: "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
@@ -57,8 +61,13 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM-ASCEND_ENABLE_NZ: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
+      VLLM_ASCEND_ENABLE_NZ: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -84,7 +93,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true,"weight_nz_mode":1}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"method":"eagle3","model":"vllm-ascend/MiniMax-M2.5-eagle-model-0318","num_speculative_tokens":3}'
     benchmarks:
@@ -97,7 +106,7 @@ test_cases:
         max_out_len: 1024
         batch_size: 4
         request_rate: 0
-        baseline: 202.68
+        baseline: 191.58
         threshold: 0.97
   - name: "MiniMax-M2.5-w8a8-in32k-36-9"
     model: "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
@@ -105,8 +114,12 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
+      VLLM_ASCEND_ENABLE_NZ: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -132,7 +145,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true,"weight_nz_mode":1}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"method":"eagle3","model":"vllm-ascend/MiniMax-M2.5-eagle-model-0318","num_speculative_tokens":3}'
     benchmarks:
@@ -145,7 +158,7 @@ test_cases:
         max_out_len: 512
         batch_size: 9
         request_rate: 0
-        baseline: 162.16
+        baseline: 146.06
         threshold: 0.97
   - name: "MiniMax-M2.5-w8a8-in32k-80-20"
     model: "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
@@ -153,8 +166,12 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
+      VLLM_ASCEND_ENABLE_NZ: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -180,7 +197,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true,"weight_nz_mode":1}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"method":"eagle3","model":"vllm-ascend/MiniMax-M2.5-eagle-model-0318","num_speculative_tokens":3}'
     benchmarks:
@@ -193,7 +210,7 @@ test_cases:
         max_out_len: 512
         batch_size: 20
         request_rate: 0
-        baseline: 444.84
+        baseline: 428.36
         threshold: 0.97
   - name: "MiniMax-M2.5-w8a8-in32k-4-1"
     model: "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
@@ -201,8 +218,12 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
+      VLLM_ASCEND_ENABLE_NZ: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -228,7 +249,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true,"weight_nz_mode":1}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"method":"eagle3","model":"vllm-ascend/MiniMax-M2.5-eagle-model-0318","num_speculative_tokens":3}'
     benchmarks:
@@ -241,7 +262,7 @@ test_cases:
         max_out_len: 512
         batch_size: 1
         request_rate: 0
-        baseline: 35.57
+        baseline: 35.17
         threshold: 0.97
   - name: "MiniMax-M2.5-w8a8-in32k-4-1-90"
     model: "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
@@ -249,8 +270,12 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
+      VLLM_ASCEND_ENABLE_NZ: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -276,7 +301,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true,"weight_nz_mode":1}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"method":"eagle3","model":"vllm-ascend/MiniMax-M2.5-eagle-model-0318","num_speculative_tokens":3}'
     benchmarks:
@@ -297,8 +322,12 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
+      VLLM_ASCEND_ENABLE_NZ: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -324,7 +353,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true,"weight_nz_mode":1}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"method":"eagle3","model":"vllm-ascend/MiniMax-M2.5-eagle-model-0318","num_speculative_tokens":3}'
     benchmarks:
@@ -337,7 +366,7 @@ test_cases:
         max_out_len: 1024
         batch_size: 18
         request_rate: 0
-        baseline: 325.65
+        baseline: 321.37
         threshold: 0.97
   - name: "MiniMax-M2.5-w8a8-in64k-4-1"
     model: "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
@@ -345,8 +374,12 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
+      VLLM_ASCEND_ENABLE_NZ: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -372,7 +405,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true,"weight_nz_mode":1}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"method":"eagle3","model":"vllm-ascend/MiniMax-M2.5-eagle-model-0318","num_speculative_tokens":3}'
     benchmarks:
@@ -393,8 +426,12 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
+      VLLM_ASCEND_ENABLE_NZ: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -424,7 +461,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true,"weight_nz_mode":1}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"enforce_eager": true, "method": "eagle3", "model": "vllm-ascend/MiniMax-M2.5-eagle-model-0318", "num_speculative_tokens": 1}'
     benchmarks:
@@ -437,7 +474,7 @@ test_cases:
         max_out_len: 1024
         batch_size: 8
         request_rate: 0
-        baseline: 172.94
+        baseline: 132.5
         threshold: 0.97
   - name: "MiniMax-M2.5-w8a8-in128k-4-1"
     model: "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
@@ -445,8 +482,12 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
+      VLLM_ASCEND_ENABLE_NZ: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -476,7 +517,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true,"weight_nz_mode":1}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"enforce_eager": true, "method": "eagle3", "model": "vllm-ascend/MiniMax-M2.5-eagle-model-0318", "num_speculative_tokens": 1}'
     benchmarks:
@@ -489,7 +530,7 @@ test_cases:
         max_out_len: 1024
         batch_size: 1
         request_rate: 0
-        baseline: 38.31
+        baseline: 24.66
         threshold: 0.97
   - name: "MiniMax-M2.5-w8a8-in128k-64-16"
     model: "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
@@ -497,8 +538,11 @@ test_cases:
       HCCL_OP_EXPANSION_MODE: "AIV"
       HCCL_BUFFSIZE: "512"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      VLLM_ASCEND_ENABLE__FUSED_MC2: "1"
       OMP_NUM_THREADS: "1"
       TASK_QUEUE_ENABLE: "1"
+      VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
+      VLLM-ASCEND_BALANCE_SCHEDULING: "1"
       VLLM_USE_MODELSCOPE: "true"
       SERVER_PORT: "DEFAULT_PORT"
     server_cmd:
@@ -524,7 +568,7 @@ test_cases:
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
       - "--additional-config"
-      - '{"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_flashcomm1":true,"enable_balance_scheduling":true}'
+      - '{"enable_cpu_binding":true}'
       - "--speculative_config"
       - '{"enforce_eager": true, "method": "eagle3", "model": "vllm-ascend/MiniMax-M2.5-eagle-model-0318", "num_speculative_tokens": 1}'
     benchmarks:
@@ -537,5 +581,5 @@ test_cases:
         max_out_len: 1024
         batch_size: 16
         request_rate: 0
-        baseline: 259.45
+        baseline: 296.08
         threshold: 0.97
