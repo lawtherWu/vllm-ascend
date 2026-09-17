@@ -8,9 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
-
-import torch
+from unittest.mock import MagicMock
 
 fake_engine = types.ModuleType("mooncake.engine")
 fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
