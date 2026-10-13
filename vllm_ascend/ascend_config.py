@@ -317,7 +317,7 @@ class EplbConfig:
 
     @model_validator(mode="after")
     def _validate_config(self):
-        if self.expert_map_path is not None:
+        if self.expert_map_path is not None and not self.enable_omni_eplb:
             logger.info("The expert_map is %s", self.expert_map_path)
             if self.expert_map_path[-5:] != ".json":
                 raise TypeError("The expert_map is not json.")
