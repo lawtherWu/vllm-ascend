@@ -840,7 +840,7 @@ class TestMooncakeHybridConnectorRegistration(unittest.TestCase):
                 types.SimpleNamespace(
                     size=backing_size,
                     layers=[layer_name],
-                    shared_by=[layer_name],
+                    layers=[layer_name],
                     layer_stride=backing_size,
                     block_stride=2 * alignment,
                     offset=layer_idx * alignment,

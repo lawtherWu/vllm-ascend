@@ -1,6 +1,5 @@
 # Release Notes
 
-<<<<<<< HEAD
 ## v0.30.0rc1 - 2026.10.11
 
 This is vLLM Ascend v0.30.0rc1, a model-focused release built on the v0.29 release line and aligned with upstream vLLM v0.30.0 via the main2main pipeline. This release focuses on four flagship models: **DeepSeek V4.1**, **GLM-5.3**, **GLM-5.3-Flash**, and **Qwen3.8-27B**, and hardens the shared execution stacks they rely on (Model Runner V2, PCP/DCP parallelism, KV Cache Pool, and speculative decoding). Model or hardware combinations outside the scope declared below are not part of the release claims. Please follow the [official documentation](https://docs.vllm.ai/projects/ascend/en/v0.30.0rc1/) to get started.
@@ -590,8 +589,6 @@ The following features and optimizations are planned for deprecation in a future
 - DeepSeek-V3.1-Terminus can show about a 15% output-throughput regression against the reported v0.18.0 baseline in high-throughput P/D-disaggregated deployments; the regression was reported on an A3 four-node 2P1D setup and an A2 large-EP setup. [#12349](https://github.com/vllm-project/vllm-ascend/issues/12349)
 - KV-cache transfer can produce precision issues and TP-shard inconsistencies when reformatting occurs before all pull tasks for a request have completed. [#12359](https://github.com/vllm-project/vllm-ascend/pull/12359)
 
-=======
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 ## v0.22.1rc1 - 2026.06.30
 
 We're excited to announce the release of v0.22.1rc1 for vLLM Ascend. This is the first release candidate for the v0.22.1 release line, building on v0.21.0rc1 and aligning the plugin with upstream vLLM v0.22.1. Please follow the [official doc](https://docs.vllm.ai/projects/ascend/en/v0.22.1rc) to get started.

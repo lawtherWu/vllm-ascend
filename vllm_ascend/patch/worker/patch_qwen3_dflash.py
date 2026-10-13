@@ -4,11 +4,6 @@ from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
 )
-<<<<<<< HEAD
-=======
-
-from vllm_ascend.utils import vllm_version_is
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 
 def precompute_and_store_context_kv(
@@ -73,7 +68,6 @@ def precompute_and_store_context_kv(
 
 DFlashQwen3Model.precompute_and_store_context_kv = precompute_and_store_context_kv
 
-<<<<<<< HEAD
 _orig_read_mask_embedding = DFlashQwen3ForCausalLM._read_mask_embedding
 
 
@@ -85,15 +79,3 @@ def _patched_read_mask_embedding(self):
 
 
 DFlashQwen3ForCausalLM._read_mask_embedding = _patched_read_mask_embedding
-=======
-if not vllm_version_is("0.23.0"):
-    _orig_read_mask_embedding = DFlashQwen3ForCausalLM._read_mask_embedding
-
-    def _patched_read_mask_embedding(self):
-        try:
-            return _orig_read_mask_embedding(self)
-        except Exception:
-            return None
-
-    DFlashQwen3ForCausalLM._read_mask_embedding = _patched_read_mask_embedding
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)

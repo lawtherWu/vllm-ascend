@@ -6,11 +6,7 @@ Qwen3.5-27B and Qwen3.6-27B are dense hybrid Mamba-Transformer language models i
 
 This document will demonstrate the main validation steps for the models, including supported features, feature configuration, environment preparation, single-node and multi-node deployment, as well as accuracy and performance evaluation.
 
-<<<<<<< HEAD
 It is **strongly recommended to use the latest release candidate (rc) version or the latest official version** of `vllm-ascend`. As a minimum-version requirement, `Qwen3.5-27B` is first supported in `vllm-ascend:v0.17.0rc1`, and `Qwen3.6-27B` is first supported in `vllm-ascend:v0.18.0rc1`. Support for Atlas 300I DUO and 950DT Products starts from `vllm-ascend:v0.23.0rc1`.
-=======
-It is **strongly recommended to use the latest release candidate (rc) version or the latest official version** of `vllm-ascend`. As a minimum-version requirement, `Qwen3.5-27B` is first supported in `vllm-ascend:v0.17.0rc1`, and `Qwen3.6-27B` is first supported in `vllm-ascend:v0.18.0rc1`.
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 ## 2 Supported Features
 
@@ -22,7 +18,6 @@ Please refer to the [Feature Guide](../../user_guide/feature_guide/index.md) for
 
 ### 3.1 Model Weight
 
-<<<<<<< HEAD
 |  Weight Version | Hardware Requirements | Download Links |
 |-----------------|-----------------------|----------------|
 | `Qwen3.5-27B` (BF16 version) | 1 Atlas 800 A3 (64GB × 16) node or 1 Atlas 800 A2 (64GB × 8) node or Atlas 300I DUO | [ModelScope](https://www.modelscope.cn/models/Qwen/Qwen3.5-27B) \| [Hugging Face](https://huggingface.co/Qwen/Qwen3.5-27B) |
@@ -31,17 +26,6 @@ Please refer to the [Feature Guide](../../user_guide/feature_guide/index.md) for
 | `Qwen3.6-27B-w8a8` (Quantized version) | 1 Atlas 800 A3 (64GB × 16) node or 1 Atlas 800 A2 (64GB × 8) node | [ModelScope](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8) |
 | `Qwen3.6-27B-w8a8-mxfp8` (Quantized version) | 1 950DT Products (96GB × 8) node | [ModelScope](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8-mxfp8) |
 | `Qwen3.6-27B-w8a8-310p`(Quantized version) | 1 Atlas 300I DUO | [ModelScope](https://modelscope.cn/models/Eco-Tech/Qwen3.6-27B-W8A8-310P) |
-=======
-**Qwen3.5-27B**
-
-- `Qwen3.5-27B` (BF16 version): requires 1 Atlas 800 A3 (64G × 16) node or 1 Atlas 800 A2 (64G × 8) node. [Download model weight](https://modelscope.cn/models/Qwen/Qwen3.5-27B)
-- `Qwen3.5-27B-w8a8` (Quantized version): requires 1 Atlas 800 A3 (64G × 16) node or 1 Atlas 800 A2 (64G × 8) node. [Download model weight](https://www.modelscope.cn/models/Eco-Tech/Qwen3.5-27B-w8a8-mtp)
-
-**Qwen3.6-27B**
-
-- `Qwen3.6-27B` (BF16 version): requires 1 Atlas 800 A3 (64G × 16) node or 1 Atlas 800 A2 (64G × 8) node. [Download model weight](https://modelscope.cn/models/Qwen/Qwen3.6-27B)
-- `Qwen3.6-27B-w8a8` (Quantized version): requires 1 Atlas 800 A3 (64G × 16) node or 1 Atlas 800 A2 (64G × 8) node. [Download model weight](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8)
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 It is recommended to download the model weight to the shared directory of multiple nodes, such as `/root/.cache/`.
 
@@ -57,11 +41,7 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
 
 Select an image based on your machine type and start the docker image on your node, refer to [using docker](../../getting_started/installation.md#installation-prebuilt-image).
 
-<<<<<<< HEAD
 It is **recommended to use the latest release candidate (rc) version or the latest official version** of the `vllm-ascend` image to ensure the best compatibility and access to the latest features. As a minimum-version requirement, use `vllm-ascend:v0.17.0rc1` (or a later version) for `Qwen3.5-27B`, and `vllm-ascend:v0.18.0rc1` (or a later version) for `Qwen3.6-27B`. For `Qwen3.6-27B` on Atlas 800 A3, please use the matching `v0.18.0rc1-a3` (or a later `-a3`) image. For Atlas 300I DUO, use `vllm-ascend:v0.23.0rc1-310p` (or a later `-310p`) image.
-=======
-It is **recommended to use the latest release candidate (rc) version or the latest official version** of the `vllm-ascend` image to ensure the best compatibility and access to the latest features. As a minimum-version requirement, use `vllm-ascend:v0.17.0rc1` (or a later version) for `Qwen3.5-27B`, and `vllm-ascend:v0.18.0rc1` (or a later version) for `Qwen3.6-27B`. For `Qwen3.6-27B` on Atlas 800 A3, please use the matching `v0.18.0rc1-a3` (or a later `-a3`) image.
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 === "A3 series"
 
@@ -137,7 +117,6 @@ It is **recommended to use the latest release candidate (rc) version or the late
 
     Start the docker image on each node.
 
-<<<<<<< HEAD
     ```bash
     export IMAGE=quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}-310p
     docker run --rm \
@@ -200,10 +179,6 @@ It is **recommended to use the latest release candidate (rc) version or the late
         -v /usr/lib64:/usr/lib64 \
         -it $IMAGE bash
     ```
-=======
-::::
-:::::
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 After a successful docker run, you can verify the running container service by executing the `docker ps` command. The expected result is that the container `vllm-ascend` is listed with status `Up`, confirming the docker installation is successful.
 
@@ -221,7 +196,6 @@ If you don't want to use the docker image as above, you can also build all from 
 
     For the complete installation steps, refer to [installation](../../getting_started/installation.md).
 
-<<<<<<< HEAD
     !!! note
 
         On Atlas 300I DUO, you may need to uninstall `triton-ascend` and `triton` to avoid dependency conflicts:
@@ -230,8 +204,6 @@ If you don't want to use the docker image as above, you can also build all from 
         pip uninstall -y triton-ascend triton
         ```
 
-=======
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 2. If you want to deploy a multi-node environment, you need to set up the environment on each node.
 
 To verify the source code installation, run the following command and confirm the displayed version matches the one you installed:
@@ -246,7 +218,6 @@ Expected result: The version information of `vllm-ascend` is displayed, confirmi
 
 ### 5.1 Single-Node Online Deployment
 
-<<<<<<< HEAD
 Single-node deployment completes both Prefill and Decode within the same node, suitable for development, testing, and medium-scale inference scenarios. The `Qwen3.5-27B`, `Qwen3.5-27B-w8a8`, `Qwen3.6-27B`, and `Qwen3.6-27B-w8a8` models can all be deployed on 1 Atlas 800 A3 (64GB × 16), 1 Atlas 800 A2 (64GB × 8). On Atlas 300I DUO, at least 2 devices are required. The `Qwen3.6-27B`, and `Qwen3.6-27B-w8a8-mxfp8` models can all be deployed on 1 950DT Products (96GB × 8). The quantized versions need to start with the `--quantization ascend` parameter.
 
 Both `Qwen3.5-27B` and `Qwen3.6-27B` share the same MTP head design, so the `qwen3_5_mtp` speculative decoding method can be used for both.
@@ -268,13 +239,6 @@ Both `Qwen3.5-27B` and `Qwen3.6-27B` share the same MTP head design, so the `qwe
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         # To reduce memory fragmentation and avoid out of memory
         # Size of the shared buffer (in MB) used by HCCL for NPU-to-NPU collective communication
-=======
-Single-node deployment completes both Prefill and Decode within the same node, suitable for development, testing, and medium-scale inference scenarios. The `Qwen3.5-27B`, `Qwen3.5-27B-w8a8`, `Qwen3.6-27B`, and `Qwen3.6-27B-w8a8` models can all be deployed on 1 Atlas 800 A3 (64G × 16) or 1 Atlas 800 A2 (64G × 8). The quantized versions need to start with the `--quantization ascend` parameter.
-
-Both `Qwen3.5-27B` and `Qwen3.6-27B` share the same MTP head design, so the `qwen3_5_mtp` speculative decoding method can be used for both.
-
-**Qwen3.5-27B-w8a8**
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
         # Model weight path; can be a ModelScope model id (e.g., Eco-Tech/Qwen3.5-27B-w8a8-mtp) or a local directory path
         # Ensure the model path matches the directory recorded during download
@@ -300,7 +264,6 @@ Both `Qwen3.5-27B` and `Qwen3.6-27B` share the same MTP head design, so the `qwe
 
     === "Qwen3.6-27B-w8a8"
 
-<<<<<<< HEAD
         Startup Command:
 
         ```bash
@@ -312,9 +275,6 @@ Both `Qwen3.5-27B` and `Qwen3.6-27B` share the same MTP head design, so the `qwe
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         # To reduce memory fragmentation and avoid out of memory
         # Size of the shared buffer (in MB) used by HCCL for NPU-to-NPU collective communication
-=======
-**Qwen3.6-27B-w8a8**
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
         # Model weight path; can be a ModelScope model id (e.g., Eco-Tech/Qwen3.6-27B-w8a8) or a local directory path
         # Ensure the model path matches the directory recorded during download
@@ -340,7 +300,6 @@ Both `Qwen3.5-27B` and `Qwen3.6-27B` share the same MTP head design, so the `qwe
 
     Key Parameter Descriptions:
 
-<<<<<<< HEAD
     - `--data-parallel-size 1` and `--tensor-parallel-size 2` are common settings for data parallelism (DP) and tensor parallelism (TP) sizes.
     - `--max-model-len` represents the context length, which is the maximum value of the input plus output for a single request. The Qwen3.6-27B model supports up to 262144.
     - `--max-num-seqs` indicates the maximum number of requests that each DP group is allowed to process. If the number of requests sent to the service exceeds this limit, the excess requests will remain in a waiting state and will not be scheduled. Note that the time spent in the waiting state is also counted in metrics such as TTFT and TPOT. Therefore, when testing performance, it is generally recommended that `--max-num-seqs` * `--data-parallel-size` >= the actual total concurrency.
@@ -359,13 +318,9 @@ Both `Qwen3.5-27B` and `Qwen3.6-27B` share the same MTP head design, so the `qwe
 === "Atlas 300I DUO"
 
     Currently only the **TP** scenario is supported. Choose **TP=2** or **TP=4** according to the available devices. Replace `MODEL_PATH` with a ModelScope model id or a local directory path.The quantized versions need to start with the `--quantization ascend` parameter.
-=======
-Key Parameter Descriptions:
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     === "Qwen3.5-27B-w8a8"
 
-<<<<<<< HEAD
         Startup Command:
 
         ```bash
@@ -494,9 +449,6 @@ Key Parameter Descriptions:
         - `"cudagraph_capture_sizes"`: represents different levels of graph modes. The default value is `[1, 2, 4, 8, 16, 24, 32, 40,..., --max-num-seqs]`. In the graph mode, the input for graphs at different levels is fixed, and inputs between levels are automatically padded to the next level. Currently, the default setting is recommended. Only in some scenarios is it necessary to set this separately to achieve optimal performance.
 
 Common Issues Tip: If you encounter issues, please refer to the [Public FAQs](../../faqs.md) for troubleshooting.
-=======
-Common Issues Tip: If you encounter issues, please refer to the [Public FAQ](https://docs.vllm.ai/projects/ascend/en/latest/faqs.html) for troubleshooting.
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 Service Verification:
 
@@ -512,13 +464,10 @@ For functional testing (e.g., `completions` and `chat.completions` curl examples
 
 ### 5.2 Multi-Node PD Separation Deployment
 
-<<<<<<< HEAD
 !!! note
 
     Multi-node PD separation deployment is **not supported** on Atlas 300I DUO.
 
-=======
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 For high-concurrency production scenarios, multi-node PD (Prefill-Decode) separation can be used to scale the service. The recommended approach is to use Mooncake for deployment: [Mooncake Multi-Node PD Disaggregation Guide](../features/pd_disaggregation_mooncake_multi_node.md).
 
 In the standard single-node deployment mode, Prefill (prompt processing) and Decode (token generation) tasks run on the same set of NPUs. This can lead to two issues:
@@ -761,7 +710,7 @@ curl http://localhost:8000/v1/completions \
     -d '{
         "model": "qwen3.5",
         "prompt": "The future of AI is",
-        "max_completion_tokens": 50,
+        "max_tokens": 50,
         "temperature": 0
     }'
 ```
@@ -925,15 +874,11 @@ After about several minutes, you can get the performance evaluation result.
 
 > **Note**: The following configurations are validated in specific test environments and are for reference only. The optimal configuration depends on factors such as maximum input/output length, prefix cache hit rate, precision requirements, and deployment machine ratios. It is recommended to refer to [Section 9.2](#92-tuning-guidelines) for tuning based on actual conditions.
 >
-<<<<<<< HEAD
 > **Parallelism Strategy**: `Qwen3.5-27B-w8a8` and `Qwen3.6-27B-w8a8` are only ~30 GB and easily fit in a single NPU (64 GB HBM per NPU). Following the **DP-first** principle, **TP=2 is the recommended default** for most scenarios, and the remaining NPUs should be allocated to DP for parallel request batches. **TP=8 is only recommended for ultra-long context (256k+) scenarios**, where it shards the KV cache across 8 NPUs to maximize the available context window per rank. For `Qwen3.6-27B-w8a8`, you can also raise `--max-model-len` up to 262144 in the same TP/DP layout.
 >
 > **Atlas 300I DUO**: Currently only the TP scenario is supported. Choose **TP=2** or **TP=4** according to the available devices. With **TP=4**, `--max-model-len` can support **128k** and **256k** long-sequence scenarios; configure `--max-num-seqs` as needed—setting it too high may cause OOM.
 >
 > **950DT Products**: The `Qwen3.6-27B-w8a8-mxfp8` model weight easily fits in a single NPU (96 GB HBM per NPU). Following the **DP-first** principle, **TP=1 is the recommended default** for most scenarios, and the remaining NPUs should be allocated to DP for parallel request batches. For `Qwen3.6-27B-w8a8-mxfp8`, `--max-model-len` can support up to **262144** in the same TP=1 + DP=8 layout.
-=======
-> **Parallelism Strategy**: `Qwen3.5-27B-w8a8` and `Qwen3.6-27B-w8a8` are only ~30 GB and easily fit in a single NPU (64 GB HBM per NPU). Following the **DP-first** principle, **TP=2 is the recommended default** for most scenarios, and the remaining NPUs should be allocated to DP for parallel request batches. **TP=8 is only recommended for ultra-long context (256K+) scenarios**, where it shards the KV cache across 8 NPUs to maximize the available context window per rank. For `Qwen3.6-27B-w8a8`, you can also raise `--max-model-len` up to 262144 in the same TP/DP layout.
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 #### Table 1: Scenario Overview
 

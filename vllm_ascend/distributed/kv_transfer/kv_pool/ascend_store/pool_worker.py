@@ -1426,6 +1426,17 @@ class KVPoolWorker:
                     execution_id, bindings
                 )
                 execution_keys.update(claim.commit_futures)
+                if claim.yielded_keys:
+                    # Cross-instance writer already owns these canonical keys
+                    # (put_start hit OBJECT_ALREADY_EXISTS). The local chunk
+                    # skips their range put; later chunks pick the objects up
+                    # through the stateless exists() triage above.
+                    logger.info(
+                        "Layerwise Store yielded %d put key(s) to a "
+                        "cross-instance owner for request %s",
+                        len(claim.yielded_keys),
+                        request.req_id,
+                    )
                 session = ChunkStoreSession(
                     RequestChunkKey(
                         request.req_id,

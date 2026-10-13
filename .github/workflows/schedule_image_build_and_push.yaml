@@ -31,7 +31,6 @@ on:
         required: false
         type: choice
         options:
-<<<<<<< HEAD
           - 'main'
           - 'releases/v0.27.1rc'
           - 'releases/v0.26.0rc'
@@ -51,26 +50,6 @@ on:
           - 'v0.21.0rc1'
           - 'v0.20.2rc1'
           - 'none'
-=======
-          - main
-          - v0.23.0rc1
-          - v0.22.1rc1
-          - v0.21.0rc1
-          - v0.20.2rc1
-          - none
-      branch:
-        description: 'Docker branch for build results (mutually exclusive with tag)'
-        default: "none"
-        required: false
-        type: choice
-        options:
-          - main
-          - releases/v0.22.1rc
-          - releases/v0.21.0rc
-          - releases/v0.20.2rc
-          - releases/v0.18.0
-          - none
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
       vllm_commit:
         description: 'vLLM commit hash or release tag, e.g. v0.29.0. Pair with vllm_ascend_commit and set docker_ref to none.'
         required: false

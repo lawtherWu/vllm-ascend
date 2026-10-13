@@ -146,16 +146,8 @@ export OMP_NUM_THREADS=1
 export TASK_QUEUE_ENABLE=1
 
 export HCCL_BUFFSIZE=800
-<<<<<<< HEAD
 # Ensure the model path matches the directory recorded during download
 vllm serve Eco-Tech/Kimi-K2.5-w4a8 --additional-config '{"scheduler_config":{"enable_balance_scheduling":true},"enable_mlapo":true}' \
-=======
-export VLLM_ASCEND_ENABLE_MLAPO=1
-export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-export VLLM_ASCEND_BALANCE_SCHEDULING=1
-
-vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
   --host 0.0.0.0 \
   --port 8088 \
   --quantization ascend \
@@ -311,33 +303,7 @@ Run the following scripts on two nodes respectively.
 
 === "Node 1"
 
-<<<<<<< HEAD
     Startup Command:
-=======
-vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
-  --host 0.0.0.0 \
-  --port 8088 \
-  --quantization ascend \
-  --served-model-name kimi_k25 \
-  --allowed-local-media-path / \
-  --trust-remote-code \
-  --no-enable-prefix-caching \
-  --seed 1024 \
-  --data-parallel-size 4 \
-  --data-parallel-size-local 2 \
-  --data-parallel-address $node0_ip \
-  --data-parallel-rpc-port 13389 \
-  --tensor-parallel-size 4 \
-  --enable-expert-parallel \
-  --max-num-seqs 16 \
-  --max-model-len 32768 \
-  --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.9 \
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-  --speculative-config '{"method":"eagle3", "model":"lightseekorg/kimi-k2.5-eagle3", "num_speculative_tokens":3}' \
-  --mm-encoder-tp-mode data
-```
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     ```shell
     #!/bin/sh
@@ -371,7 +337,6 @@ vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
     export OMP_NUM_THREADS=1
     export TASK_QUEUE_ENABLE=1
 
-<<<<<<< HEAD
     export HCCL_BUFFSIZE=1024
     # Ensure the model path matches the directory recorded during download
     vllm serve Eco-Tech/Kimi-K2.5-w4a8 --additional-config '{"scheduler_config":{"enable_balance_scheduling":true},"enable_mlapo":true}' \
@@ -402,55 +367,6 @@ vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
     --tool-call-parser kimi_k2 \
     --reasoning-parser kimi_k2
     ```
-=======
-# [Optional] jemalloc
-# jemalloc is for better performance, if `libjemalloc.so` is installed on your machine, you can turn it on.
-export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
-
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-export HCCL_OP_EXPANSION_MODE="AIV"
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export OMP_PROC_BIND=false
-export OMP_NUM_THREADS=1
-export TASK_QUEUE_ENABLE=1
-
-export HCCL_BUFFSIZE=1024
-export VLLM_ASCEND_ENABLE_MLAPO=1
-export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-export VLLM_ASCEND_BALANCE_SCHEDULING=1
-
-vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
-  --host 0.0.0.0 \
-  --port 8088 \
-  --quantization ascend \
-  --served-model-name kimi_k25 \
-  --allowed-local-media-path / \
-  --trust-remote-code \
-  --no-enable-prefix-caching \
-  --seed 1024 \
-  --headless \
-  --data-parallel-size 4 \
-  --data-parallel-size-local 2 \
-  --data-parallel-start-rank 2 \
-  --data-parallel-address $node0_ip \
-  --data-parallel-rpc-port 13389 \
-  --tensor-parallel-size 4 \
-  --enable-expert-parallel \
-  --max-num-seqs 16 \
-  --max-model-len 32768 \
-  --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.9 \
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-  --speculative-config '{"method":"eagle3", "model":"lightseekorg/kimi-k2.5-eagle3", "num_speculative_tokens":3}' \
-  --mm-encoder-tp-mode data
-```
-
-::::
-:::::
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 Key Parameter Descriptions:
 
@@ -602,48 +518,7 @@ Parameter descriptions:
             }'
         ```
 
-<<<<<<< HEAD
     === "Node 1(Prefill)"
-=======
-vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
-    --host 0.0.0.0 \
-    --port $2 \
-    --data-parallel-size $3 \
-    --data-parallel-rank $4 \
-    --data-parallel-address $5 \
-    --data-parallel-rpc-port $6 \
-    --tensor-parallel-size $7 \
-    --enable-expert-parallel \
-    --seed 1024 \
-    --quantization ascend \
-    --served-model-name kimi_k25 \
-    --trust-remote-code \
-    --max-num-seqs 8 \
-    --max-model-len 32768 \
-    --max-num-batched-tokens 16384 \
-    --no-enable-prefix-caching \
-    --gpu-memory-utilization 0.8 \
-    --enforce-eager \
-    --speculative-config '{"method": "eagle3", "model":"lightseekorg/kimi-k2.5-eagle3", "num_speculative_tokens": 3}' \
-    --mm-encoder-tp-mode data \
-    --kv-transfer-config \
-    '{"kv_connector": "MooncakeConnectorV1",
-    "kv_role": "kv_producer",
-    "kv_port": "30000",
-    "engine_id": "0",
-    "kv_connector_extra_config": {
-            "prefill": {
-                    "dp_size": 2,
-                    "tp_size": 8
-            },
-            "decode": {
-                    "dp_size": 32,
-                    "tp_size": 1
-            }
-        }
-    }'
-```
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
         ```shell
         # this obtained through ifconfig
@@ -725,52 +600,11 @@ vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
 
     === "Node 0(Decode)"
 
-<<<<<<< HEAD
         ```shell
         # this obtained through ifconfig
         # nic_name is the network interface name corresponding to local_ip of the current node
         nic_name="xxx"
         local_ip="192.xx.xx.3"
-=======
-vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
-    --host 0.0.0.0 \
-    --port $2 \
-    --data-parallel-size $3 \
-    --data-parallel-rank $4 \
-    --data-parallel-address $5 \
-    --data-parallel-rpc-port $6 \
-    --tensor-parallel-size $7 \
-    --enable-expert-parallel \
-    --seed 1024 \
-    --quantization ascend \
-    --served-model-name kimi_k25 \
-    --trust-remote-code \
-    --max-num-seqs 8 \
-    --max-model-len 32768 \
-    --max-num-batched-tokens 16384 \
-    --no-enable-prefix-caching \
-    --gpu-memory-utilization 0.8 \
-    --enforce-eager \
-    --speculative-config '{"method": "eagle3", "model":"lightseekorg/kimi-k2.5-eagle3", "num_speculative_tokens": 3}' \
-    --mm-encoder-tp-mode data \
-    --kv-transfer-config \
-    '{"kv_connector": "MooncakeConnectorV1",
-    "kv_role": "kv_producer",
-    "kv_port": "30100",
-    "engine_id": "1",
-    "kv_connector_extra_config": {
-            "prefill": {
-                    "dp_size": 2,
-                    "tp_size": 8
-            },
-            "decode": {
-                    "dp_size": 32,
-                    "tp_size": 1
-            }
-        }
-    }'
-```
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
         # The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
         node0_ip="xxxx"
@@ -851,49 +685,8 @@ vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
         nic_name="xxx"
         local_ip="192.xx.xx.4"
 
-<<<<<<< HEAD
         # The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
         node0_ip="xxxx"
-=======
-vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
-    --host 0.0.0.0 \
-    --port $2 \
-    --data-parallel-size $3 \
-    --data-parallel-rank $4 \
-    --data-parallel-address $5 \
-    --data-parallel-rpc-port $6 \
-    --tensor-parallel-size $7 \
-    --enable-expert-parallel \
-    --seed 1024 \
-    --quantization ascend \
-    --served-model-name kimi_k25 \
-    --trust-remote-code \
-    --max-num-seqs 48 \
-    --max-model-len 32768 \
-    --max-num-batched-tokens 256 \
-    --no-enable-prefix-caching \
-    --gpu-memory-utilization 0.95 \
-    --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --additional-config '{"recompute_scheduler_enable":true,"multistream_overlap_shared_expert": false}' \
-    --speculative-config '{"method": "eagle3", "model":"lightseekorg/kimi-k2.5-eagle3", "num_speculative_tokens": 3}' \
-    --kv-transfer-config \
-    '{"kv_connector": "MooncakeConnectorV1",
-    "kv_role": "kv_consumer",
-    "kv_port": "30200",
-    "engine_id": "2",
-    "kv_connector_extra_config": {
-            "prefill": {
-                    "dp_size": 2,
-                    "tp_size": 8
-            },
-            "decode": {
-                    "dp_size": 32,
-                    "tp_size": 1
-            }
-        }
-    }'
-```
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
         export HCCL_IF_IP=$local_ip
         export GLOO_SOCKET_IFNAME=$nic_name
@@ -969,48 +762,7 @@ vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
     - `recompute_scheduler_enable: true`: enables the recomputation scheduler. When the Key-Value Cache (KV Cache) of the decode node is insufficient, requests will be sent to the prefill node to recompute the KV Cache. In the PD separation scenario, it is recommended to enable this configuration on both prefill and decode nodes simultaneously.
     - `multistream_overlap_shared_expert: true`: When the Tensor Parallelism (TP) size is 1 or `enable_shared_expert_dp: true`, an additional stream is enabled to overlap the computation process of shared experts for improved efficiency.
 
-<<<<<<< HEAD
     The `run_dp_template.sh` scripts use positional parameters (`$1`-`$7`) to receive configuration values from `launch_online_dp.py`:
-=======
-vllm serve Eco-Tech/Kimi-K2.5-W4A8 \
-    --host 0.0.0.0 \
-    --port $2 \
-    --data-parallel-size $3 \
-    --data-parallel-rank $4 \
-    --data-parallel-address $5 \
-    --data-parallel-rpc-port $6 \
-    --tensor-parallel-size $7 \
-    --enable-expert-parallel \
-    --seed 1024 \
-    --quantization ascend \
-    --served-model-name kimi_k25 \
-    --trust-remote-code \
-    --max-num-seqs 48 \
-    --max-model-len 32768 \
-    --max-num-batched-tokens 256 \
-    --no-enable-prefix-caching \
-    --gpu-memory-utilization 0.95 \
-    --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --additional-config '{"recompute_scheduler_enable":true,"multistream_overlap_shared_expert": false}' \
-    --speculative-config '{"method": "eagle3", "model":"lightseekorg/kimi-k2.5-eagle3", "num_speculative_tokens": 3}' \
-    --kv-transfer-config \
-    '{"kv_connector": "MooncakeConnectorV1",
-    "kv_role": "kv_consumer",
-    "kv_port": "30200",
-    "engine_id": "2",
-    "kv_connector_extra_config": {
-            "prefill": {
-                    "dp_size": 2,
-                    "tp_size": 8
-            },
-            "decode": {
-                    "dp_size": 32,
-                    "tp_size": 1
-            }
-        }
-    }'
-```
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     - `$1` (`ASCEND_RT_VISIBLE_DEVICES`): the NPU devices assigned to this DP instance, e.g., `0,1,2,3` or `4,5,6,7`.
     - `$2` (`--port`): the vLLM server port for this DP instance, auto-assigned starting from `--vllm-start-port` (e.g., `7100`, `7101`).

@@ -12,10 +12,6 @@ if TYPE_CHECKING:
     from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
 
 from vllm.config import VllmConfig
-<<<<<<< HEAD
-=======
-from vllm.config.parallel import ParallelConfig
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
     WeightTransferEngine,
@@ -28,7 +24,6 @@ from vllm_ascend.distributed.weight_transfer.packed_tensor import (
     DEFAULT_PACKED_NUM_BUFFERS,
     packed_broadcast_consumer,
 )
-from vllm_ascend.utils import vllm_version_is
 
 
 @dataclass
@@ -119,7 +114,6 @@ class HCCLWeightTransferEngine(WeightTransferEngine[HCCLWeightTransferInitInfo, 
     init_info_cls = HCCLWeightTransferInitInfo
     update_info_cls = HCCLWeightTransferUpdateInfo
 
-<<<<<<< HEAD
     def __init__(  # type: ignore[misc]
         self,
         config: WeightTransferConfig,
@@ -143,46 +137,6 @@ class HCCLWeightTransferEngine(WeightTransferEngine[HCCLWeightTransferInitInfo, 
         )
 
         finalize_layerwise_reload(self.model, self.model_config)
-=======
-    if vllm_version_is("0.23.0"):
-
-        def __init__(
-            self,
-            config: WeightTransferConfig,
-            parallel_config: ParallelConfig,
-            model: torch.nn.Module | None = None,
-        ) -> None:
-            super().__init__(config, parallel_config, model)
-            self.model_update_group: PyHcclCommunicator | None = None
-
-    else:
-
-        def __init__(  # type: ignore[misc]
-            self,
-            config: WeightTransferConfig,
-            vllm_config: VllmConfig,
-            device: torch.device,
-            model: torch.nn.Module,
-        ) -> None:
-            super().__init__(config, vllm_config, device, model)
-            self.model_update_group: PyHcclCommunicator | None = None  # type: ignore[no-redef]
-
-    if not vllm_version_is("0.23.0"):
-
-        def start_weight_update(self) -> None:
-            from vllm.model_executor.model_loader.reload import (
-                initialize_layerwise_reload,
-            )
-
-            initialize_layerwise_reload(self.model)
-
-        def finish_weight_update(self) -> None:
-            from vllm.model_executor.model_loader.reload import (
-                finalize_layerwise_reload,
-            )
-
-            finalize_layerwise_reload(self.model, self.model_config)
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     def init_transfer_engine(self, init_info: HCCLWeightTransferInitInfo) -> None:
         """

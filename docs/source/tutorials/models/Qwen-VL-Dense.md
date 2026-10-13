@@ -8,13 +8,10 @@ This document will show the main verification steps of the model, including supp
 
 This tutorial uses the vLLM-Ascend `v0.11.0rc3-a3` version for demonstration, showcasing the `Qwen3-VL-8B-Instruct` model as an example for single NPU and multi-NPU deployment.
 
-<<<<<<< HEAD
 !!! note
 
     For **Atlas inference products**, Qwen3-VL Dense requires vLLM-Ascend `v0.18.0` or later(for 950DT Products, the model is supported from `vllm-ascend:v0.23.0rc1`). Do not use the demonstration version above on this hardware.
 
-=======
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 ## 2 Supported Features
 
 Refer to [Supported Features List](../../user_guide/support_matrix/supported_models.md) to get the model's supported feature matrix.
@@ -25,24 +22,12 @@ Refer to [Feature Guide](../../user_guide/feature_guide/index.md) to get the fea
 
 ### 3.1 Model Weight
 
-<<<<<<< HEAD
 |  Weight Version                                 | Hardware Requirements                                                                     | Download Links |
 |-------------------------------------------------|-------------------------------------------------------------------------------------------|----------------|
 | `Qwen3-VL-8B-Instruct`                          | 1 card on Atlas 800I A2 (64GB × 8), Atlas 800 A3 (64GB × 16), or Atlas 300I DUO           | [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-VL-8B-Instruct) |
 | `Qwen3-VL-8B-Instruct-w8a8`(Quantized version)  | 1 card on 950DT Products (96GB × 8) node                                              | [ModelScope](https://modelscope.cn/models/Eco-Tech/Qwen3-VL-8B-Instruct-w8a8-mxfp8) |
 | `Qwen3-VL-32B-Instruct`                         | 2 cards on Atlas 800I A2 (64GB × 8), Atlas 800 A3 (64GB × 16), or Atlas inference products| [ModelScope](https://www.modelscope.cn/models/Qwen/Qwen3-VL-32B-Instruct) |
 | `Qwen3-VL-32B-Instruct-w8a8`(Quantized version) | 1 card on 950DT Products (96GB × 8) node                                              | [ModelScope](https://modelscope.cn/models/Eco-Tech/Qwen3-VL-32B-Instruct-w8a8-mxfp8) |
-=======
-Requires 1 card in 1 Atlas 800I A2 (64G × 8) node or 1 card in 1 Atlas 800 A3 (64G × 16) node:
-
-- `Qwen3-VL-2B-Instruct`: [Download model weight](https://modelscope.cn/models/Qwen/Qwen3-VL-2B-Instruct)
-- `Qwen3-VL-4B-Instruct`: [Download model weight](https://modelscope.cn/models/Qwen/Qwen3-VL-4B-Instruct)
-- `Qwen3-VL-8B-Instruct`: [Download model weight](https://modelscope.cn/models/Qwen/Qwen3-VL-8B-Instruct)
-
-Requires 2 cards in 1 Atlas 800I A2 (64G × 8) node or 2 cards in 1 Atlas 800 A3 (64G × 16) node:
-
-- `Qwen3-VL-32B-Instruct`: [Download model weight](https://modelscope.cn/models/Qwen/Qwen3-VL-32B-Instruct)
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 It is recommended to download the model weight to the shared directory of multiple nodes, such as `/root/.cache/`.
 
@@ -54,7 +39,6 @@ It is recommended to download the model weight to the shared directory of multip
 
 Select an image based on your machine type and start the docker image on your node, refer to [using docker](../../getting_started/installation.md#installation-prebuilt-image).
 
-<<<<<<< HEAD
 === "950DT Products"
 
     Start the docker image on your each node.
@@ -94,19 +78,9 @@ Select an image based on your machine type and start the docker image on your no
     -v /usr/lib64:/usr/lib64 \
     -itd $IMAGE bash
     ```
-=======
-**A3 series:**
-
-Start the docker image on each node.
-
-``` bash
-# Update the vllm-ascend image
-export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 === "A2 / A3 series"
 
-<<<<<<< HEAD
     ```bash
     # Update the vllm-ascend image
     # A2: quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}
@@ -160,8 +134,6 @@ export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|
     -it $IMAGE bash
     ```
 
-=======
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 **Installation Verification:**
 
 After starting the container, run the following command to verify the installation:
@@ -198,7 +170,6 @@ If you prefer not to use the Docker image, you can build from source. Install vL
    pip install -e .
    ```
 
-<<<<<<< HEAD
 !!! note
 
     Atlas 300I DUO does not support `triton` or `triton-ascend`. Source installation may pull them in automatically; uninstall them manually before running:
@@ -207,8 +178,6 @@ If you prefer not to use the Docker image, you can build from source. Install vL
     pip uninstall -y triton-ascend triton
     ```
 
-=======
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 **Installation Verification:**
 
 ```bash
@@ -229,7 +198,6 @@ For more details, please refer to the [Installation Guide](../../getting_started
 
 Run docker container to start the vLLM server on single-NPU:
 
-<<<<<<< HEAD
 === "950DT Products"
 
     ```bash
@@ -321,15 +289,6 @@ Run docker container to start the vLLM server on single-NPU:
         - Graph compilation (`--compilation-config`) requires **CANN version >= 9.0.0**. If your CANN version is lower, replace `--compilation-config` with `--enforce-eager`.
         - `--additional-config` with `"ascend_compilation_config": {"enable_npugraph_ex": false}` is required because `enable_npugraph_ex` is not supported on Atlas 300I DUO.
 
-=======
-``` bash
-vllm serve Qwen/Qwen3-VL-8B-Instruct \
---dtype bfloat16 \
---max_model_len 16384 \
---max-num-batched-tokens 16384
-```
-
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 Key Parameter Descriptions:
 
 - Add the `--max_model_len` option to avoid the ValueError that occurs when the Qwen3-VL-8B-Instruct model's max-seq-len (256000) exceeds the maximum number of tokens that can be stored in KV cache. This will differ with different NPU series based on the on-chip memory size. Please modify the value according to a suitable value for your NPU series.
@@ -371,13 +330,10 @@ The service returns HTTP 200 OK.
 
 ## 7 Accuracy Evaluation
 
-### Using Language Model Evaluation Harness
-
 The accuracy of some models is already within our CI monitoring scope, including:
 
 - `Qwen3-VL-8B-Instruct`
 
-<<<<<<< HEAD
 === "A2 / A3 series"
 
     **Using Language Model Evaluation Harness**
@@ -385,9 +341,6 @@ The accuracy of some models is already within our CI monitoring scope, including
     As an example, take the `mmmu_val` dataset as a test dataset, and run accuracy evaluation of `Qwen3-VL-8B-Instruct` in offline mode.
 
     1. Refer to [Using lm_eval](../../developer_guide/evaluation/using_lm_eval.md) for more details on `lm_eval` installation.
-=======
-As an example, take the `mmmu_val` dataset as a test dataset, and run accuracy evaluation of `Qwen3-VL-8B-Instruct` in offline mode.
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
         ```shell
         pip install lm_eval
@@ -412,7 +365,6 @@ As an example, take the `mmmu_val` dataset as a test dataset, and run accuracy e
     | -------- | ------ | ------ |
     | mmmu_val | 0.5389 | 0.0159 |
 
-<<<<<<< HEAD
 === "Atlas 300I DUO"
 
     **Using AISBench**
@@ -432,11 +384,6 @@ As an example, take the `mmmu_val` dataset as a test dataset, and run accuracy e
     | dataset  | metric   | mode | vllm-api-general-chat |
     | -------- | -------- | ---- | --------------------- |
     | text_vqa | accuracy | gen  | 80.57                 |
-=======
-    |  Tasks  |Value |Stderr|
-    |---------|---|-----|
-    |mmmu_val |0.5389|0.0159|
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 ## 8 Performance Evaluation
 

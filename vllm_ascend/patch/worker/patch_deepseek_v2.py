@@ -42,8 +42,6 @@ from vllm_ascend.worker.v2.pp_transport import (
     configure_pp_topk_transport,
 )
 
-from vllm_ascend.utils import vllm_version_is
-
 
 def _should_skip_indexer_init(
     config: DeepseekV2Config | DeepseekV3Config,
@@ -83,11 +81,8 @@ def _deepseek_v2_mla_attention_init(
     topk_indices_buffer: torch.Tensor | None = None,
     input_size: int | None = None,
     reduce_results: bool = True,
-<<<<<<< HEAD
     index_group_builder: SparseMLAIndexGroupBuilder | None = None,
     non_causal_multi_token_decode: bool = False,
-=======
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 ) -> None:
     # Zero-argument super() is unavailable because this function is defined
     # outside the class and assigned to DeepseekV2MLAAttention.__init__.
@@ -293,7 +288,6 @@ def _deepseek_v2_mla_attention_init(
 DeepseekV2MLAAttention.__init__ = _deepseek_v2_mla_attention_init
 
 
-<<<<<<< HEAD
 # TODO: Retire the legacy aux transport when vLLM 0.28/0.29 are no longer supported.
 _original_deepseek_v2_model_init = DeepseekV2Model.__init__
 
@@ -449,78 +443,3 @@ def _patched_forward(
 
 
 DeepseekV2Model.forward = _patched_forward
-=======
-if not vllm_version_is("0.23.0"):
-    from itertools import islice
-
-    from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
-    from vllm.model_executor.models.deepseek_v2 import (
-        DeepseekV2Model,
-        _get_llama_4_scaling,
-    )
-    from vllm.sequence import IntermediateTensors
-
-    def _patched_forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                if input_ids is None:
-                    raise ValueError("Either input_ids or inputs_embeds must be provided to DeepseekV2Model.forward")
-                hidden_states = self.embed_input_ids(input_ids)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-
-        llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
-        llama_4_scaling: torch.Tensor | None
-        if llama_4_scaling_config is not None:
-            llama_4_scaling = _get_llama_4_scaling(
-                original_max_position_embeddings=llama_4_scaling_config["original_max_position_embeddings"],
-                scaling_beta=llama_4_scaling_config["beta"],
-                positions=positions,
-            )
-        else:
-            llama_4_scaling = None
-
-        aux_hidden_states = []
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
-            if idx in self.aux_hidden_state_layers:
-                aux_hidden_state = hidden_states + residual
-                if aux_hidden_state.shape[0] != positions.shape[0]:
-                    aux_hidden_state = tensor_model_parallel_all_gather(aux_hidden_state, 0)
-                    aux_hidden_state = aux_hidden_state[: positions.shape[0]]
-                aux_hidden_states.append(aux_hidden_state)
-            hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
-
-        if hidden_states.shape[0] != positions.shape[0]:
-            combined_states = torch.cat([hidden_states, residual], dim=-1)
-            combined_states = tensor_model_parallel_all_gather(combined_states, 0)
-            combined_states = combined_states[: positions.shape[0]]
-            hidden_states, residual = combined_states.split([self.hidden_size, self.hidden_size], dim=-1)
-            residual = residual.contiguous()
-
-        if self.end_layer in self.aux_hidden_state_layers:
-            aux_hidden_states.append(hidden_states + residual)
-
-        hidden_states, _ = self.norm(hidden_states, residual)
-        if len(aux_hidden_states) > 0:
-            return hidden_states, aux_hidden_states
-        return hidden_states
-
-    DeepseekV2Model.forward = _patched_forward
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)

@@ -332,7 +332,6 @@ Parameter descriptions:
     export TASK_QUEUE_ENABLE=1
     export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages/mooncake:$LD_LIBRARY_PATH
 
-<<<<<<< HEAD
     export HCCL_BUFFSIZE=1536
     export ASCEND_RT_VISIBLE_DEVICES=$1
     
@@ -376,54 +375,6 @@ Parameter descriptions:
                         "dp_size": 8,
                         "tp_size": 4
                 }
-=======
-export HCCL_OP_EXPANSION_MODE="AIV"
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export OMP_PROC_BIND=false
-export OMP_NUM_THREADS=1
-export TASK_QUEUE_ENABLE=1
-export ASCEND_BUFFER_POOL=4:8
-export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages/mooncake:$LD_LIBRARY_PATH
-
-export HCCL_BUFFSIZE=800
-export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-export ASCEND_RT_VISIBLE_DEVICES=$1
-
-vllm serve Eco-Tech/Kimi-K2.6-W4A8 \
-    --host 0.0.0.0 \
-    --port $2 \
-    --data-parallel-size $3 \
-    --data-parallel-rank $4 \
-    --data-parallel-address $5 \
-    --data-parallel-rpc-port $6 \
-    --tensor-parallel-size $7 \
-    --enable-expert-parallel \
-    --seed 1024 \
-    --quantization ascend \
-    --served-model-name kimi_k26 \
-    --trust-remote-code \
-    --max-num-seqs 4 \
-    --max-model-len 32768 \
-    --max-num-batched-tokens 16384 \
-    --no-enable-prefix-caching \
-    --gpu-memory-utilization 0.95 \
-    --enforce-eager \
-    --speculative-config '{"method": "eagle3", "model":"lightseekorg/kimi-k2.6-eagle3", "num_speculative_tokens": 3}' \
-    --mm-encoder-tp-mode data \
-    --kv-transfer-config \
-    '{"kv_connector": "MooncakeConnectorV1",
-    "kv_role": "kv_producer",
-    "kv_port": "30000",
-    "engine_id": "0",
-    "kv_connector_extra_config": {
-            "prefill": {
-                    "dp_size": 4,
-                    "tp_size": 4
-            },
-            "decode": {
-                    "dp_size": 8,
-                    "tp_size": 4
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             }
         }'
     ```
@@ -466,7 +417,6 @@ vllm serve Eco-Tech/Kimi-K2.6-W4A8 \
     export HCCL_BUFFSIZE=1536
     export ASCEND_RT_VISIBLE_DEVICES=$1
 
-<<<<<<< HEAD
     # Ensure the model path matches the directory recorded during download
     vllm serve Eco-Tech/Kimi-K2.6-W4A8 \
         --host 0.0.0.0 \
@@ -506,42 +456,6 @@ vllm serve Eco-Tech/Kimi-K2.6-W4A8 \
                         "dp_size": 8,
                         "tp_size": 4
                 }
-=======
-vllm serve Eco-Tech/Kimi-K2.6-W4A8 \
-    --host 0.0.0.0 \
-    --port $2 \
-    --data-parallel-size $3 \
-    --data-parallel-rank $4 \
-    --data-parallel-address $5 \
-    --data-parallel-rpc-port $6 \
-    --tensor-parallel-size $7 \
-    --enable-expert-parallel \
-    --seed 1024 \
-    --quantization ascend \
-    --served-model-name kimi_k26 \
-    --trust-remote-code \
-    --max-num-seqs 4 \
-    --max-model-len 32768 \
-    --max-num-batched-tokens 16384 \
-    --no-enable-prefix-caching \
-    --gpu-memory-utilization 0.95 \
-    --enforce-eager \
-    --speculative-config '{"method": "eagle3", "model":"lightseekorg/kimi-k2.6-eagle3", "num_speculative_tokens": 3}' \
-    --mm-encoder-tp-mode data \
-    --kv-transfer-config \
-    '{"kv_connector": "MooncakeConnectorV1",
-    "kv_role": "kv_producer",
-    "kv_port": "30100",
-    "engine_id": "1",
-    "kv_connector_extra_config": {
-            "prefill": {
-                    "dp_size": 4,
-                    "tp_size": 4
-            },
-            "decode": {
-                    "dp_size": 8,
-                    "tp_size": 4
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
             }
         }'
     ```

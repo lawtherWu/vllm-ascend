@@ -2,13 +2,10 @@
 
 ## Version Specific FAQs
 
-<<<<<<< HEAD
 - [[v0.30.0rc1] FAQ & Feedback](https://github.com/vllm-project/vllm-ascend/issues/17748)
 - [[v0.26.0rc1] FAQ & Feedback](https://github.com/vllm-project/vllm-ascend/issues/14766)
 - [[v0.23.0] FAQ & Feedback](https://github.com/vllm-project/vllm-ascend/issues/12916)
 - [[v0.23.0rc1] FAQ & Feedback](https://github.com/vllm-project/vllm-ascend/issues/12238)
-=======
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 - [[v0.22.1rc1] FAQ & Feedback](https://github.com/vllm-project/vllm-ascend/issues/10593)
 - [[v0.21.0rc1] FAQ & Feedback](https://github.com/vllm-project/vllm-ascend/issues/9970)
 - [[v0.20.2rc1] FAQ & Feedback](https://github.com/vllm-project/vllm-ascend/issues/9586)

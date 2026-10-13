@@ -1,25 +1,23 @@
 # Qwen3-ASR-1.7B
 
-## Introduction
+## 1 Introduction
 
-The released Qwen3-ASR-1.7B is a lightweight, high-performance automatic speech recognition (ASR) model developed by the Qwen Team. It delivers industry-leading recognition accuracy across Chinese/English multi-scene speech, Chinese dialects, multilingual and singing voice scenarios, with native support for long audio and streaming inference, and deep optimization for Ascend NPU hardware.
+Qwen3-ASR-1.7B is a 1.7B-parameter automatic speech recognition (ASR) model from the Qwen team. It supports Chinese and English speech, Chinese dialects, multilingual speech, and singing voice transcription, and provides long-audio and streaming inference capabilities.
 
-This document will show the main verification steps of the model, including supported features, feature configuration, environment preparation, single-node deployment, accuracy and performance evaluation.
+This document describes the supported features, environment preparation, single-node deployment, functional verification, and evaluation workflow for Qwen3-ASR-1.7B on Ascend NPUs.
 
-## Environment Preparation
+Qwen3-ASR-1.7B was introduced with upstream vLLM v0.19.0. Use a vLLM-Ascend image that matches your vLLM version, and refer to the support matrix for the current release status.
 
-### Model Weight
+## 2 Supported Features
 
-`Qwen3-ASR-1.7B`(BF16 version): requires 1 Ascend 910B (with 1 x 64G NPUs).
+Please refer to the [Supported Features List](../../user_guide/support_matrix/supported_models.md) for the model support matrix.
 
-`Qwen3-ASR-1.7B`(BF16 version): requires 1 Ascend 310P (with 1 x 48G NPUs).
-[Download model weight](https://modelscope.cn/models/Qwen/Qwen3-ASR-1.7B).
+Please refer to the [Feature Guide](../../user_guide/feature_guide/index.md) for feature configuration information.
 
-It is recommended to download the model weight to the shared directory of multiple nodes, such as `/root/.cache/`.
+## 3 Prerequisites
 
-### Installation
+### 3.1 Model Weight
 
-<<<<<<< HEAD
 |  Weight Version    | Hardware Requirements                                            | Download Links |
 |--------------------|------------------------------------------------------------------|----------------|
 | BF16               | one Ascend Atlas 800I A2 64 GB NPU or one Ascend Atlas 300I DUO 48 GB NPU | [ModelScope](https://www.modelscope.cn/models/Qwen/Qwen3-ASR-1.7B) |
@@ -157,93 +155,34 @@ After the service is started, the model can be invoked by sending a prompt.
 ```bash
 curl http://localhost:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
-=======
-`Qwen3-ASR-1.7B` is supported in `vllm-ascend`.
-
-You can use our official docker image to run `Qwen3-ASR-1.7B` directly.
-
-```{code-block} bash
-   :substitutions:
-export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|
-docker run --rm \
-  --name vllm-ascend \
-  --shm-size=1g \
-  --device /dev/davinci0 \
-  --device /dev/davinci_manager \
-  --device /dev/devmm_svm \
-  --device /dev/hisi_hdc \
-  -v /usr/local/dcmi:/usr/local/dcmi \
-  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-  -v /etc/ascend_install.info:/etc/ascend_install.info \
-  -v /root/.cache:/root/.cache \
-  -v /data/vllm-workspace/models:/data/vllm-workspace/models \
-  -p 8000:8000 \
-  -it $IMAGE bash
-```
-
-In addition, if you don't want to use the docker image as above, you can also build all from source:
-
-- Install `vllm-ascend` from source, refer to [installation](../../installation.md).
-
-## Deployment
-
-### Atlas 300I A2 2UP
-
-```shell
-vllm serve "Qwen/Qwen3-ASR-1.7B" \
-  --tensor-parallel-size 1 \
-  --max-model-len 4096 \
-  --gpu-memory-utilization 0.9 \
-  --enforce-eager \
-  --port 8000
-```
-
-### Atlas 300I DUO
-
-```shell
-vllm serve "Qwen/Qwen3-ASR-1.7B" \
-  --tensor-parallel-size 1 \
-  --gpu_memory_utilization 0.9 \
-  --dtype float16 \
-  --max_model_len 4096 \
-  --additional-config '{"ascend_compilation_config": {"fuse_norm_quant": false}}' \
-  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1,4]}' \
-  --port 8000
-```
-
-## Functional Verification
-
-Once your server is started, you can query the model with input prompts:
-
-```shell
-curl http://localhost:8000/v1/chat/completions
-    -H "Content-Type: application/json"
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
     -d '{
-    "messages": [
-    {"role": "user", "content": [
-        {"type": "audio_url",
-        "audio_url":
-        {"url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav"}}
-    ]}
-    ]
-}'
+        "model": "qwen3-asr",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "audio_url",
+                        "audio_url": {
+                            "url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav"
+                        }
+                    }
+                ]
+            }
+        ]
+    }'
 ```
 
-## Accuracy Evaluation
+Replace `localhost`, `8000`, and `qwen3-asr` with the address, port, and `--served-model-name` used by your deployment. Expected result: HTTP 200 and a JSON response containing the transcription in the `choices` field.
 
-After all samples were processed, transcription quality was measured using:
+## 7 Accuracy Evaluation
 
-- WER (Word Error Rate) for word-level recognition accuracy
-- CER (Character Error Rate) for character-level recognition accuracy
+Evaluate transcription quality with Word Error Rate (WER) for word-level recognition and Character Error Rate (CER) for character-level recognition.
 
-### Remarks
+## 8 Performance Evaluation
 
-This result reflects end-to-end serving performance, including audio preprocessing, request construction, API communication, inference, and response parsing. Actual performance may vary depending on hardware, concurrency, audio length, and deployment configuration.
+Measure ASR serving performance with audio samples that represent the production workload. Record at least the audio duration, request concurrency, end-to-end latency, real-time factor, and throughput. This ensures that audio preprocessing, request construction, API communication, inference, and response parsing are included in the result.
 
-<<<<<<< HEAD
 Actual performance varies with hardware, audio duration, concurrency, and deployment configuration. Evaluate short audio, long audio, and concurrent requests separately before selecting a production configuration.
 
 ## 9 Performance Tuning
@@ -269,6 +208,3 @@ For common environment, installation, and general parameter issues, see the [Pub
 **Cause:** On Atlas 300I DUO, an automatically detected large context length can create a full causal attention mask whose memory consumption grows quadratically with `max_model_len`.
 
 **Solution:** Always set `--max-model-len` explicitly to a conservative value, such as `4096`, and increase it only after verifying available NPU memory.
-=======
-Further benchmarking is recommended for latency distribution, concurrent throughput, long-audio scenarios, and system resource utilization.
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)

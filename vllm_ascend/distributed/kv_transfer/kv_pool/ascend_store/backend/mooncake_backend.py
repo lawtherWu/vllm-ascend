@@ -604,7 +604,7 @@ class MooncakeBackend(Backend):
         sizes: list[int],
         config: ReplicateConfig | None = None,
     ) -> list[int]:
-        self._ensure_initialized()
+        self.ensure_initialized()
         self._require_layerwise_session_api()
         if len(keys) != len(sizes):
             raise ValueError("Mooncake batch_put_session_start keys and sizes must align")
@@ -623,7 +623,7 @@ class MooncakeBackend(Backend):
         all_sizes: list[list[int]],
         all_dst_offsets: list[list[int]],
     ) -> list[int]:
-        self._ensure_initialized()
+        self.ensure_initialized()
         self._validate_key_major(keys, all_buffer_ptrs, all_sizes, all_dst_offsets)
         assert self.store is not None
         result = self.store.batch_put_from_multi_buffer_ranges(
@@ -642,17 +642,17 @@ class MooncakeBackend(Backend):
         return normalized
 
     def batch_put_session_end(self, keys: list[str]) -> list[int]:
-        self._ensure_initialized()
+        self.ensure_initialized()
         assert self.store is not None
         return self._validate_key_results("batch_put_session_end", keys, self.store.batch_put_session_end(keys))
 
     def batch_put_session_revoke(self, keys: list[str]) -> list[int]:
-        self._ensure_initialized()
+        self.ensure_initialized()
         assert self.store is not None
         return self._validate_key_results("batch_put_session_revoke", keys, self.store.batch_put_session_revoke(keys))
 
     def batch_get_session_start(self, keys: list[str]) -> list[int]:
-        self._ensure_initialized()
+        self.ensure_initialized()
         self._require_layerwise_session_api()
         assert self.store is not None
         return self._validate_key_results("batch_get_session_start", keys, self.store.batch_get_session_start(keys))
@@ -664,7 +664,7 @@ class MooncakeBackend(Backend):
         all_sizes: list[list[int]],
         all_src_offsets: list[list[int]],
     ) -> list[int]:
-        self._ensure_initialized()
+        self.ensure_initialized()
         self._validate_key_major(keys, all_buffer_ptrs, all_sizes, all_src_offsets)
         assert self.store is not None
         result = self.store.batch_get_into_multi_buffer_ranges(
@@ -683,7 +683,7 @@ class MooncakeBackend(Backend):
         return normalized
 
     def batch_get_session_end(self, keys: list[str]) -> int:
-        self._ensure_initialized()
+        self.ensure_initialized()
         assert self.store is not None
         result = self.store.batch_get_session_end(keys)
         if isinstance(result, (list, tuple)):

@@ -57,7 +57,6 @@ class XliteModelRunner(NPUModelRunner):
         # but this should be fine since they are both long-lived objects
         self.model = self.runner_model = self.runner_cls(self, self.vllm_config, device=self.device)  # type: ignore[assignment]
 
-<<<<<<< HEAD
     @contextmanager
     def _bypass_xlite_wrapper(self):
         """Temporarily route ``self.model`` to the native runnable.
@@ -108,15 +107,6 @@ class XliteModelRunner(NPUModelRunner):
                 xlite_expects,
                 ascend_metadata_cls,
             )
-=======
-    def initialize_kv_cache(
-        self,
-        kv_cache_config: KVCacheConfig,
-        is_profiling: bool = False,
-    ) -> None:
-        super().initialize_kv_cache(kv_cache_config, is_profiling=is_profiling)
-        self.xlite_model.register_kv_caches(self.kv_caches)
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     def _should_build_dummy_attn_metadata(
         self, force_attention: bool = False, is_profile: bool = False, *args: Any, **kwargs: Any

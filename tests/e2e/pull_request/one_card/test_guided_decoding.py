@@ -193,7 +193,6 @@ def test_guided_regex_guidance(sample_regex, vllm_runner):
 @pytest.mark.timeout(1000)
 @pytest.mark.model(
     model_name=MODEL_NAME,
-<<<<<<< HEAD
     # disable_any_whitespace is only supported by xgrammar/guidance backends,
     # so it cannot be enabled here (backend="auto").
     extra_kwargs={"seed": 0, "enforce_eager": True, "structured_outputs_config": {"backend": "auto"}},
@@ -239,10 +238,6 @@ def test_guided_auto_rejects_mixed_structured_output_backends(vllm_runner):
     # disable_any_whitespace is only supported by xgrammar/guidance backends,
     # so it cannot be enabled here (backend="outlines").
     extra_kwargs={"seed": 0, "enforce_eager": True, "structured_outputs_config": {"backend": "outlines"}},
-=======
-    compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8]},
-    extra_kwargs={"seed": 0, "structured_outputs_config": {"backend": "outlines"}},
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 )
 def test_guided_json_completion_outlines(sample_json_schema, request):
     sampling_params = SamplingParams(

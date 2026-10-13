@@ -228,14 +228,9 @@ class AscendStep3p5MTPProposer(AscendEagleProposer):
         if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
-<<<<<<< HEAD
             with self.runner.synchronize_input_prep():
                 self.query_start_loc.cpu[: num_reqs + 1].copy_(self.runner.query_start_loc.cpu[: num_reqs + 1])
                 self.query_start_loc.copy_to_gpu()
-=======
-            self.query_start_loc.cpu[: num_reqs + 1].copy_(self.runner.query_start_loc.cpu[: num_reqs + 1])
-            self.query_start_loc.copy_to_gpu()
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
             common_attn_metadata = AscendCommonAttentionMetadata(
                 query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
@@ -251,7 +246,6 @@ class AscendStep3p5MTPProposer(AscendEagleProposer):
                 actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
                 block_table_tensor=self.runner.input_batch.block_table[0].get_device_tensor()[:num_reqs],
                 slot_mapping=self.runner.input_batch.block_table[0].slot_mapping.gpu,
-                slot_mapping_cpu=self.runner.input_batch.block_table[0].slot_mapping.cpu,
                 positions=self.runner.positions,
                 attn_state=self.runner.attn_state,
                 decode_token_per_req=self.runner.decode_token_per_req,

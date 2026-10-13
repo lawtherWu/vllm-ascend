@@ -11,13 +11,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
-<<<<<<< HEAD
 from vllm.config import VllmConfig
-=======
-from vllm import envs
-from vllm.config import VllmConfig
-from vllm.config.parallel import ParallelConfig
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
     TrainerWeightTransferEngine,
@@ -35,7 +29,6 @@ from vllm_ascend.distributed.weight_transfer.packed_tensor import (
     packed_npu_ipc_consumer,
     packed_npu_ipc_producer,
 )
-from vllm_ascend.utils import vllm_version_is
 
 if TYPE_CHECKING:
     from vllm.distributed.weight_transfer.base import (
@@ -135,7 +128,6 @@ class NPUIPCWeightTransferEngine(  # type: ignore[no-redef]
     init_info_cls = NPUIPCWeightTransferInitInfo
     update_info_cls = NPUIPCWeightTransferUpdateInfo
 
-<<<<<<< HEAD
     @staticmethod
     def trainer_send_weights(*args: Any, **kwargs: Any) -> None:
         raise NotImplementedError(
@@ -157,60 +149,12 @@ class NPUIPCWeightTransferEngine(  # type: ignore[no-redef]
         # Set from the trainer-supplied init info at the handshake; defaults
         # are only for the (unreachable) receive-before-init case.
         self.packed = False
-=======
-    if vllm_version_is("0.23.0"):
-
-        def __init__(
-            self,
-            config: WeightTransferConfig,
-            parallel_config: ParallelConfig,
-            model: torch.nn.Module | None = None,
-        ) -> None:
-            super().__init__(config, parallel_config, model)
-
-    else:
-
-        def __init__(  # type: ignore[misc]
-            self,
-            config: WeightTransferConfig,
-            vllm_config: VllmConfig,
-            device: torch.device,
-            model: torch.nn.Module,
-        ) -> None:
-            super().__init__(config, vllm_config, device, model)
-
-    def parse_update_info(self, update_dict: dict[str, Any]) -> NPUIPCWeightTransferUpdateInfo:
-        """Parse update dict, deserializing pickled IPC handles if present.
-
-        HTTP transport sends IPC handles as a base64-encoded pickle under the
-        key ``ipc_handles_pickled``. This method deserializes them back into
-        ``ipc_handles`` before constructing the typed dataclass, keeping
-        serialization concerns out of the dataclass itself.
-
-        Requires ``VLLM_ALLOW_INSECURE_SERIALIZATION=1`` because the
-        payload is deserialized via ``pickle.loads``.
-        """
-        if "ipc_handles_pickled" in update_dict:
-            if "ipc_handles" in update_dict:
-                raise ValueError("Cannot specify both `ipc_handles` and `ipc_handles_pickled`")
-
-            if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
-                raise ValueError(
-                    "Refusing to deserialize `ipc_handles_pickled` without VLLM_ALLOW_INSECURE_SERIALIZATION=1"
-                )
-
-            pickled = update_dict.pop("ipc_handles_pickled")
-            update_dict["ipc_handles"] = pickle.loads(base64.b64decode(pickled))
-
-        return super().parse_update_info(update_dict)
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
     def init_transfer_engine(self, init_info: NPUIPCWeightTransferInitInfo) -> None:
         """Record the trainer-supplied wire params so the worker decodes
         exactly as the trainer encoded."""
         self.packed = init_info.packed
 
-<<<<<<< HEAD
     def start_weight_update(self) -> None:
         from vllm.model_executor.model_loader.reload import (
             initialize_layerwise_reload,
@@ -226,23 +170,6 @@ class NPUIPCWeightTransferEngine(  # type: ignore[no-redef]
         finalize_layerwise_reload(self.model, self.model_config)
 
     def receive_weights(self, update_info: NPUIPCWeightTransferUpdateInfo) -> None:
-=======
-    if not vllm_version_is("0.23.0"):
-
-        def start_weight_update(self) -> None:
-            """No-op for NPU IPC engine (no layerwise reloading)."""
-            pass
-
-        def finish_weight_update(self) -> None:
-            """No-op for NPU IPC engine (no layerwise reloading)."""
-            pass
-
-    def receive_weights(
-        self,
-        update_info: NPUIPCWeightTransferUpdateInfo,
-        load_weights: Callable[[list[tuple[str, torch.Tensor]]], None],
-    ) -> None:
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         """Receive weights from the trainer via NPU IPC handles.
 
         Args:

@@ -103,10 +103,6 @@ msgstr "=== \"Ubuntu 24.04\""
 msgid "=== \"openEuler 24.03\""
 msgstr "=== \"openEuler 24.03\""
 
-<<<<<<< HEAD
-=======
-#: ../../source/tutorials/hardwares/310p.md:156
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 msgid "Set up environment variables:"
 msgstr "设置环境变量："
 

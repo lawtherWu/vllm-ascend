@@ -21,13 +21,9 @@ import os
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
-<<<<<<< HEAD
 from vllm.distributed import get_tp_group
 from vllm.forward_context import is_forward_context_available
 from vllm.logger import logger
-=======
-from vllm.forward_context import is_forward_context_available
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
     Gemma4RotaryEmbedding,
@@ -288,7 +284,6 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         if is_neox_style_override is not None:
             is_neox_style = is_neox_style_override
         is_draft_model = _EXTRA_CTX.is_draft_model if is_forward_context_available() else False
-<<<<<<< HEAD
         if is_draft_model and self.use_mtp and enable_sp():
             tp_group = get_tp_group()
             positions = torch.ops.vllm.all_gather(positions.contiguous(), 0, tp_group.world_size, tp_group.unique_name)
@@ -321,13 +316,6 @@ class AscendRotaryEmbedding(RotaryEmbedding):
             self.head_size,
             self.rotary_dim,
             is_neox_style,
-=======
-        flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled if is_forward_context_available() else False
-        if is_draft_model and self.use_mtp and flash_comm_v1_enabled:
-            positions = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(positions.contiguous(), True)
-        return torch.ops.vllm.npu_rotary_embedding(
-            positions, query, key, self.cos_sin_cache, self.head_size, self.rotary_dim, is_neox_style
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         )
         if out_dtype is None:
             return torch.ops.vllm.npu_rotary_embedding(*rope_args)

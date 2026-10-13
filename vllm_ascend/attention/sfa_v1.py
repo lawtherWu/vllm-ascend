@@ -32,11 +32,9 @@ from vllm_ascend.attention.cache_layout import (
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import (
-    AscendPCPMetadata,
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
-from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE
 from vllm_ascend.attention.offload_capability import (
     DsaOffloadAttentionBackendCapability,
     DsaOffloadCacheMemory,
@@ -68,17 +66,10 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     OFFLOAD_KV_CACHE_TUPLE_LEN,
     OFFLOAD_V_CACHE_NPU_INDEX,
 )
-from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.dsa_offload import (
     DsaOffloadConfig,
     get_dsa_config_value,
     get_dsa_raw_seq,
-)
-from vllm_ascend.ops.layer_shard_linear import (
-    is_hidden_layer,
-    post_process_after_loading_for_shard_weight_series,
-    reach_layer_for_shard_weight_series,
-    register_all_layers_to_shard_weight_series,
 )
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.quantization.methods import (

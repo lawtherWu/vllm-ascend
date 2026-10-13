@@ -130,11 +130,11 @@ def test_prefill_planner_shares_four_base_bundles_and_counts_mtp() -> None:
     assert result.num_blocks == 17
     assert len(result.kv_cache_tensors) == 5
     for arena_id in range(4):
-        assert result.kv_cache_tensors[arena_id].shared_by == [
+        assert result.kv_cache_tensors[arena_id].layers == [
             f"model.layers.{layer_id}.self_attn.attn"
             for layer_id in range(arena_id, 8, 4)
         ]
-    assert result.kv_cache_tensors[4].shared_by == [
+    assert result.kv_cache_tensors[4].layers == [
         "model.layers.8.self_attn.attn"
     ]
     assert sum(item.size for item in result.kv_cache_tensors) == available_memory
@@ -182,27 +182,27 @@ def test_prefill_planner_reuses_arena_after_four_layers() -> None:
     )
 
     assert result.num_blocks == 7
-    assert result.kv_cache_tensors[0].shared_by == [
+    assert result.kv_cache_tensors[0].layers == [
         "model.layers.0.self_attn.attn",
         "model.layers.4.self_attn.attn",
         "model.layers.8.self_attn.attn",
     ]
-    assert result.kv_cache_tensors[1].shared_by == [
+    assert result.kv_cache_tensors[1].layers == [
         "model.layers.1.self_attn.attn",
         "model.layers.5.self_attn.attn",
         "model.layers.9.self_attn.attn",
     ]
-    assert result.kv_cache_tensors[2].shared_by == [
+    assert result.kv_cache_tensors[2].layers == [
         "model.layers.2.self_attn.attn",
         "model.layers.6.self_attn.attn",
         "model.layers.10.self_attn.attn",
     ]
-    assert result.kv_cache_tensors[3].shared_by == [
+    assert result.kv_cache_tensors[3].layers == [
         "model.layers.3.self_attn.attn",
         "model.layers.7.self_attn.attn",
         "model.layers.11.self_attn.attn",
     ]
-    assert result.kv_cache_tensors[4].shared_by == [
+    assert result.kv_cache_tensors[4].layers == [
         "model.layers.12.self_attn.attn",
     ]
 
@@ -280,7 +280,7 @@ def test_prefill_planner_accepts_merged_ascend_mla_spec() -> None:
     assert result.num_blocks == 3
     assert len(result.kv_cache_tensors) == 4
     for arena_id in range(4):
-        assert result.kv_cache_tensors[arena_id].shared_by == [
+        assert result.kv_cache_tensors[arena_id].layers == [
             group.layer_names[layer_id]
             for layer_id in range(arena_id, len(group.layer_names), 4)
         ]
@@ -307,7 +307,7 @@ def test_decode_planner_accepts_merged_ascend_mla_spec(
             kv_cache_tensors=[
                 KVCacheTensor(
                     size=spec.page_size_bytes,
-                    shared_by=groups[0].layer_names,
+                    layers=groups[0].layer_names,
                     offset=64,
                     block_stride=spec.page_size_bytes + 64,
                 )
@@ -327,7 +327,7 @@ def test_decode_planner_accepts_merged_ascend_mla_spec(
     )
 
     assert result.num_blocks > 0
-    assert result.kv_cache_tensors[0].shared_by == group.layer_names
+    assert result.kv_cache_tensors[0].layers == group.layer_names
     assert result.kv_cache_tensors[0].offset == 64
     assert result.kv_cache_tensors[0].block_stride == spec.page_size_bytes + 64
 
@@ -344,7 +344,7 @@ def test_decode_planner_accepts_zero_memory_for_minimal_profile(monkeypatch) -> 
         return KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[
-                KVCacheTensor(size=spec.page_size_bytes, shared_by=groups[0].layer_names)
+                KVCacheTensor(size=spec.page_size_bytes, layers=groups[0].layer_names)
             ],
             kv_cache_groups=groups,
         )
@@ -361,7 +361,7 @@ def test_decode_planner_accepts_zero_memory_for_minimal_profile(monkeypatch) -> 
     )
 
     assert result.num_blocks == 1
-    assert result.kv_cache_tensors[0].shared_by == group.layer_names
+    assert result.kv_cache_tensors[0].layers == group.layer_names
 
 
 def test_decode_planner_rejects_zero_memory_without_profile_override() -> None:
@@ -395,7 +395,7 @@ def _profiled_decode_config(
         kv_cache_tensors=[
             KVCacheTensor(
                 size=spec.page_size_bytes * num_blocks,
-                shared_by=group.layer_names,
+                layers=group.layer_names,
             )
         ],
         kv_cache_groups=[group],

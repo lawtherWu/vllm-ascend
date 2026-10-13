@@ -21,12 +21,8 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
-<<<<<<< HEAD
     MambaManager,
     get_manager_for_kv_cache_spec,
-=======
-    SingleTypeKVCacheManager,
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -218,7 +214,6 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         )
         self.verify_and_split_kv_cache_groups()
 
-<<<<<<< HEAD
         # Align the WRITE-path mask granularity (reachable_block_mask) with the
         # READ-path hit granularity (find_longest_cache_hit) so SlidingWindowManager
         # only caches blocks that land on a boundary where future cache hits can
@@ -229,8 +224,6 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             # Match the lookup boundary, including the raw-tail pool alignment.
             mgr.cache_hit_alignment_tokens = self._cache_hit_alignment_tokens
 
-=======
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
         self.use_eagle = use_eagle
         # Roles are derived here, where they are used, from the kv-transfer
         # config attached by the ``get_kv_cache_config_from_groups`` builder
@@ -410,7 +403,6 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 drop_eagle_block = use_eagle and idx not in eagle_verified and not self.skips_eagle_block_drop
 
                 _max_length = curr_hit_length
-<<<<<<< HEAD
                 if drop_eagle_block and not isinstance(spec, MambaSpec):
                     # Eagle needs to match one more block and then pop the last.
                     eagle_margin = (
@@ -422,13 +414,6 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     )
                     _max_length = min(curr_hit_length + eagle_margin, max_cache_hit_length)
                 hit_result = manager_cls.find_longest_cache_hit(
-=======
-                if use_eagle:
-                    # Eagle needs to match one more block and then pop the last.
-                    _max_length = min(curr_hit_length + spec.block_size, max_cache_hit_length)
-                eagle_kwarg = {"drop_eagle_block": use_eagle}
-                hit_blocks = manager_cls.find_longest_cache_hit(
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
@@ -487,7 +472,6 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # ``self.skips_eagle_block_drop``): matched content blocks are
         # always verified prompt blocks there.
         num_groups = len(self.kv_cache_config.kv_cache_groups)
-<<<<<<< HEAD
         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
         hit_lengths: list[int] = [0] * num_groups
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
@@ -506,95 +490,6 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 hit_blocks[gid] = blks
                 hit_lengths[gid] = group_hit
         return tuple(hit_blocks), tuple(hit_lengths)
-=======
-        hit_length = max_cache_hit_length
-        hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
-
-        # Simple hybrid (1 full attn + 1 other): one iteration suffices.
-        # Full attn is always first if it exists.
-        is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
-            self.attention_groups[0][0], FullAttentionSpec
-        )
-
-        # Attention-group indices whose EAGLE drop is verified at the current
-        # ``curr_hit_length``. Each eagle group applies the drop at most once
-        # per candidate length (see issue #32802).
-        eagle_verified: set[int] = set()
-        while True:
-            curr_hit_length = hit_length
-            for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
-                # In PD disaggregation, Mamba running/temporal state is transferred
-                # via the KV connector, but the D side has no local Mamba prefix
-                # cache hit. If we let Mamba groups participate in the min-reduction,
-                # their zero hit collapses the FullAttention hit length to 0 and
-                # defeats prefix caching on the D side. Skip them instead.
-                if isinstance(spec, MambaSpec):
-                    if hit_blocks_by_group[group_ids[0]] is None:
-                        for gid in group_ids:
-                            hit_blocks_by_group[gid] = []
-                    continue
-
-                effective_block_size = self._get_effective_block_size(spec)
-                cached_blocks = hit_blocks_by_group[group_ids[0]]
-                if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
-                    # Full attention is downward-closed: we only need to look
-                    # up cached blocks once; on subsequent iterations just trim
-                    # to the (reduced) current hit length.
-                    num_blocks = curr_hit_length // effective_block_size
-                    curr_hit_length = num_blocks * effective_block_size
-                    continue
-
-                use_eagle = idx in self.eagle_attn_group_indices and idx not in eagle_verified
-
-                _max_length = curr_hit_length
-                if use_eagle:
-                    # Eagle needs to match one more block and then pop the last.
-                    _max_length = min(curr_hit_length + spec.block_size, max_cache_hit_length)
-                eagle_kwarg = {"drop_eagle_block": use_eagle}
-                hit_blocks = manager_cls.find_longest_cache_hit(
-                    block_hashes=_get_block_hashes(spec),
-                    max_length=_max_length,
-                    kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
-                    kv_cache_spec=spec,
-                    **eagle_kwarg,
-                    alignment_tokens=self.lcm_block_size,
-                    dcp_world_size=self.dcp_world_size,
-                    pcp_world_size=self.pcp_world_size,
-                )
-                _new_hit_length = len(hit_blocks[0]) * effective_block_size
-                if use_eagle:
-                    eagle_verified.add(idx)
-                elif _new_hit_length < curr_hit_length:
-                    # length shrunk; invalidate previous eagle verifications
-                    eagle_verified.clear()
-                curr_hit_length = _new_hit_length
-                curr_hit_length = len(hit_blocks[0]) * effective_block_size
-                for group_id, blocks in zip(group_ids, hit_blocks):
-                    hit_blocks_by_group[group_id] = blocks
-
-            if curr_hit_length >= hit_length:
-                break
-            hit_length = curr_hit_length
-            if is_simple_hybrid:
-                break
-
-        # Truncate full attention blocks to final hit_length (if present)
-        # NOTE(zxr): for deepseek-v4, there is two fullattn groups, but
-        # in this function, only the first fullattn group is truncate by
-        # the belowing codes(c4), c128 layer does not truncate, which may
-        # have prefix cache block hit.
-        # Due to slidingwindow attn, deepseek-v4 decode node can't have
-        # any prefix cache hit, because `hit_length` of SWA is 0.
-        spec, group_ids, _ = self.attention_groups[0]
-        if isinstance(spec, FullAttentionSpec):
-            num_blocks = hit_length // self._get_effective_block_size(spec)
-            for group_id in group_ids:
-                if (blks := hit_blocks_by_group[group_id]) is not None:
-                    del blks[num_blocks:]
-
-        return tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group), hit_length
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 
 def get_kv_cache_coordinator(  # type: ignore[misc]

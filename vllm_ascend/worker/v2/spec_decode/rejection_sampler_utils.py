@@ -19,34 +19,12 @@
 
 import torch
 from vllm.triton_utils import tl, triton
-<<<<<<< HEAD
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     _compute_global_logsumexp as _compute_global_lse,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     _compute_local_logits_stats_kernel as _compute_block_stats_kernel,
 )
-=======
-
-from vllm_ascend.utils import vllm_version_is
-
-if not vllm_version_is("0.23.0"):
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-        _compute_global_logsumexp as _compute_global_lse,
-    )
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-        _compute_local_logits_stats_kernel as _compute_block_stats_kernel,
-    )
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-        _insert_resampled_kernel,
-    )
-else:
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-        _compute_block_stats_kernel,
-        _compute_global_lse,
-        _insert_resampled_kernel,
-    )
->>>>>>> 36d8a3435 ([Feature][KV Offload] Add offload capability abstraction with warmup proxy and finalization fixes)
 
 from vllm_ascend.ops.triton.v2.spec_decode.resample import resample
 

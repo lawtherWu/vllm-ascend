@@ -228,6 +228,7 @@ from vllm_ascend.utils import (
     weak_ref_tensor,
     weak_ref_tensors,
 )
+from vllm_ascend.utils import get_kv_cache_tensor_layers
 from vllm_ascend.worker.dcp_utils import (
     DCPAsyncSpecDecodeRebuildResult,
     DCPDummyRunMetadata,
@@ -4400,7 +4401,9 @@ class NPUModelRunner(GPUModelRunner):
                 except Exception as e:
                     logger.error("[eplb/omni] OmniPlanner stage 2 failed: %s", e)
                     raise
-            self.eplb_updator.reset_log2phy()
+                # Only OmniEplbUpdator maintains a log2phy mapping that must
+                # be reset after stage-2 re-planning.
+                self.eplb_updator.reset_log2phy()
 
     def update_eplb_heat_collection_status(
         self, num_tokens_padded: int, num_tokens_across_dp: torch.Tensor | None = None
@@ -6694,7 +6697,7 @@ class NPUModelRunner(GPUModelRunner):
         arena_ptrs: list[tuple[int, ...]] = []
         layer_count = 0
         for arena_id, tensor_spec in enumerate(workspace_tensors):
-            workspace_layers = tensor_spec.shared_by
+            workspace_layers = get_kv_cache_tensor_layers(tensor_spec)
             if not workspace_layers:
                 raise RuntimeError(
                     f"Layerwise workspace arena {arena_id} has no layers"

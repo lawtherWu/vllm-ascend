@@ -76,11 +76,11 @@ def generate_global_placement(n_expert, ep_size, n_redundant, num_shared_experts
 
 
 def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num_shared_experts=1, tp_size=None):
-    if eplb_config.enable_omni_eplb:
+    if bool(getattr(eplb_config, "enable_omni_eplb", False)):
         try:
             from omni_placement.omni_planner import OmniPlanner
             planner = OmniPlanner(
-                config_file=eplb_config.omni_config_file,
+                config_file=getattr(eplb_config, "omni_config_file", None),
                 device="npu",
                 rank=moe_config.ep_rank,
                 world_size=moe_config.ep_size,
@@ -88,7 +88,7 @@ def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num
                 max_redundant_per_rank=eplb_config.num_redundant_experts//moe_config.ep_size  if eplb_config.expert_map_path is None else None,
                 max_redundant_per_expert=100  if eplb_config.expert_map_path is None else None,
             )
-            planner.config.dump_dir = eplb_config.expert_map_record_path
+            planner.config.dump_dir = getattr(eplb_config, "expert_map_record_path", None)
             planner.config.enable_dump = os.getenv("EXPERT_MAP_RECORD", "false") == "true"
             planner.enable_dynamic = os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
         except Exception as e:

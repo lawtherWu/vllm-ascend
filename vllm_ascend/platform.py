@@ -591,7 +591,6 @@ class NPUPlatform(Platform):
         _validate_draft_decode_context_parallel_config(vllm_config)
         _validate_parallel_config(vllm_config)
         _validate_engram_config(vllm_config)
-        cls._validate_layerwise_host_offload_config(vllm_config)
 
         # 3.Auto detect quantization method and verify cache dtype
         maybe_auto_detect_quantization(vllm_config)
@@ -623,6 +622,13 @@ class NPUPlatform(Platform):
 
         # 8.Setup worker class, custom ops and scheduler (ascend_config -> vllm_config).
         _setup_worker_and_scheduler(vllm_config, ascend_config)
+
+        # 8.5.Validate the frozen layerwise host offload shape. Runs after
+        # _setup_worker_and_scheduler because refresh_block_size() raises the
+        # default block size to 128 when chunked prefill or prefix caching is
+        # enabled; validating earlier would reject deployments that omit an
+        # explicit --block_size.
+        cls._validate_layerwise_host_offload_config(vllm_config)
 
         # 9.Validate SFA / DCP / KV and SP consistency (vllm_config)
         _validate_sfa_dcp_kv_sp(vllm_config)

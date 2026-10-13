@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.v1.worker import mamba_utils
 
+from vllm_ascend.utils import get_kv_cache_tensor_layers
 from vllm_ascend.attention.cache_layout import (
     LAYERWISE_PREFILL_GET_GROUP_SIZE,
     LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT,
@@ -75,101 +76,6 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             for connector in self._connectors
         )
 
-    def configure_dspark_prefix_cache(self, vllm_config: "VllmConfig") -> bool:
-        """Select a store that restores both target and persistent draft KV."""
-        providers = []
-        for index, connector in enumerate(self._connectors):
-            configure = getattr(connector, "configure_dspark_prefix_cache", None)
-            if callable(configure) and configure(vllm_config):
-                providers.append(index)
-        if len(providers) > 1:
-            raise ValueError("DSpark prefix reuse requires exactly one paired target/draft store")
-        self._dspark_prefix_provider_index = providers[0] if providers else None
-        if providers:
-            self._requires_full_dspark_prompt = False
-        return bool(providers)
-
-    def _configure_layerwise_reuse_completion(self) -> None:
-        # Producers that report when a shared physical KV slot is safe to reuse.
-        self._layerwise_slot_release_providers = [
-            connector
-            for connector in self._connectors
-            if getattr(connector, "is_producer", False)
-            and getattr(connector, "connector_worker", None) is not None
-            and getattr(connector, "supports_layerwise_buffer_reuse", False)
-            and callable(getattr(connector, "wait_for_layer_reuse", None))
-        ]
-        # All remaining connectors, which run after the slot-release providers.
-        self._non_slot_release_connectors = [
-            connector
-            for connector in self._connectors
-            if all(connector is not provider for provider in self._layerwise_slot_release_providers)
-        ]
-        self._external_slot_release_sink_configured = False
-        if not self._layerwise_slot_release_providers:
-            return
-        for connector in self._connectors:
-            set_waiter = getattr(connector, "set_external_slot_release_waiter", None)
-            if callable(set_waiter) and set_waiter(self._wait_for_external_slot_release) is not False:
-                self._external_slot_release_sink_configured = True
-
-    def _wait_for_external_slot_release(self, layer_idx: int) -> None:
-        for provider in self._layerwise_slot_release_providers:
-            provider.wait_for_layer_reuse(layer_idx)
-
-    def wait_for_layer_load(self, layer_name: str) -> None:
-        if getattr(self, "_external_slot_release_sink_configured", False):
-            # AscendStore owns the layer-entry reuse wait after accepting the
-            # composite waiter, so provider layer-entry waits are redundant.
-            connectors = self._non_slot_release_connectors
-        else:
-            # Without a sink, preserve the original protection by waiting on
-            # providers before any sibling connector can write shared slots.
-            connectors = [*self._layerwise_slot_release_providers, *self._non_slot_release_connectors]
-        for connector in connectors:
-            connector.wait_for_layer_load(layer_name)
-        if (copy_bufs := getattr(self, "_mamba_copy_bufs", None)) is not None:
-            mamba_utils.do_mamba_copy_block_for_layer(
-                copy_bufs,
-                layer_name,
-            )
-        # Mamba state copy runs after every child connector finished this
-        # layer's load so the copy never reads half-loaded state. The model
-        # state no-ops for non-mamba layers and for already-copied layers.
-        if (mamba_state := getattr(self, "_mamba_state", None)) is not None:
-            mamba_state.do_mamba_copy_for_layer(layer_name)
-
-    def prepare_mamba_state_copy(self, mamba_state_or_copy_bufs) -> bool:
-        """Take over the mamba align pre-copy for this step.
-
-        The V1 model runner passes its mamba copy buffers; the V2 model runner
-        passes its mamba hybrid model state. Returns True when any child
-        connector executes per-layer copies from its ``wait_for_layer_load``;
-        see ``AscendStoreConnector.prepare_mamba_state_copy``.
-        """
-        if not self.requires_mamba_state_copy_after_layer_load:
-            return False
-        if hasattr(mamba_state_or_copy_bufs, "do_mamba_copy_for_layer"):
-            self._mamba_state = mamba_state_or_copy_bufs
-        else:
-            mamba_utils.prepare_mamba_copy_by_layer(mamba_state_or_copy_bufs)
-            self._mamba_copy_bufs = mamba_state_or_copy_bufs
-        return True
-
-    def finish_mamba_state_copy(self) -> None:
-        if self._mamba_copy_bufs is not None:
-            try:
-                mamba_utils.finish_mamba_copy_by_layer(self._mamba_copy_bufs)
-            finally:
-                self._mamba_copy_bufs = None
-        self._mamba_state = None
-
-    def on_kv_cache_written(self, layer_name: str = "") -> None:
-        # Phase 1: providers close their gates at the earliest cache-write hook.
-        for connector in self._layerwise_slot_release_providers:
-            hook = getattr(connector, "on_kv_cache_written", None)
-            if callable(hook):
-                hook(layer_name)
         # Phase 2: only then may sibling hooks publish reuse-enabling work.
         for connector in self._non_slot_release_connectors:
             hook = getattr(connector, "on_kv_cache_written", None)
@@ -231,27 +137,66 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                     "use_layerwise_range=true"
                 )
 
-            workspace_tensors = kv_cache_config.kv_cache_tensors[
-                :LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
+            # The layerwise planner emits one zero-stride workspace tensor
+            # per (arena, page-size) — v0.30 splits each SFA layer into a
+            # main MLA spec and a separate indexer spec, so an arena can own
+            # several tensors. Collect every zero-stride tensor and rebuild
+            # the layer -> arena mapping from the planner's
+            # layer_index % ARENA_COUNT contract.
+            workspace_tensors = [
+                tensor
+                for tensor in kv_cache_config.kv_cache_tensors
+                if tensor.layer_stride == 0
             ]
-            if len(workspace_tensors) != LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT:
+            if not workspace_tensors:
                 raise ValueError(
-                    "Prefill layerwise host offload requires "
-                    f"{LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT} grouped-"
-                    "prefetch workspace tensors"
+                    "Prefill layerwise host offload found no zero-stride "
+                    "workspace tensors"
                 )
-            for arena_id, tensor_spec in enumerate(workspace_tensors):
-                if not tensor_spec.shared_by:
+            arena_counter: dict[str, int] = {}
+            for tensor_spec in workspace_tensors:
+                arena_layers = get_kv_cache_tensor_layers(tensor_spec)
+                if not arena_layers:
                     raise ValueError(
-                        f"Layerwise workspace arena {arena_id} has no layers"
+                        "A layerwise workspace tensor has no layers"
                     )
-                for layer_name in tensor_spec.shared_by:
+                for layer_name in arena_layers:
                     if layer_name in self._workspace_layer_to_arena:
                         raise ValueError(
                             f"Layer {layer_name} is assigned to multiple "
                             "layerwise workspace arenas"
                         )
-                    self._workspace_layer_to_arena[layer_name] = arena_id
+                    # Layers of the same model layer share its arena; the
+                    # arena id is resolved after collection below via the
+                    # group order (layer_index % ARENA_COUNT).
+                    self._workspace_layer_to_arena[layer_name] = -1
+                    arena_counter[layer_name] = -1
+            # Resolve arena ids from group order over *model layers*: v0.30
+            # lists the SFA main cache and its indexer cache as separate
+            # layer names of the same transformer layer, and they must share
+            # one arena. Normalize by collapsing an indexer cache name onto
+            # its parent attention layer before numbering.
+            def _parent_model_layer(name: str) -> str:
+                return name.split(".indexer.")[0] + ".attn"
+
+            ordered_names = [
+                layer_name
+                for group in kv_cache_config.kv_cache_groups
+                for layer_name in group.layer_names
+                if layer_name in self._workspace_layer_to_arena
+            ]
+            parent_order: list[str] = []
+            parent_index: dict[str, int] = {}
+            for layer_name in ordered_names:
+                parent = _parent_model_layer(layer_name)
+                if parent not in parent_index:
+                    parent_index[parent] = len(parent_order)
+                    parent_order.append(parent)
+            for layer_name in ordered_names:
+                self._workspace_layer_to_arena[layer_name] = (
+                    parent_index[_parent_model_layer(layer_name)]
+                    % LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
+                )
 
             ordered_layers = tuple(
                 layer_name
@@ -263,20 +208,14 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 raise ValueError(
                     "Layerwise workspace layers do not match the KV cache groups"
                 )
-            for layer_index, layer_name in enumerate(ordered_layers):
-                expected_arena = (
-                    layer_index % LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
-                )
-                actual_arena = self._workspace_layer_to_arena[layer_name]
-                if actual_arena != expected_arena:
-                    raise ValueError(
-                        f"Layerwise workspace layer {layer_name} uses arena "
-                        f"{actual_arena}, expected {expected_arena}"
-                    )
             self._workspace_layer_order = ordered_layers
+            # Fence/group scheduling numbers *model layers*: the save hook
+            # fires once per attention layer (indexer caches ride along in
+            # the same bundle), so the index must collapse cache-layer
+            # names onto their parent transformer layer.
             self._workspace_layer_to_index = {
-                layer_name: layer_index
-                for layer_index, layer_name in enumerate(ordered_layers)
+                layer_name: parent_index[_parent_model_layer(layer_name)]
+                for layer_name in ordered_layers
             }
             self._store_connector = store_children[0]
             self._layer_load_executor = ThreadPoolExecutor(
@@ -284,6 +223,111 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 thread_name_prefix="layerwise-store-prefetch",
                 initializer=_set_layerwise_prefetch_device,
             )
+
+
+
+
+    def configure_dspark_prefix_cache(self, vllm_config: "VllmConfig") -> bool:
+        """Select a store that restores both target and persistent draft KV."""
+        providers = []
+        for index, connector in enumerate(self._connectors):
+            configure = getattr(connector, "configure_dspark_prefix_cache", None)
+            if callable(configure) and configure(vllm_config):
+                providers.append(index)
+        if len(providers) > 1:
+            raise ValueError("DSpark prefix reuse requires exactly one paired target/draft store")
+        self._dspark_prefix_provider_index = providers[0] if providers else None
+        if providers:
+            self._requires_full_dspark_prompt = False
+        return bool(providers)
+
+    def _configure_layerwise_reuse_completion(self) -> None:
+        # Producers that report when a shared physical KV slot is safe to reuse.
+        self._layerwise_slot_release_providers = [
+            connector
+            for connector in self._connectors
+            if getattr(connector, "is_producer", False)
+            and getattr(connector, "connector_worker", None) is not None
+            and getattr(connector, "supports_layerwise_buffer_reuse", False)
+            and callable(getattr(connector, "wait_for_layer_reuse", None))
+        ]
+        # All remaining connectors, which run after the slot-release providers.
+        self._non_slot_release_connectors = [
+            connector
+            for connector in self._connectors
+            if all(connector is not provider for provider in self._layerwise_slot_release_providers)
+        ]
+        self._external_slot_release_sink_configured = False
+        if not self._layerwise_slot_release_providers:
+            return
+        for connector in self._connectors:
+            set_waiter = getattr(connector, "set_external_slot_release_waiter", None)
+            if callable(set_waiter) and set_waiter(self._wait_for_external_slot_release) is not False:
+                self._external_slot_release_sink_configured = True
+
+    def _wait_for_external_slot_release(self, layer_idx: int) -> None:
+        for provider in self._layerwise_slot_release_providers:
+            provider.wait_for_layer_reuse(layer_idx)
+
+    def _wait_for_layer_load_base(self, layer_name: str) -> None:
+        """v0.30.0 base routing: provider-first waits plus per-layer mamba copy."""
+        if getattr(self, "_external_slot_release_sink_configured", False):
+            # AscendStore owns the layer-entry reuse wait after accepting the
+            # composite waiter, so provider layer-entry waits are redundant.
+            connectors = self._non_slot_release_connectors
+        else:
+            # Without a sink, preserve the original protection by waiting on
+            # providers before any sibling connector can write shared slots.
+            connectors = [*self._layerwise_slot_release_providers, *self._non_slot_release_connectors]
+        for connector in connectors:
+            connector.wait_for_layer_load(layer_name)
+        if (copy_bufs := getattr(self, "_mamba_copy_bufs", None)) is not None:
+            mamba_utils.do_mamba_copy_block_for_layer(
+                copy_bufs,
+                layer_name,
+            )
+        # Mamba state copy runs after every child connector finished this
+        # layer's load so the copy never reads half-loaded state. The model
+        # state no-ops for non-mamba layers and for already-copied layers.
+        if (mamba_state := getattr(self, "_mamba_state", None)) is not None:
+            mamba_state.do_mamba_copy_for_layer(layer_name)
+
+    def prepare_mamba_state_copy(self, mamba_state_or_copy_bufs) -> bool:
+        """Take over the mamba align pre-copy for this step.
+
+        The V1 model runner passes its mamba copy buffers; the V2 model runner
+        passes its mamba hybrid model state. Returns True when any child
+        connector executes per-layer copies from its ``wait_for_layer_load``;
+        see ``AscendStoreConnector.prepare_mamba_state_copy``.
+        """
+        if not self.requires_mamba_state_copy_after_layer_load:
+            return False
+        if hasattr(mamba_state_or_copy_bufs, "do_mamba_copy_for_layer"):
+            self._mamba_state = mamba_state_or_copy_bufs
+        else:
+            mamba_utils.prepare_mamba_copy_by_layer(mamba_state_or_copy_bufs)
+            self._mamba_copy_bufs = mamba_state_or_copy_bufs
+        return True
+
+    def finish_mamba_state_copy(self) -> None:
+        if self._mamba_copy_bufs is not None:
+            try:
+                mamba_utils.finish_mamba_copy_by_layer(self._mamba_copy_bufs)
+            finally:
+                self._mamba_copy_bufs = None
+        self._mamba_state = None
+
+    def on_kv_cache_written(self, layer_name: str = "") -> None:
+        # Phase 1: providers close their gates at the earliest cache-write hook.
+        for connector in self._layerwise_slot_release_providers:
+            hook = getattr(connector, "on_kv_cache_written", None)
+            if callable(hook):
+                hook(layer_name)
+        # Phase 2: only then may sibling hooks publish reuse-enabling work.
+        for connector in self._non_slot_release_connectors:
+            hook = getattr(connector, "on_kv_cache_written", None)
+            if callable(hook):
+                hook(layer_name)
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         chosen_connector = self._requests_to_connector.get(request.request_id, -1)
@@ -491,7 +535,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._layerwise_workspace_fences_enabled:
-            super().wait_for_layer_load(layer_name)
+            self._wait_for_layer_load_base(layer_name)
             return
 
         if layer_name not in self._workspace_layer_to_index:
@@ -502,7 +546,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             # until that snapshot is complete. SFA calls this hook before its
             # cache write, so this is the last safe ordering point.
             self._drain_non_workspace_source_futures(layer_name)
-            super().wait_for_layer_load(layer_name)
+            self._wait_for_layer_load_base(layer_name)
             return
 
         layer_index = self._workspace_layer_to_index[layer_name]

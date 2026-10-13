@@ -67,8 +67,7 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
     inject_qos,
     validate_register_region_count,
 )
-from vllm_ascend.models.deepseek_v4_dspark import get_dspark_num_layers
-from vllm_ascend.utils import enable_custom_op, get_kv_cache_tensor_layers, is_dspark_config, is_vl_model
+from vllm_ascend.utils import enable_custom_op, get_kv_cache_tensor_layers, is_vl_model
 
 # isort: off
 if TYPE_CHECKING:
