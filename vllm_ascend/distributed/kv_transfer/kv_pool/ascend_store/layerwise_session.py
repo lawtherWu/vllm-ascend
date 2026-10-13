@@ -44,6 +44,11 @@ class LayerwiseStoreBackend(Protocol):
     def batch_get_session_end(self, keys: list[str]) -> int: ...
 
 
+# Mooncake native error codes consumed by the put claim path. The value must
+# stay aligned with ``ErrorCode`` in mooncake-store/include/types.h.
+MOONCAKE_OBJECT_ALREADY_EXISTS = -705
+
+
 class PutState(str, Enum):
     OPEN = "open"
     COMMITTED = "committed"
@@ -72,6 +77,10 @@ class PutClaim:
     owned_keys: list[str] = field(default_factory=list)
     followed_keys: list[str] = field(default_factory=list)
     failed_keys: list[str] = field(default_factory=list)
+    # Keys whose put_start hit OBJECT_ALREADY_EXISTS from a cross-instance
+    # owner. The local execution yielded write ownership: no entry, no
+    # future, no wait. Observability only; not part of any control flow.
+    yielded_keys: list[str] = field(default_factory=list)
     commit_futures: dict[str, Future[list[int]]] = field(default_factory=dict)
 
 
@@ -156,6 +165,22 @@ class StorePutRegistry:
                         claim.commit_futures[binding.key] = future
                 else:
                     for binding, code in zip(unique, result, strict=True):
+                        if int(code) == MOONCAKE_OBJECT_ALREADY_EXISTS:
+                            # Another (cross-process) writer owns this
+                            # canonical key. The chunk hash guarantees the
+                            # object content is equivalent, so yield write
+                            # ownership: no local entry, no future, no put.
+                            # Native put_start failed keys are not registered
+                            # client-side (real_client), and master metadata
+                            # belongs to the winner, so nothing leaks here.
+                            # Visibility for later chunks is resolved by the
+                            # existing stateless exists() triage in
+                            # ``KVPoolWorker._start_load_range_request``; if
+                            # the owner has not committed by then, the request
+                            # fails through the existing history-incomplete
+                            # path and a scheduler retry heals it.
+                            claim.yielded_keys.append(binding.key)
+                            continue
                         future = Future()
                         entry = _PutEntry(
                             future=future,
