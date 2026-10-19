@@ -167,7 +167,15 @@ class KVPoolWorker:
         self.original_block_size = self._infer_group_block_sizes(vllm_config, kv_cache_config)
         cp_scale = self.pcp_size * self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
-        requested_hash_block_size = vllm_config.cache_config.hash_block_size
+        # vLLM renamed CacheConfig.hash_block_size (#40946) to prefix_match_unit
+        # on the v0.30 line; accept either name and treat absence as unset.
+        requested_hash_block_size = getattr(
+            vllm_config.cache_config, "prefix_match_unit", None
+        )
+        if requested_hash_block_size is None:
+            requested_hash_block_size = getattr(
+                vllm_config.cache_config, "hash_block_size", None
+            )
         if not isinstance(requested_hash_block_size, int):
             requested_hash_block_size = None
         self.hash_block_size = (

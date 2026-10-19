@@ -1819,7 +1819,11 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
         already represents every complete token block before it.  Hash the
         remaining partial-block tokens explicitly to cover the prompt tail.
         """
-        hash_block_size = int(getattr(self.vllm_config.cache_config, "hash_block_size", None) or self.block_size)
+        hash_block_size = int(
+            getattr(self.vllm_config.cache_config, "prefix_match_unit", None)
+            or getattr(self.vllm_config.cache_config, "hash_block_size", None)
+            or self.block_size
+        )
         complete_hashes = min(end_token // hash_block_size, len(request.block_hashes))
         digest = hashlib.sha256()
         digest.update(b"d2rh-host-cache-v1")
