@@ -168,23 +168,36 @@ def _get_layerwise_prefill_cache_layout(
     if not workspace_layers:
         raise ValueError("Layerwise Host Offload Prefill found no base-model layers")
 
-    workspace_page_sizes = {
+    # v0.30 splits each SFA layer into a main MLAAttentionSpec and a
+    # separate AscendSFAIndexerCacheSpec inside the same uniform group, so
+    # base-model layers legitimately carry different page sizes. Group them
+    # per page size: each bucket gets its own set of workspace arena
+    # tensors, which the model runner allocates and aliases independently.
+    workspace_page_buckets: dict[int, list[str]] = {}
+    for layer_name in workspace_layers:
+        page = per_layer_specs[layer_name].page_size_bytes
+        workspace_page_buckets.setdefault(page, []).append(layer_name)
+    # Splitting one SFA layer into main and indexer cache specs (same
+    # transformer layer) is supported; heterogeneous *attention* layers
+    # (unrelated model layers with different specs) remain a first-release
+    # gap.
+    attn_pages = {
         per_layer_specs[layer_name].page_size_bytes
         for layer_name in workspace_layers
+        if ".indexer." not in layer_name
     }
-    if len(workspace_page_sizes) != 1:
+    if len(attn_pages) > 1:
         raise NotImplementedError(
             "Layerwise Host Offload Prefill requires compatible base-layer "
-            "cache page sizes; heterogeneous layers need separate arenas"
+            "attention cache page sizes; heterogeneous layers need separate "
+            "arenas"
         )
-    workspace_page_size = next(iter(workspace_page_sizes))
     mtp_page_sizes = {
         layer_name: per_layer_specs[layer_name].page_size_bytes
         for layer_name in mtp_layers
     }
     return (
-        workspace_layers,
-        workspace_page_size,
+        workspace_page_buckets,
         mtp_page_sizes,
         per_layer_specs,
     )
@@ -197,8 +210,7 @@ def _get_layerwise_prefill_max_memory_usage_bytes(
     """Return HBM needed for one maximum-length layerwise request."""
 
     (
-        _workspace_layers,
-        workspace_page_size,
+        workspace_page_buckets,
         mtp_page_sizes,
         per_layer_specs,
     ) = _get_layerwise_prefill_cache_layout(vllm_config, kv_cache_groups)
@@ -209,10 +221,12 @@ def _get_layerwise_prefill_max_memory_usage_bytes(
         )
         for spec in per_layer_specs.values()
     )
-    bytes_per_block = (
-        LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT * workspace_page_size
-        + sum(mtp_page_sizes.values())
-    )
+    # Each page-size bucket (main MLA vs SFA indexer under v0.30 split
+    # specs) owns its own full set of workspace arenas.
+    bytes_per_block = sum(
+        LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT * page
+        for page in workspace_page_buckets
+    ) + sum(mtp_page_sizes.values())
     return num_blocks * bytes_per_block
 
 
@@ -246,20 +260,36 @@ def _get_layerwise_prefill_kv_cache_config(
     """
 
     (
-        workspace_layers,
-        workspace_page_size,
+        workspace_page_buckets,
         mtp_page_sizes,
-        _per_layer_specs,
+        per_layer_specs,
     ) = _get_layerwise_prefill_cache_layout(vllm_config, kv_cache_groups)
-    if len(workspace_layers) < LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT:
+    workspace_layer_order = [
+        layer_name
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+        if layer_name in {
+            name
+            for bucket in workspace_page_buckets.values()
+            for name in bucket
+        }
+    ]
+    if len(workspace_layer_order) < LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT:
         raise ValueError(
             "Layerwise Host Offload Prefill grouped prefetch requires at least "
             f"{LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT} base layers"
         )
-    bytes_per_block = (
-        LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT * workspace_page_size
-        + sum(mtp_page_sizes.values())
-    )
+    # v0.30 splits each SFA layer into a main MLAAttentionSpec and a
+    # separate AscendSFAIndexerCacheSpec inside the same uniform group, so
+    # base layers carry different page sizes. An arena still owns whole
+    # layers (arena = model-layer-index % ARENA_COUNT, matching the
+    # multi-connector's layer->arena mapping); within an arena, each page
+    # size gets its own physical tensor. The per-block budget sums one
+    # arena set per page size plus the private MTP pages.
+    bytes_per_block = sum(
+        LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT * page
+        for page in workspace_page_buckets
+    ) + sum(mtp_page_sizes.values())
     if bytes_per_block <= 0:
         raise ValueError("Layerwise Host Offload Prefill has an invalid page budget")
 
@@ -274,18 +304,43 @@ def _get_layerwise_prefill_kv_cache_config(
     # metadata. A workspace arena is one physical buffer whose member layers
     # all alias it (layer_stride=0 mirrors the upstream reuse-slot contract),
     # and each MTP layer keeps its own private buffer.
-    kv_cache_tensors = [
-        KVCacheTensor(
-            size=workspace_page_size * num_blocks,
-            layers=workspace_layers[
-                arena_id::LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
-            ],
-            offset=0,
-            layer_stride=0,
-            block_stride=workspace_page_size,
-        )
-        for arena_id in range(LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT)
+    def _parent_model_layer(name: str) -> str:
+        # v0.30 lists the SFA main cache and its indexer cache as separate
+        # layer names of the same transformer layer; they must share one
+        # arena so the fence guards the whole layer bundle.
+        return name.split(".indexer.")[0] + ".attn" if ".indexer." in name else name
+
+    parent_index: dict[str, int] = {}
+    for layer_name in workspace_layer_order:
+        parent = _parent_model_layer(layer_name)
+        if parent not in parent_index:
+            parent_index[parent] = len(parent_index)
+    arena_layers: list[dict[int, list[str]]] = [
+        {} for _ in range(LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT)
     ]
+    for layer_name in workspace_layer_order:
+        page = per_layer_specs[layer_name].page_size_bytes
+        arena_id = (
+            parent_index[_parent_model_layer(layer_name)]
+            % LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
+        )
+        arena_layers[arena_id].setdefault(page, []).append(layer_name)
+    # arena = model-layer-index % ARENA_COUNT. Inside one arena, each page
+    # size (main MLA / SFA indexer under v0.30 split specs) is its own
+    # physical tensor; the model runner allocates and aliases each
+    # independently.
+    kv_cache_tensors = []
+    for arena_id, page_buckets in enumerate(arena_layers):
+        for bucket_page, bucket_layers in page_buckets.items():
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=bucket_page * num_blocks,
+                    layers=bucket_layers,
+                    offset=0,
+                    layer_stride=0,
+                    block_stride=bucket_page,
+                )
+            )
     kv_cache_tensors.extend(
         KVCacheTensor(
             size=mtp_page_sizes[layer_name] * num_blocks,

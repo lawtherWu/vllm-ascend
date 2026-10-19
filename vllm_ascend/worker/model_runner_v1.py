@@ -6680,13 +6680,18 @@ class NPUModelRunner(GPUModelRunner):
 
         if not is_layerwise_host_offload_prefill(self.vllm_config):
             return
-        workspace_tensors = kv_cache_config.kv_cache_tensors[
-            :LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
+        # The planner emits one zero-stride tensor per (arena, page-size):
+        # v0.30 splits each SFA layer into main and indexer cache specs, so
+        # an arena can own several tensors. All alias groups (stride==0)
+        # are workspace tensors; validate each independently.
+        workspace_tensors = [
+            tensor
+            for tensor in kv_cache_config.kv_cache_tensors
+            if tensor.layer_stride == 0
         ]
-        if len(workspace_tensors) != LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT:
+        if not workspace_tensors:
             raise RuntimeError(
-                "Layerwise Host Offload Prefill requires exactly "
-                f"{LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT} base-layer "
+                "Layerwise Host Offload Prefill found no zero-stride "
                 "workspace tensors"
             )
 
@@ -6696,11 +6701,11 @@ class NPUModelRunner(GPUModelRunner):
 
         arena_ptrs: list[tuple[int, ...]] = []
         layer_count = 0
-        for arena_id, tensor_spec in enumerate(workspace_tensors):
+        for tensor_id, tensor_spec in enumerate(workspace_tensors):
             workspace_layers = get_kv_cache_tensor_layers(tensor_spec)
             if not workspace_layers:
                 raise RuntimeError(
-                    f"Layerwise workspace arena {arena_id} has no layers"
+                    f"Layerwise workspace tensor {tensor_id} has no layers"
                 )
             expected_ptrs = component_ptrs(kv_caches[workspace_layers[0]])
             for layer_name in workspace_layers[1:]:

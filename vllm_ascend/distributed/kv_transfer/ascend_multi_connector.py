@@ -137,20 +137,27 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                     "use_layerwise_range=true"
                 )
 
-            workspace_tensors = kv_cache_config.kv_cache_tensors[
-                :LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
+            # The layerwise planner emits one zero-stride workspace tensor
+            # per (arena, page-size) — v0.30 splits each SFA layer into a
+            # main MLA spec and a separate indexer spec, so an arena can own
+            # several tensors. Collect every zero-stride tensor and rebuild
+            # the layer -> arena mapping from the planner's model-layer
+            # index % ARENA_COUNT contract.
+            workspace_tensors = [
+                tensor
+                for tensor in kv_cache_config.kv_cache_tensors
+                if tensor.layer_stride == 0
             ]
-            if len(workspace_tensors) != LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT:
+            if not workspace_tensors:
                 raise ValueError(
-                    "Prefill layerwise host offload requires "
-                    f"{LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT} grouped-"
-                    "prefetch workspace tensors"
+                    "Prefill layerwise host offload found no zero-stride "
+                    "workspace tensors"
                 )
-            for arena_id, tensor_spec in enumerate(workspace_tensors):
+            for tensor_spec in workspace_tensors:
                 arena_layers = get_kv_cache_tensor_layers(tensor_spec)
                 if not arena_layers:
                     raise ValueError(
-                        f"Layerwise workspace arena {arena_id} has no layers"
+                        "A layerwise workspace tensor has no layers"
                     )
                 for layer_name in arena_layers:
                     if layer_name in self._workspace_layer_to_arena:
@@ -158,7 +165,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                             f"Layer {layer_name} is assigned to multiple "
                             "layerwise workspace arenas"
                         )
-                    self._workspace_layer_to_arena[layer_name] = arena_id
+                    self._workspace_layer_to_arena[layer_name] = -1
+
+            def _parent_model_layer(name: str) -> str:
+                # The SFA main cache and its indexer cache are separate
+                # layer names of the same transformer layer; they must share
+                # one arena.
+                return name.split(".indexer.")[0] + ".attn" if ".indexer." in name else name
 
             ordered_layers = tuple(
                 layer_name
@@ -170,20 +183,24 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 raise ValueError(
                     "Layerwise workspace layers do not match the KV cache groups"
                 )
-            for layer_index, layer_name in enumerate(ordered_layers):
-                expected_arena = (
-                    layer_index % LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
+            parent_index: dict[str, int] = {}
+            for layer_name in ordered_layers:
+                parent = _parent_model_layer(layer_name)
+                if parent not in parent_index:
+                    parent_index[parent] = len(parent_index)
+            for layer_name in ordered_layers:
+                self._workspace_layer_to_arena[layer_name] = (
+                    parent_index[_parent_model_layer(layer_name)]
+                    % LAYERWISE_PREFILL_WORKSPACE_ARENA_COUNT
                 )
-                actual_arena = self._workspace_layer_to_arena[layer_name]
-                if actual_arena != expected_arena:
-                    raise ValueError(
-                        f"Layerwise workspace layer {layer_name} uses arena "
-                        f"{actual_arena}, expected {expected_arena}"
-                    )
             self._workspace_layer_order = ordered_layers
+            # Fence/group scheduling numbers *model layers*: the save hook
+            # fires once per attention layer (indexer caches ride along in
+            # the same bundle), so the index must collapse cache-layer
+            # names onto their parent transformer layer.
             self._workspace_layer_to_index = {
-                layer_name: layer_index
-                for layer_index, layer_name in enumerate(ordered_layers)
+                layer_name: parent_index[_parent_model_layer(layer_name)]
+                for layer_name in ordered_layers
             }
             self._store_connector = store_children[0]
             self._layer_load_executor = ThreadPoolExecutor(
